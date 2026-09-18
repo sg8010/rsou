@@ -273,8 +273,9 @@ impl RsouApp {
         }
     }
 
-    /// 点击片段:切到该文档预览并记录滚动目标(plain_text 字节偏移)。
-    pub(crate) fn focus_preview(&mut self, document_id: i64, byte_offset: usize) {
+    /// 切到该文档预览的指定命中批次,并记录滚动目标(plain_text 字节偏移)。
+    pub(crate) fn focus_preview(&mut self, document_id: i64, hit_index: usize, byte_offset: usize) {
+        self.preview_hit_index = hit_index;
         self.pending_scroll = Some(byte_offset);
         if self.preview_doc_id != Some(document_id) || self.preview_text.is_none() {
             self.preview_doc_id = Some(document_id);

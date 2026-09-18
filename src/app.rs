@@ -202,6 +202,8 @@ pub struct RsouApp {
     search_gen: u64,
     /// 预览面板的文档 id
     preview_doc_id: Option<i64>,
+    /// 当前预览的命中批次(对应检索结果中保存的命中片段)
+    preview_hit_index: usize,
     /// 预览文本(plain_text;大文档渲染时按命中窗口截断)
     preview_text: Option<String>,
     /// 预览文本通道
@@ -278,6 +280,7 @@ impl RsouApp {
             search_rx: None,
             search_gen: 0,
             preview_doc_id: None,
+            preview_hit_index: 0,
             preview_text: None,
             preview_rx: None,
             preview_gen: 0,

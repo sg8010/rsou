@@ -88,6 +88,11 @@ fn span_job(text: &str, base: usize, spans: &[Span], color: Color32, size: f32) 
     job
 }
 
+/// 命中批次在全文中的定位点:优先定位到该批次的首个高亮。
+fn hit_offset(hit: &Hit) -> usize {
+    hit.start_offset + hit.highlights.first().map(|span| span.start).unwrap_or(0)
+}
+
 impl RsouApp {
     pub(crate) fn ui_page_search(&mut self, ui: &mut egui::Ui) {
         let mut want_search = false;
@@ -105,16 +110,22 @@ impl RsouApp {
             },
             |ui| {
                 ui.horizontal(|ui| {
+                    // 不使用 `desired_width(f32::INFINITY)`:它会把输入框抢满整行,
+                    // 让按钮只剩下贴在窗口边缘的一小条。按钮先占位,输入框使用剩余宽度。
+                    let button_width = 72.0;
+                    let input_width =
+                        (ui.available_width() - button_width - ui.spacing().item_spacing.x)
+                            .max(160.0);
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
-                            .desired_width(f32::INFINITY)
+                            .desired_width(input_width)
                             .hint_text("输入关键词,回车搜索"),
                     );
                     // 输入框持有焦点时回车触发;按按钮同样触发。
                     if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         want_search = true;
                     }
-                    if Self::primary_button(ui, "搜索", 64.0, can_search).clicked() {
+                    if Self::primary_button(ui, "搜索", button_width, can_search).clicked() {
                         want_search = true;
                     }
                 });
@@ -193,20 +204,55 @@ impl RsouApp {
         ui.add_space(6.0);
 
         // ---------- 左右分栏:结果列表 | 预览 ----------
-        let left_width = (ui.available_width() * 0.55).max(280.0);
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui(egui::vec2(left_width, RESULT_PANE_HEIGHT), |ui| {
-                self.ui_search_results(ui);
+        let total_width = ui.available_width();
+        if total_width >= 900.0 {
+            let gap = ui.spacing().item_spacing.x;
+            let left_width = (total_width * 0.52).clamp(360.0, total_width - gap - 400.0);
+            let right_width = (total_width - gap - left_width).max(400.0);
+            ui.horizontal_top(|ui| {
+                // horizontal_top 会继承横向布局;若直接 allocate_ui,面板内部的
+                // 结果片段和预览行也会被当成同一行排列。这里显式切回纵向布局。
+                ui.allocate_ui_with_layout(
+                    egui::vec2(left_width, RESULT_PANE_HEIGHT),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(left_width, RESULT_PANE_HEIGHT));
+                        self.ui_search_results(ui);
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(right_width, RESULT_PANE_HEIGHT),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_min_size(egui::vec2(right_width, RESULT_PANE_HEIGHT));
+                        self.ui_search_preview(ui);
+                    },
+                );
             });
-            ui.allocate_ui(egui::vec2(ui.available_width(), RESULT_PANE_HEIGHT), |ui| {
-                self.ui_search_preview(ui);
-            });
-        });
+        } else {
+            ui.allocate_ui_with_layout(
+                egui::vec2(total_width, RESULT_PANE_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_size(egui::vec2(total_width, RESULT_PANE_HEIGHT));
+                    self.ui_search_results(ui);
+                },
+            );
+            ui.add_space(10.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(total_width, RESULT_PANE_HEIGHT),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_size(egui::vec2(total_width, RESULT_PANE_HEIGHT));
+                    self.ui_search_preview(ui);
+                },
+            );
+        }
     }
 
     /// 左侧:按文档分组的命中卡片。
     fn ui_search_results(&mut self, ui: &mut egui::Ui) {
-        let mut focus: Option<(i64, usize)> = None;
+        let mut focus: Option<(i64, usize, usize)> = None;
         Self::panel_frame().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("search_result_list")
@@ -242,8 +288,8 @@ impl RsouApp {
                         });
                 });
         });
-        if let Some((doc_id, offset)) = focus {
-            self.focus_preview(doc_id, offset);
+        if let Some((doc_id, hit_index, offset)) = focus {
+            self.focus_preview(doc_id, hit_index, offset);
         }
     }
 
@@ -263,21 +309,44 @@ impl RsouApp {
             .as_ref()
             .map(|r| r.compiled.literals.clone())
             .unwrap_or_default();
+        let hit_offsets = self
+            .preview_doc_id
+            .and_then(|id| {
+                self.search_result
+                    .as_ref()?
+                    .documents
+                    .iter()
+                    .find(|d| d.document.id == id)
+            })
+            .map(|doc_hit| doc_hit.hits.iter().map(hit_offset).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let current_hit_index = self
+            .preview_hit_index
+            .min(hit_offsets.len().saturating_sub(1));
 
         let mut action: Option<RowAction> = None;
+        let mut navigation: Option<usize> = None;
         Self::panel_frame().show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
-                    // 工具行:标题 + 打开/所在目录
-                    ui.horizontal(|ui| {
-                        if let Some(doc) = &document {
-                            ui.label(
-                                egui::RichText::new(&doc.title)
+                    // 工具行拆成标题和操作两行,避免长标题把右侧按钮挤出面板。
+                    if let Some(doc) = &document {
+                        let title = if doc.title.is_empty() {
+                            &doc.file_name
+                        } else {
+                            &doc.title
+                        };
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(title)
                                     .size(15.0)
                                     .strong()
                                     .color(Self::ink()),
-                            );
+                            )
+                            .truncate(),
+                        );
+                        ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -289,15 +358,38 @@ impl RsouApp {
                                     }
                                 },
                             );
-                        } else {
-                            ui.label(
-                                egui::RichText::new("预览")
-                                    .size(15.0)
-                                    .strong()
-                                    .color(Self::ink()),
-                            );
+                        });
+                        if hit_offsets.len() > 1 {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "命中批次 {} / {}",
+                                        current_hit_index + 1,
+                                        hit_offsets.len()
+                                    ))
+                                    .size(12.0)
+                                    .color(Self::muted()),
+                                );
+                                if preview_nav_button(ui, "上一批", current_hit_index > 0) {
+                                    navigation = Some(current_hit_index - 1);
+                                }
+                                if preview_nav_button(
+                                    ui,
+                                    "下一批",
+                                    current_hit_index + 1 < hit_offsets.len(),
+                                ) {
+                                    navigation = Some(current_hit_index + 1);
+                                }
+                            });
                         }
-                    });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("预览")
+                                .size(15.0)
+                                .strong()
+                                .color(Self::ink()),
+                        );
+                    }
                     ui.separator();
 
                     let Some(text) = self.preview_text.as_deref() else {
@@ -305,7 +397,7 @@ impl RsouApp {
                             egui::RichText::new(if self.preview_loading {
                                 "正在加载原文…"
                             } else {
-                                "点击左侧片段查看原文。"
+                                "点击左侧文档卡片查看原文。"
                             })
                             .size(14.0)
                             .color(Self::muted()),
@@ -353,7 +445,9 @@ impl RsouApp {
                                     && let Some(target) = target
                                     && line_end >= target
                                 {
-                                    response.scroll_to_me(Some(egui::Align::TOP));
+                                    // 不指定对齐方式:命中已在当前可视区域时不移动,
+                                    // 只有目标不在预览窗格内才滚动到目标位置。
+                                    response.scroll_to_me(None);
                                     scrolled = true;
                                 }
                                 offset = line_end + 1;
@@ -364,6 +458,12 @@ impl RsouApp {
                     }
                 });
         });
+        if let Some(hit_index) = navigation
+            && let Some(document_id) = document.as_ref().map(|doc| doc.id)
+            && let Some(&offset) = hit_offsets.get(hit_index)
+        {
+            self.focus_preview(document_id, hit_index, offset);
+        }
         let action_result = match action {
             Some(RowAction::Open(path)) => Some(platform::open_path(&path)),
             Some(RowAction::Reveal(path)) => Some(platform::reveal_in_folder(&path)),
@@ -399,10 +499,14 @@ fn preview_window(text: &str, target: Option<usize>) -> (&str, usize) {
     (&text[start..end], start)
 }
 
-/// 一篇文档的命中卡片:标题(标题命中上底色)+ 路径 + 片段列表。
-fn ui_doc_card(ui: &mut egui::Ui, doc_hit: &DocumentHit, focus: &mut Option<(i64, usize)>) {
-    RsouApp::card_frame(RsouApp::surface(), RsouApp::line(), 12).show(ui, |ui| {
-        let doc = &doc_hit.document;
+/// 一篇文档的命中卡片:标题(标题命中上底色)+ 路径 + 命中数。
+/// 整张卡片可点击,命中内容统一在右侧预览区显示。
+fn ui_doc_card(ui: &mut egui::Ui, doc_hit: &DocumentHit, focus: &mut Option<(i64, usize, usize)>) {
+    let doc = &doc_hit.document;
+    let first_hit_offset = doc_hit.hits.first().map(hit_offset).unwrap_or(0);
+    let card = RsouApp::card_frame(RsouApp::surface(), RsouApp::line(), 12).show(ui, |ui| {
+        // 让可点击区域铺满结果列,点击卡片的空白处也能切换预览。
+        ui.set_min_width(ui.available_width());
         // 标题行:标题命中上底色 + 类型徽标 + 命中数
         ui.horizontal_wrapped(|ui| {
             let title = if doc.title.is_empty() {
@@ -430,42 +534,32 @@ fn ui_doc_card(ui: &mut egui::Ui, doc_hit: &DocumentHit, focus: &mut Option<(i64
                 );
             });
         });
-        ui.label(
-            egui::RichText::new(&doc.path)
-                .size(11.0)
-                .color(RsouApp::soft()),
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(&doc.path)
+                    .size(11.0)
+                    .color(RsouApp::soft()),
+            )
+            .truncate(),
         );
-        ui.add_space(4.0);
-        for hit in &doc_hit.hits {
-            ui_hit_snippet(ui, doc.id, hit, focus);
-            ui.add_space(4.0);
-        }
     });
+    let response = ui.interact(
+        card.response.rect,
+        ui.id().with(("search-document-card", doc.id)),
+        egui::Sense::click(),
+    );
+    if response.clicked() {
+        *focus = Some((doc.id, 0, first_hit_offset));
+    }
 }
 
-/// 一条片段:标题路径(muted)+ 带底色的命中内容,点击定位到预览。
-fn ui_hit_snippet(
-    ui: &mut egui::Ui,
-    document_id: i64,
-    hit: &Hit,
-    focus: &mut Option<(i64, usize)>,
-) {
-    if !hit.context_header.is_empty() {
-        ui.add(egui::Label::new(span_job(
-            &hit.context_header,
-            0,
-            &hit.header_highlights,
-            RsouApp::muted(),
-            11.0,
-        )));
-    }
-    let job = span_job(&hit.content, 0, &hit.highlights, RsouApp::ink(), 13.0);
-    let response = ui.add(egui::Label::new(job).wrap().sense(egui::Sense::click()));
-    if response.clicked() {
-        // 定位到片段起点 + 首个高亮段开头。
-        let inner = hit.highlights.first().map(|s| s.start).unwrap_or(0);
-        *focus = Some((document_id, hit.start_offset + inner));
-    }
+/// 预览命中导航按钮:没有上一批/下一批时禁用,避免越界后循环跳转。
+fn preview_nav_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(text).size(12.0)).min_size(egui::vec2(72.0, 30.0)),
+    )
+    .clicked()
 }
 
 /// 行内文字按钮(与资料库页同款,避免跨模块私有依赖重复定义)。

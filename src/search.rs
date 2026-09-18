@@ -6,7 +6,7 @@
 //! - `highlight()` 会把同一短语的相邻词元合并成一个区间,区间文本可能含
 //!   空白或标点(逐字索引下 `文、档` 也会被短语 `"文档"` 命中),所以必须有
 //!   二次精确过滤:区间文本剔除空白后 **包含** 任一查询字面量才保留;
-//! - 按 document_id 保序聚合(行序 = rank 序),每篇最多 3 条片段。
+//! - 按 document_id 保序聚合(行序 = rank 序),保留每篇的全部命中片段。
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -84,9 +84,9 @@ pub struct DocumentHit {
     pub document: DocumentRow,
     /// 文档标题内的高亮区间(取该文档首个命中行的 title 列)
     pub title_highlights: Vec<Span>,
-    /// 片段,最多 3 条,按 rank
+    /// 全部命中片段,按 rank
     pub hits: Vec<Hit>,
-    /// 该文档过滤后的命中分块总数(可能 > hits.len())
+    /// 该文档过滤后的命中分块总数(与 hits.len() 一致)
     pub total_hits: usize,
     pub best_rank: f64,
 }
@@ -301,18 +301,17 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             }
         });
         acc.total_hits += 1;
-        if acc.hits.len() < 3 {
-            acc.hits.push(Hit {
-                chunk_id,
-                context_header,
-                start_offset: start_offset.max(0) as usize,
-                end_offset: end_offset.max(0) as usize,
-                content,
-                highlights,
-                header_highlights,
-                rank,
-            });
-        }
+        let start_offset = start_offset.max(0) as usize;
+        acc.hits.push(Hit {
+            chunk_id,
+            context_header,
+            start_offset,
+            end_offset: end_offset.max(0) as usize,
+            content,
+            highlights,
+            header_highlights,
+            rank,
+        });
     }
     drop(rows);
     drop(stmt);
@@ -567,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn hits_capped_at_three_and_totals_are_exact() {
+    fn all_hits_are_kept_and_totals_are_exact() {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc_chunks(
             &mut conn,
@@ -584,7 +583,7 @@ mod tests {
             .iter()
             .find(|d| d.document.path == "/d/多段.txt")
             .expect("多段文档应命中");
-        assert_eq!(doc.hits.len(), 3);
+        assert_eq!(doc.hits.len(), 5);
         assert_eq!(doc.total_hits, 5);
         // max_documents 截断 documents,但 total_documents 记真实数。
         let truncated = search(

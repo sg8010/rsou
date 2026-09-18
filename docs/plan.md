@@ -80,7 +80,7 @@ UI 方案与兼容性工程重建为一个 Rust + egui/eframe 单文件桌面应
 | `src/core/search/fts-repository.ts` | 388 | SQL 与过滤条件编译(去掉 `source_kind='pdf_page'` 页行,统一 chunk 行) |
 | `src/core/search/query-parser.ts` | 269 | 手写递归下降解析器照搬语法:隐式 AND、短语、`-`/NOT、OR、`title:`/`content:`;去掉 NEAR |
 | `src/core/search/jieba-query.ts` | 14 | `jieba-rs` 切词 → 每段加引号 → `AND` 连接(仅宽松模式) |
-| `src/core/search/search-service.ts` 关键词路径 | 约 300 | 高亮区间计算、按文档聚合(每篇最多 3 处)、标题命中过滤 |
+| `src/core/search/search-service.ts` 关键词路径 | 约 300 | 高亮区间计算、按文档聚合(保留全部命中片段)、标题命中过滤 |
 | `src/core/chunking/*` | 约 700 | 只用标题感知单层分块思路,自写约 250 LOC |
 | `src/renderer/features/search/*` | 约 1000 | 视觉与交互参考(结果列表 / 片段面板 / 命中类型标签),用 egui 重写 |
 
