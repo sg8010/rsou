@@ -351,13 +351,24 @@ impl RsouApp {
         }
     }
 
-    /// 每帧非阻塞地收取后台任务消息;回收已结束的 worker 线程。
+    /// 每帧非阻塞地收取后台任务消息;回收已结束的 worker 线程
+    /// (已完成的 join 掉收 panic 信息,未完成的继续留在列表里)。
     pub(crate) fn poll_workers(&mut self) {
         self.poll_import();
         self.poll_search();
         self.poll_preview();
         self.poll_maintain();
-        self.workers.retain(|worker| !worker.is_finished());
+        let mut still_running = Vec::with_capacity(self.workers.len());
+        for worker in std::mem::take(&mut self.workers) {
+            if worker.is_finished() {
+                if let Err(error) = worker.join() {
+                    log::warn!("后台线程异常结束: {error:?}");
+                }
+            } else {
+                still_running.push(worker);
+            }
+        }
+        self.workers = still_running;
     }
 
     /// 消费维护结果;完成后刷新统计与文档列表缓存。

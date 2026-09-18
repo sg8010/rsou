@@ -232,32 +232,43 @@ pub fn rebuild_fts(
 
     let mut inserted = 0u64;
     {
-        let mut select = tx.prepare(
-            "SELECT c.id, d.title, c.context_header, c.start_offset, c.end_offset, dc.plain_text \
-             FROM chunks c \
-             JOIN documents d ON d.id = c.document_id \
-             JOIN document_contents dc ON dc.document_id = c.document_id \
-             WHERE d.parse_status = 'parsed' ORDER BY c.id",
+        // 两层查询:外层按文档取一次 plain_text,内层按 document_id 逐块取
+        // (单行查询把 plain_text 按分块数成倍拷贝,大文档 × 多分块会放大内存)。
+        let mut select_docs = tx.prepare(
+            "SELECT d.id, d.title, dc.plain_text \
+             FROM documents d \
+             JOIN document_contents dc ON dc.document_id = d.id \
+             WHERE d.parse_status = 'parsed' ORDER BY d.id",
+        )?;
+        // Transaction 上没有 prepare_cached(它是 Connection 的方法,且与事务
+        // 的 &mut 借用冲突);这里 prepare 一次、事务内循环执行,效果相同。
+        let mut select_chunks = tx.prepare(
+            "SELECT id, context_header, start_offset, end_offset \
+             FROM chunks WHERE document_id = ?1 ORDER BY id",
         )?;
         let mut insert = tx.prepare(
             "INSERT INTO chunks_fts(rowid, title, context_header, content) \
              VALUES (?1, ?2, ?3, ?4)",
         )?;
-        let mut rows = select.query([])?;
-        while let Some(row) = rows.next()? {
-            let chunk_id: i64 = row.get(0)?;
-            let title: String = row.get(1)?;
-            let header: String = row.get(2)?;
-            let start = row.get::<_, i64>(3)? as usize;
-            let end = row.get::<_, i64>(4)? as usize;
-            let plain: String = row.get(5)?;
-            // 切片在 Rust 侧做:偏移是 UTF-8 字节偏移,越界/非边界时写空串
-            // (等于跳过这条,行数仍占一席,便于事后用完整性检查发现)。
-            let content = plain.get(start..end).unwrap_or_default();
-            insert.execute(params![chunk_id, title, header, content])?;
-            inserted += 1;
-            if inserted.is_multiple_of(PROGRESS_STEP) {
-                progress(inserted, total);
+        let mut doc_rows = select_docs.query([])?;
+        while let Some(doc) = doc_rows.next()? {
+            let doc_id: i64 = doc.get(0)?;
+            let title: String = doc.get(1)?;
+            let plain: String = doc.get(2)?;
+            let mut chunk_rows = select_chunks.query(params![doc_id])?;
+            while let Some(chunk) = chunk_rows.next()? {
+                let chunk_id: i64 = chunk.get(0)?;
+                let header: String = chunk.get(1)?;
+                let start = chunk.get::<_, i64>(2)? as usize;
+                let end = chunk.get::<_, i64>(3)? as usize;
+                // 切片在 Rust 侧做:偏移是 UTF-8 字节偏移,越界/非边界时写空串
+                // (等于跳过这条,行数仍占一席,便于事后用完整性检查发现)。
+                let content = plain.get(start..end).unwrap_or_default();
+                insert.execute(params![chunk_id, title, header, content])?;
+                inserted += 1;
+                if inserted.is_multiple_of(PROGRESS_STEP) {
+                    progress(inserted, total);
+                }
             }
         }
     }

@@ -474,8 +474,8 @@ tests/{end_to_end.rs,tokenizer_parity.rs,fixtures/}
 ### 阶段 0:兼容性验证先行(必须)
 
 状态:已完成,记录见 [stage0.md](stage0.md)(anydoc 目标矩阵、tokenizer 闭环、10 万文档基准三项通过)。
-两处遗留随阶段 1 收口:① 计划中的 release 二进制体积与冷启动时间尚未测;
-② arm64 目前只对 anydoc crate 做了 `cargo check`,沿用 bundled SQLite 的 C 编译要等 CI 的 arm64 runner。
+两处遗留的现状:① release 二进制体积已在阶段 1 实测,9.8 MB(目标 < 40 MB);
+② arm64 完整构建(含 bundled SQLite 的 C 编译)仍待 CI 的 arm64 runner 验证。
 
 三个 spike,每个都是可编译的小工程,结论决定后续选型:
 
@@ -491,11 +491,15 @@ tests/{end_to_end.rs,tokenizer_parity.rs,fixtures/}
 
 ### 阶段 1:骨架与存储
 
+状态:已完成(提交 d2c3208)。
+
 搬 excelookup 的 shell/theme/startup/file_dialog/filebrowser/build.rs/vendor/CI/deb,
 改品牌;建库、schema、迁移(单版本)、注册 tokenizer、CLI 打印文档表。
 **完成标准**:arm64 deb 装得上、启动日志正常、空库可打开且能建 FTS 表。
 
 ### 阶段 2:解析与导入
+
+状态:已完成(提交 cbae9ec)。
 
 `parse.rs` + `text.rs` + `chunk.rs` + `import.rs` + 资料库页;单文件与文件夹导入、
 进度、取消、失败清单、去重与变更重解析。**完成标准**:fixtures 全绿;真实语料导入无 panic,
@@ -503,16 +507,23 @@ tests/{end_to_end.rs,tokenizer_parity.rs,fixtures/}
 
 ### 阶段 3:检索
 
+状态:已完成(提交 4177314)。
+
 `query.rs` + `search.rs` + 检索页 + 预览高亮。**完成标准**:§10 的 tokenizer/注册/查询/过滤
 四层单测全绿;中文短语与两字词命中符合预期;10 万文档量级查询 < 300 ms。
 
 ### 阶段 4:设置与索引维护
+
+状态:已完成(提交 098b511)。
 
 设置页、重建/优化/完整性检查、统计口径(文档数/分块数/索引体积)、数据目录展示与打开日志。
 注意重建与完整性检查都依赖 tokenizer 已注册(在 `store::open` 之后执行)。
 **完成标准**:重建后结果集与增量索引一致;完整性检查能检出并修复 FTS 不一致。
 
 ### 阶段 5:发布
+
+状态:代码与文档已完成(README、AGENTS.md、CI 收窄到 `-p rsou`、Windows 目标 `cargo check` 通过)。
+仍待实际执行的门禁:arm64 CI 首次发版、Win7 x64/x86 完整交叉构建 + 导入表审计、真机 GUI 验收(均由用户手动完成)。
 
 CI 发版、deb 结构校验、Win7 x64/x86 交叉编译与导入表审计、README 写「启动失败排查」
 (照抄 excelookup 的组织方式:日志路径、`.1` 轮转、动态链接错误、崩溃留痕、兜底提示链),
