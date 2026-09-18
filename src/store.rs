@@ -223,6 +223,7 @@ CREATE INDEX IF NOT EXISTS idx_documents_canonical_path ON documents(canonical_p
 CREATE INDEX IF NOT EXISTS idx_documents_parse_status ON documents(parse_status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_import_items_run_status ON import_items(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_import_items_document_id ON import_items(document_id);
 ";
 
 #[cfg(test)]
@@ -272,6 +273,25 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn import_items_document_id_index_exists() {
+        let path = temp_db("idx");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            // import_items.document_id 是 ON DELETE SET NULL 外键,删文档时靠它避免全表扫。
+            let exists: bool = connection
+                .query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master \
+                     WHERE type = 'index' AND name = 'idx_import_items_document_id'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "应创建 idx_import_items_document_id 索引");
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

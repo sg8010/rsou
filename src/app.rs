@@ -109,6 +109,12 @@ pub(crate) struct PreviewMsg {
     pub text: Option<String>,
 }
 
+/// 文档列表 worker 回传的消息(文档列表 + 失败清单)。
+pub(crate) struct DocsMsg {
+    pub generation: u64,
+    pub result: Result<(Vec<DocumentRow>, Vec<DocumentRow>), String>,
+}
+
 /// 索引维护任务的种类(设置页四个按钮一一对应)。
 #[derive(Clone, Copy)]
 pub(crate) enum MaintainKind {
@@ -152,14 +158,34 @@ pub struct RsouApp {
     db_error: Option<String>,
     /// 数据目录布局(data_dir / db_path / tmp_dir)
     dirs: DataDirs,
+    /// 界面上下文(后台线程读完数据后 request_repaint 用)
+    egui_ctx: egui::Context,
     /// 启动日志路径(设置页展示用)
     startup_log_path: Option<PathBuf>,
     /// 资料库页的操作提示(文件已选中等)
     library_notice: Option<String>,
-    /// 文档列表缓存(资料库页表格;不每帧查库,按事件刷新)
+    /// 文档列表缓存(资料库页表格;后台线程读取,按事件刷新)
     documents: Vec<DocumentRow>,
     /// 解析失败的文档(失败清单抽屉;与 documents 同一次刷新)
     failed_documents: Vec<DocumentRow>,
+    /// documents 换代号:每次替换/修改 +1,过滤缓存据它失效
+    documents_version: u64,
+    /// 过滤后的 documents 下标(表格渲染复用;filtered_key 命中时不重算)
+    filtered_docs: Vec<usize>,
+    /// 过滤缓存键:(小写过滤词, documents_version)
+    filtered_key: Option<(String, u64)>,
+    /// 文档列表后台读取通道(世代号随通道存)
+    docs_rx: Option<(u64, Receiver<DocsMsg>)>,
+    /// 文档列表读取世代号
+    docs_gen: u64,
+    /// 文档列表正在后台读取
+    docs_loading: bool,
+    /// 有读取在途时又收到刷新请求:在途结果落地后补读一次
+    docs_refresh_pending: bool,
+    /// 导入中有文件处理完(需要节流刷新列表)
+    docs_dirty: bool,
+    /// 上次文档列表读取落地时间(节流用)
+    docs_last_refresh: Option<std::time::Instant>,
     /// 文件名过滤(内存过滤缓存列表)
     doc_filter: String,
     /// 「显示失败清单」抽屉开关
@@ -214,6 +240,8 @@ pub struct RsouApp {
     preview_loading: bool,
     /// 点片段后待滚动的 plain_text 字节偏移(渲染一次后清除)
     pending_scroll: Option<usize>,
+    /// 预览窗口的稳定中心(plain_text 字节偏移;只在 focus_preview 时更新)
+    preview_anchor: usize,
     /// 索引统计缓存(设置页卡片;进入设置页/维护完成后刷新,不每帧查)
     index_stats: Option<IndexStats>,
     /// 是否有索引维护任务在后台进行
@@ -249,16 +277,26 @@ pub struct RsouApp {
 }
 
 impl RsouApp {
-    fn new_state() -> Self {
+    fn new_state(ctx: &egui::Context) -> Self {
         Self {
             page: Page::Library,
             db: None,
             db_error: None,
             dirs: store::data_dirs(),
+            egui_ctx: ctx.clone(),
             startup_log_path: None,
             library_notice: None,
             documents: Vec::new(),
             failed_documents: Vec::new(),
+            documents_version: 0,
+            filtered_docs: Vec::new(),
+            filtered_key: None,
+            docs_rx: None,
+            docs_gen: 0,
+            docs_loading: false,
+            docs_refresh_pending: false,
+            docs_dirty: false,
+            docs_last_refresh: None,
             doc_filter: String::new(),
             show_failures: false,
             prev_page: Page::Library,
@@ -286,6 +324,7 @@ impl RsouApp {
             preview_gen: 0,
             preview_loading: false,
             pending_scroll: None,
+            preview_anchor: 0,
             index_stats: None,
             maintenance_active: false,
             maintain_rx: None,
@@ -368,9 +407,9 @@ impl eframe::App for RsouApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
-                        // 进入资料库页时刷新文档列表缓存(不每帧查库)
+                        // 进入资料库页时后台刷新文档列表缓存(不每帧查库)
                         if self.page == Page::Library && self.prev_page != Page::Library {
-                            self.refresh_documents();
+                            self.request_documents_refresh();
                         }
                         // 进入设置页时刷新索引统计(同样不每帧查库)
                         if self.page == Page::Settings && self.prev_page != Page::Settings {

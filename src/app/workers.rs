@@ -5,6 +5,7 @@
 //! worker 不直接触碰 GUI。写库连接由导入线程自己打开(GUI 的连接不跨线程)。
 
 use std::sync::mpsc;
+use std::time::Duration;
 
 use rsou_lib::import::{self, FileOutcome, ImportOptions};
 use rsou_lib::maintain;
@@ -20,10 +21,10 @@ impl RsouApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
         Self::configure_ui_style(&cc.egui_ctx);
-        let mut app = Self::new_state();
+        let mut app = Self::new_state(&cc.egui_ctx);
         app.open_store();
-        // 启动时先读一遍,资料库页首次进入就有数据
-        app.refresh_documents();
+        // 启动时后台读一遍,资料库页首次进入就有数据
+        app.request_documents_refresh();
         app.load_settings();
         app
     }
@@ -147,20 +148,49 @@ impl RsouApp {
         }
     }
 
-    /// 重新读取文档列表缓存(进入资料库页 / 导入结束 / 周期性刷新时调用)。
-    pub(crate) fn refresh_documents(&mut self) {
-        let Some(conn) = &self.db else { return };
-        match repo::list_documents(conn) {
-            Ok(documents) => {
-                // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
-                let old = std::mem::replace(&mut self.documents, documents);
-                drop_in_background(old);
-            }
+    /// 后台重读文档列表缓存(进入资料库页 / 导入节奏刷新 / 删除与维护后调用)。
+    /// 已有读取在途时只记 pending,在途结果落地后再发一次,保证读到最终状态。
+    pub(crate) fn request_documents_refresh(&mut self) {
+        if self.db.is_none() {
+            return;
+        }
+        if self.docs_rx.is_some() {
+            self.docs_refresh_pending = true;
+            return;
+        }
+        self.docs_gen += 1;
+        let generation = self.docs_gen;
+        self.docs_loading = true;
+        self.docs_dirty = false;
+        let (tx, rx) = mpsc::channel::<DocsMsg>();
+        self.docs_rx = Some((generation, rx));
+
+        let db_path = self.dirs.db_path.clone();
+        let ctx = self.egui_ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rsou-docs".to_owned())
+            .spawn(move || {
+                // 读取线程自己开只读连接;库不可用时把中文原因带回。
+                let result = store::open(&db_path, OpenMode::ReadOnly)
+                    .and_then(|conn| {
+                        Ok((
+                            repo::list_documents(&conn)?,
+                            repo::list_failed_documents(&conn)?,
+                        ))
+                    })
+                    .map_err(|error| format!("{error:#}"));
+                if tx.send(DocsMsg { generation, result }).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(handle) => self.workers.push(handle),
             Err(error) => {
-                self.library_notice = Some(format!("读取文档列表失败: {error:#}"));
+                self.docs_loading = false;
+                self.docs_rx = None;
+                self.library_notice = Some(format!("无法启动文档列表读取线程: {error}"));
             }
         }
-        self.failed_documents = repo::list_failed_documents(conn).unwrap_or_default();
     }
 
     /// 删除一篇文档并刷新缓存(用 GUI 连接做一次短写;导入中禁用由页面把关)。
@@ -171,7 +201,11 @@ impl RsouApp {
         match repo::delete_document(conn, id) {
             Ok(()) => {
                 self.library_notice = Some("已移除文档".to_owned());
-                self.refresh_documents();
+                // 先从缓存里摘掉,避免后台读取落地前表格还显示已删行
+                self.documents.retain(|d| d.id != id);
+                self.failed_documents.retain(|d| d.id != id);
+                self.documents_version += 1;
+                self.request_documents_refresh();
             }
             Err(error) => self.library_notice = Some(format!("移除失败: {error:#}")),
         }
@@ -277,6 +311,7 @@ impl RsouApp {
     pub(crate) fn focus_preview(&mut self, document_id: i64, hit_index: usize, byte_offset: usize) {
         self.preview_hit_index = hit_index;
         self.pending_scroll = Some(byte_offset);
+        self.preview_anchor = byte_offset;
         if self.preview_doc_id != Some(document_id) || self.preview_text.is_none() {
             self.preview_doc_id = Some(document_id);
             let old = self.preview_text.take();
@@ -356,6 +391,7 @@ impl RsouApp {
     /// (已完成的 join 掉收 panic 信息,未完成的继续留在列表里)。
     pub(crate) fn poll_workers(&mut self) {
         self.poll_import();
+        self.poll_docs();
         self.poll_search();
         self.poll_preview();
         self.poll_maintain();
@@ -397,7 +433,43 @@ impl RsouApp {
                 self.refresh_index_stats();
                 // 清空后文档列表必须跟着空;重建/优化后也顺手刷新,成本一样。
                 if !matches!(kind, MaintainKind::Check) {
-                    self.refresh_documents();
+                    self.request_documents_refresh();
+                }
+            }
+        }
+    }
+
+    /// 消费文档列表读取结果;pending 时在落地后再发一次,保证读到最终状态。
+    fn poll_docs(&mut self) {
+        if let Some((generation, rx)) = &self.docs_rx
+            && *generation == self.docs_gen
+        {
+            let mut msg = None;
+            while let Ok(event) = rx.try_recv() {
+                msg = Some(event);
+            }
+            if let Some(DocsMsg { generation, result }) = msg
+                && generation == self.docs_gen
+            {
+                self.docs_loading = false;
+                self.docs_rx = None;
+                self.docs_last_refresh = Some(std::time::Instant::now());
+                match result {
+                    Ok((documents, failed)) => {
+                        // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
+                        let old = std::mem::replace(&mut self.documents, documents);
+                        drop_in_background(old);
+                        self.failed_documents = failed;
+                        self.documents_version += 1;
+                    }
+                    Err(error) => {
+                        self.library_notice = Some(format!("读取文档列表失败: {error}"));
+                    }
+                }
+                // 在途期间又收到过刷新请求:结果已落地,补读一次拿最终状态。
+                if self.docs_refresh_pending {
+                    self.docs_refresh_pending = false;
+                    self.request_documents_refresh();
                 }
             }
         }
@@ -457,11 +529,10 @@ impl RsouApp {
         }
     }
 
-    /// 消费导入事件:更新进度、按节奏刷新文档列表。
+    /// 消费导入事件:更新进度、按节奏后台刷新文档列表。
     ///
     /// 消息里带世代号,换代后晚到的旧事件直接丢弃。
     fn poll_import(&mut self) {
-        let mut file_done = 0usize;
         let mut finished = false;
         if let Some((generation, rx)) = &self.import_rx
             && *generation == self.import_gen
@@ -490,7 +561,7 @@ impl RsouApp {
                                 self.import_progress.recent_failures.pop_front();
                             }
                         }
-                        file_done += 1;
+                        self.docs_dirty = true;
                     }
                     ImportEvent::Finished {
                         counts, cancelled, ..
@@ -518,9 +589,16 @@ impl RsouApp {
             self.import_rx = None;
             self.import_cancel = None;
         }
-        // 文档列表刷新:导入结束立刻刷;导入中每 20 个文件刷一次,不每事件刷
-        if finished || file_done >= 20 {
-            self.refresh_documents();
+        // 文档列表后台刷新:导入结束立刻读一次(pending 机制保证在途读取
+        // 落地后还会再读,最终状态一定刷新);导入中至少间隔一秒才发一次。
+        if finished
+            || (self.docs_dirty
+                && self.docs_rx.is_none()
+                && self
+                    .docs_last_refresh
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(1)))
+        {
+            self.request_documents_refresh();
         }
     }
 

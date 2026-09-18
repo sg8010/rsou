@@ -152,9 +152,8 @@ pub fn parse_bytes(path: &Path, bytes: &[u8]) -> Result<Parsed, ParseError> {
     }
 }
 
-/// 读文件并解析。先按元数据判超限,再读,再走 `parse_bytes`。
-/// 返回解析产物与原始字节(调用方算内容哈希)。
-pub fn parse_file(path: &Path, max_bytes: u64) -> Result<(Parsed, Vec<u8>), ParseError> {
+/// 读文件:先按元数据判超限,再整体读入(导入流程在解析前先算内容哈希)。
+pub fn read_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ParseError> {
     let meta = std::fs::metadata(path).map_err(|e| io_error(path, &e))?;
     if meta.len() > max_bytes {
         return Err(ParseError::new(
@@ -163,7 +162,13 @@ pub fn parse_file(path: &Path, max_bytes: u64) -> Result<(Parsed, Vec<u8>), Pars
             format!("{} 字节", meta.len()),
         ));
     }
-    let bytes = std::fs::read(path).map_err(|e| io_error(path, &e))?;
+    std::fs::read(path).map_err(|e| io_error(path, &e))
+}
+
+/// 读文件并解析(`read_file` + `parse_bytes` 的组合)。
+/// 返回解析产物与原始字节(调用方算内容哈希)。
+pub fn parse_file(path: &Path, max_bytes: u64) -> Result<(Parsed, Vec<u8>), ParseError> {
+    let bytes = read_file(path, max_bytes)?;
     let parsed = parse_bytes(path, &bytes)?;
     Ok((parsed, bytes))
 }

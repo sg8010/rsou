@@ -3,7 +3,8 @@
 //! 线程模型(见 docs/plan.md §7.3):
 //! - `run_import` 在调用线程执行(GUI 把它放进 `std::thread`),自己开写连接;
 //! - 文件读取、解析、文本化、分块、哈希在 rayon 线程池并行;
-//! - 所有写库操作串行发生在调用线程,经 mpsc 通道消费 worker 结果。
+//! - 所有写库操作串行发生在调用线程,经有界 mpsc 通道消费 worker 结果
+//!   (写库慢时通道给解析线程背压)。
 //!
 //! 取消:worker 在每个文件开工前检查 cancel 标志;单文件解析不可中断
 //! (anydoc 没有取消接口),置位后已开始的文件会跑完,未开始的直接不开工。
@@ -183,7 +184,9 @@ pub fn run_import(
     };
     let mut first_error: Option<anyhow::Error> = None;
 
-    let (tx, rx) = mpsc::channel::<FileResult>();
+    // 有界通道:写库慢时给解析线程背压;消费者在写库出错后仍排空通道,
+    // 生产者不会卡死在 send 上。
+    let (tx, rx) = mpsc::sync_channel::<FileResult>(rayon::current_num_threads().max(1) * 2);
     let options_ref = &options;
     let cancel_ref = &cancel;
     let existing_ref = &existing;
@@ -344,8 +347,9 @@ fn process_file(
         };
     }
 
-    let (parsed, bytes) = match parse::parse_file(path, options.max_file_bytes) {
-        Ok(pair) => pair,
+    // 先读后算哈希:内容未变的文件在二级跳过就返回,不白白解析一遍。
+    let bytes = match parse::read_file(path, options.max_file_bytes) {
+        Ok(bytes) => bytes,
         Err(error) => {
             return FileResult::Done {
                 meta,
@@ -369,7 +373,7 @@ fn process_file(
         };
     }
 
-    let result = build_document(&meta, parsed);
+    let result = parse::parse_bytes(path, &bytes).and_then(|parsed| build_document(&meta, parsed));
     FileResult::Done { meta, hash, result }
 }
 

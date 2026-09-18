@@ -143,13 +143,9 @@ fn split_long_block(text: &str, base: usize) -> Vec<(usize, usize)> {
     let mut pieces = Vec::new();
     let mut rest = text;
     let mut rest_base = base;
-    while rest.chars().count() > CHUNK_MAX_CHARS {
-        // 前 MAX 字符对应的字节前缀。
-        let prefix_bytes = rest
-            .char_indices()
-            .nth(CHUNK_MAX_CHARS)
-            .map(|(i, _)| i)
-            .unwrap_or(rest.len());
+    // nth(MAX) 为 Some ⇔ 剩余字符数 > MAX,其字节下标即前 MAX 字符的前缀长度;
+    // 只扫前 MAX 个字符,不每轮数完剩余全文。
+    while let Some((prefix_bytes, _)) = rest.char_indices().nth(CHUNK_MAX_CHARS) {
         let prefix = &rest[..prefix_bytes];
         // 窗口内最后一个句末标点,切在它之后。
         let cut = prefix
@@ -315,6 +311,29 @@ mod tests {
             assert!(piece.chars().count() <= CHUNK_MAX_CHARS);
             assert!(SENTENCE_ENDS.contains(&piece.chars().last().unwrap()));
         }
+    }
+
+    #[test]
+    fn huge_single_block_splits_in_linear_time() {
+        // 200 万字符的单块(无标题、无句末标点):逐段硬切,不整体反复扫描。
+        let body = "文".repeat(2_000_000);
+        let plain = PlainText {
+            text: body.clone(),
+            blocks: vec![Block {
+                start: 0,
+                end: body.len(),
+                heading_level: None,
+            }],
+        };
+        let chunks = chunk_document("", &plain);
+        let mut prev_end = 0;
+        for chunk in &chunks {
+            let piece = &plain.text[chunk.start..chunk.end];
+            assert!(piece.chars().count() <= CHUNK_MAX_CHARS);
+            assert_eq!(chunk.start, prev_end, "相邻块应首尾相接");
+            prev_end = chunk.end;
+        }
+        assert_eq!(prev_end, plain.text.len(), "分块并集应覆盖整个块");
     }
 
     #[test]

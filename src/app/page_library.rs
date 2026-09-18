@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use egui_extras::{Column, TableBuilder};
 use rsou_lib::filebrowser;
-use rsou_lib::repo::DocumentRow;
 
 use super::*;
 
@@ -146,7 +145,21 @@ impl RsouApp {
 
     /// 文档列表表格(虚拟滚动;行操作收集后统一落地)。
     fn ui_documents_table(&mut self, ui: &mut egui::Ui) {
-        if self.documents.is_empty() && self.db.is_some() && !self.import_active {
+        if self.documents.is_empty() && self.docs_loading {
+            Self::work_panel(ui, "列表", "文档列表", "", None, |ui| {
+                ui.label(
+                    egui::RichText::new("正在读取文档列表…")
+                        .size(15.0)
+                        .color(Self::muted()),
+                );
+            });
+            return;
+        }
+        if self.documents.is_empty()
+            && self.db.is_some()
+            && !self.import_active
+            && !self.docs_loading
+        {
             Self::work_panel(ui, "列表", "文档列表", "", None, |ui| {
                 ui.label(
                     egui::RichText::new("资料库为空,点「添加文件」或「添加文件夹」开始导入。")
@@ -157,12 +170,24 @@ impl RsouApp {
             return;
         }
 
-        let filter = self.doc_filter.trim().to_lowercase();
-        let filtered: Vec<&DocumentRow> = self
-            .documents
-            .iter()
-            .filter(|d| filter.is_empty() || d.file_name.to_lowercase().contains(&filter))
-            .collect();
+        // 过滤结果按 (过滤词, 列表换代号) 缓存,不每帧重建。
+        let key = (
+            self.doc_filter.trim().to_lowercase(),
+            self.documents_version,
+        );
+        if self.filtered_key.as_ref() != Some(&key) {
+            let filter = &key.0;
+            self.filtered_docs = self
+                .documents
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| filter.is_empty() || d.file_name.to_lowercase().contains(filter))
+                .map(|(i, _)| i)
+                .collect();
+            self.filtered_key = Some(key);
+        }
+        let documents = &self.documents;
+        let filtered = &self.filtered_docs;
 
         let mut action: Option<RowAction> = None;
         let busy = self.import_active || self.maintenance_active;
@@ -211,7 +236,7 @@ impl RsouApp {
                     })
                     .body(|body| {
                         body.rows(26.0, filtered.len(), |mut row| {
-                            let doc = filtered[row.index()];
+                            let doc = &documents[filtered[row.index()]];
                             // 文件名:截断显示,hover 看完整路径
                             row.col(|ui| {
                                 ui.label(

@@ -412,8 +412,9 @@ impl RsouApp {
                         return;
                     };
 
-                    // 大文档只渲染命中附近的窗口。
-                    let (window, base) = preview_window(text, self.pending_scroll);
+                    // 大文档只渲染命中附近的窗口(锚点是稳定的命中偏移,
+                    // 滚动请求清除后窗口不跳回文首)。
+                    let (window, base) = preview_window(text, self.preview_anchor);
                     if base > 0 || window.len() < text.len() {
                         ui.label(
                             egui::RichText::new("文档过大,只显示命中附近的内容。")
@@ -488,13 +489,13 @@ enum RowAction {
     Reveal(PathBuf),
 }
 
-/// 计算预览窗口:超过 PREVIEW_MAX_BYTES 时以滚动目标为中心取 ±PREVIEW_WINDOW_BYTES。
+/// 计算预览窗口:超过 PREVIEW_MAX_BYTES 时以锚点(命中偏移)为中心取 ±PREVIEW_WINDOW_BYTES。
 /// 返回 (窗口文本, 窗口起点在原文字节偏移)。边界取字符边界。
-fn preview_window(text: &str, target: Option<usize>) -> (&str, usize) {
+fn preview_window(text: &str, anchor: usize) -> (&str, usize) {
     if text.len() <= PREVIEW_MAX_BYTES {
         return (text, 0);
     }
-    let center = target.unwrap_or(0).min(text.len());
+    let center = anchor.min(text.len());
     let mut start = center.saturating_sub(PREVIEW_WINDOW_BYTES);
     while start > 0 && !text.is_char_boundary(start) {
         start -= 1;
@@ -575,4 +576,48 @@ fn link_button(ui: &mut egui::Ui, text: &str) -> bool {
         egui::Button::new(egui::RichText::new(text).size(12.0).color(RsouApp::blue())).frame(false),
     )
     .clicked()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_window_short_text_returns_whole() {
+        let text = "短文本,不超过上限。";
+        assert_eq!(preview_window(text, 0), (text, 0));
+        // 锚点越界也不影响短文本
+        assert_eq!(preview_window(text, usize::MAX), (text, 0));
+    }
+
+    #[test]
+    fn preview_window_centers_on_anchor() {
+        let text = "a".repeat(PREVIEW_MAX_BYTES + 4 * PREVIEW_WINDOW_BYTES);
+        let anchor = text.len() / 2 + 123;
+        let (window, base) = preview_window(&text, anchor);
+        assert!(base > 0);
+        assert!(base <= anchor);
+        assert!(anchor <= base + window.len());
+        assert!(window.len() <= 2 * PREVIEW_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn preview_window_same_anchor_is_stable() {
+        // 滚动请求清除前后(同一锚点)窗口必须一致,不能跳回文首。
+        let text = "a".repeat(PREVIEW_MAX_BYTES + 4 * PREVIEW_WINDOW_BYTES);
+        let anchor = text.len() / 2;
+        assert_eq!(preview_window(&text, anchor), preview_window(&text, anchor));
+    }
+
+    #[test]
+    fn preview_window_stays_on_char_boundaries() {
+        // 多字节字符:窗口两端都必须落在字符边界上(切片不能 panic)。
+        let text = "文".repeat(PREVIEW_MAX_BYTES + 4 * PREVIEW_WINDOW_BYTES);
+        let anchor = text.len() / 2 + 1;
+        let (window, base) = preview_window(&text, anchor);
+        assert!(text.is_char_boundary(base));
+        assert!(text.is_char_boundary(base + window.len()));
+        assert!(base <= anchor);
+        assert!(anchor <= base + window.len());
+    }
 }

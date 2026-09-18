@@ -94,6 +94,51 @@ fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
 }
 
 #[test]
+fn unchanged_content_with_new_mtime_is_skipped() {
+    let dir = common::temp_dir("e2e-mtime");
+    let db_path = dir.join("index.sqlite3");
+    let docs_dir = dir.join("docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    let file = docs_dir.join("笔记.txt");
+    let bytes = common::txt_utf8_fixture();
+    std::fs::write(&file, &bytes).unwrap();
+
+    let (counts, _) = run(&db_path, vec![docs_dir.clone()], false);
+    assert_eq!(counts.ok, 1);
+
+    let conn = store::open(&db_path, OpenMode::ReadOnly).unwrap();
+    let canonical = file.canonicalize().unwrap();
+    let before = repo::find_document_by_path(&conn, &canonical)
+        .unwrap()
+        .unwrap();
+    drop(conn);
+
+    // 等一拍再原样重写:mtime 变、内容不变,应命中哈希二级跳过。
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(&file, &bytes).unwrap();
+    let new_mtime_ms = std::fs::metadata(&file)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(new_mtime_ms > before.file_mtime_ms, "mtime 应已变化");
+
+    let (counts, _) = run(&db_path, vec![docs_dir.clone()], false);
+    assert_eq!(counts.skipped, 1);
+    assert_eq!(counts.ok, 0);
+
+    let conn = store::open(&db_path, OpenMode::ReadOnly).unwrap();
+    let after = repo::find_document_by_path(&conn, &canonical)
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.indexed_at, before.indexed_at, "indexed_at 不应变化");
+    assert_eq!(after.updated_at, before.updated_at, "updated_at 不应变化");
+    assert_eq!(after.file_mtime_ms, new_mtime_ms, "file_mtime_ms 应已更新");
+}
+
+#[test]
 fn import_skip_reimport_and_delete() {
     let dir = common::temp_dir("e2e");
     let db_path = dir.join("index.sqlite3");
