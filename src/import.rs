@@ -514,3 +514,86 @@ fn consume(
     counts.processed += 1;
     Ok((path, outcome))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+
+    fn file_meta(path: &str) -> FileMeta {
+        FileMeta {
+            path: path.into(),
+            canonical_path: path.into(),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            ext: path.rsplit('.').next().unwrap_or("").to_owned(),
+            file_type: crate::parse::FileType::Text,
+            file_size: 0,
+            file_mtime_ms: 1_000,
+        }
+    }
+
+    fn done_result(path: &str, hash: &str) -> FileResult {
+        let meta = file_meta(path);
+        let parsed = build_document(
+            &meta,
+            parse::Parsed {
+                markdown: "正文".to_owned(),
+                warnings: Vec::new(),
+                parser_name: "text",
+                parser_version: "text.v1",
+            },
+        )
+        .unwrap();
+        FileResult::Done {
+            meta,
+            hash: hash.to_owned(),
+            result: Ok(parsed),
+        }
+    }
+
+    fn row_count(conn: &rusqlite::Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn write_batch_rolls_back_whole_batch_on_error() {
+        let mut conn = store::open_in_memory().unwrap();
+        // 特定路径的 item 写入触发失败,模拟批量写库中途出错。
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_item BEFORE INSERT ON import_items \
+             WHEN new.path LIKE '%坏%' \
+             BEGIN SELECT RAISE(ABORT, '注入的写库失败'); END;",
+        )
+        .unwrap();
+        let run_id = repo::create_run(&conn, "files", None, 3, 1_000).unwrap();
+        let counts = ImportCounts {
+            total: 3,
+            ..ImportCounts::default()
+        };
+
+        let batch = vec![
+            done_result("/d/甲.txt", "h1"),
+            done_result("/d/坏.txt", "h2"),
+            done_result("/d/丙.txt", "h3"),
+        ];
+        let result = write_batch(&mut conn, run_id, batch, counts);
+        assert!(result.is_err(), "触发器应让整批失败");
+        // 整批回滚:触发器之前已写成功的 甲.txt 也不能留。
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM chunks_fts"), 0);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM import_items"), 0);
+        assert!(conn.is_autocommit(), "失败事务应已随 drop 回滚");
+
+        // 对照:不含坏文件的批次正常提交,事件带逐条计数快照。
+        let batch = vec![
+            done_result("/d/甲.txt", "h1"),
+            done_result("/d/丙.txt", "h3"),
+        ];
+        let (counts, events) = write_batch(&mut conn, run_id, batch, counts).unwrap();
+        assert_eq!(counts.ok, 2);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].2.processed, 1);
+        assert_eq!(events[1].2.processed, 2);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 2);
+    }
+}

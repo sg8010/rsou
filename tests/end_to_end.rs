@@ -113,9 +113,15 @@ fn unchanged_content_with_new_mtime_is_skipped() {
         .unwrap();
     drop(conn);
 
-    // 等一拍再原样重写:mtime 变、内容不变,应命中哈希二级跳过。
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    std::fs::write(&file, &bytes).unwrap();
+    // 显式改 mtime、内容不变,应命中哈希二级跳过。
+    let new_mtime = std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_millis((before.file_mtime_ms + 5_000) as u64);
+    std::fs::File::options()
+        .write(true)
+        .open(&file)
+        .unwrap()
+        .set_modified(new_mtime)
+        .unwrap();
     let new_mtime_ms = std::fs::metadata(&file)
         .unwrap()
         .modified()
@@ -123,7 +129,7 @@ fn unchanged_content_with_new_mtime_is_skipped() {
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    assert!(new_mtime_ms > before.file_mtime_ms, "mtime 应已变化");
+    assert!(new_mtime_ms != before.file_mtime_ms, "mtime 应已变化");
 
     let (counts, _) = run(&db_path, vec![docs_dir.clone()], false);
     assert_eq!(counts.skipped, 1);

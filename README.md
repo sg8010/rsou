@@ -91,7 +91,7 @@ chmod +x rsou-linux-arm64
 3. **设置**页 → 查看数据位置与索引统计;做完整性检查、重建索引、优化或清空;
    调整单文件体积上限
 
-命令行工具 `rsou-cli` 可对同一个索引库做导入/检索/维护(见下表)。
+
 
 ## 数据目录与日志
 
@@ -112,26 +112,10 @@ chmod +x rsou-linux-arm64
 `MATCH`/`highlight()` 会报 `no such tokenizer: rsou`;普通表的查询、
 `integrity_check` 不受影响。
 
-因此:只读翻看 `documents`/`chunks` 等普通表没有问题;任何涉及 `chunks_fts`
-的读写请通过本程序(GUI 或 `rsou-cli`)进行,不要手工改这个文件。
+因此：只读翻看 `documents`/`chunks` 等普通表没有问题;任何涉及 `chunks_fts`
+的读写请通过本程序 (GUI) 进行，不要手工改这个文件。
 
-## rsou-cli
 
-| 子命令 | 作用 |
-|---|---|
-| `rsou-cli docs` | 打印 documents 表(id/文件名/类型/状态/分块数) |
-| `rsou-cli stats` | 文档数、分块数、FTS 行数、原文字节、索引文件体积 |
-| `rsou-cli schema` | 打印建表语句(验证 FTS 表与自定义分词器) |
-| `rsou-cli import <路径...> [--force]` | 导入文件/目录(目录递归;--force 全部重解析) |
-| `rsou-cli parse <文件>` | 解析单文件,Markdown 打 stdout;失败打中文原因与错误码,退出码 1 |
-| `rsou-cli text <文件>` | 打印纯文本与分块边界摘要 |
-| `rsou-cli search <查询> [--loose] [--scope all\|title\|content] [--type word,pdf...] [--limit N]` | 全文检索,片段用【】标出高亮 |
-| `rsou-cli check` | 完整性检查;索引不一致时退出码 1 |
-| `rsou-cli rebuild` | 重建全文索引(打印进度与行数) |
-| `rsou-cli optimize` | FTS optimize + WAL 截断 + VACUUM |
-| `rsou-cli clear --yes` | 清空资料库(保留 settings;无 --yes 拒绝) |
-
-公共选项 `--db PATH` 指定索引库路径,缺省用上面数据目录下的 `index.sqlite3`。
 
 ## 启动失败排查
 
@@ -196,7 +180,7 @@ Linux 图形版需要 X11 和 OpenGL/EGL 运行库;不同设备的显卡驱动�
 ### Linux 本机
 
 ```bash
-cargo build --release            # 产物: target/release/rsou 与 target/release/rsou-cli
+cargo build --release            # 产物：target/release/rsou
 ```
 
 ### Linux arm64 deb(走 CI)
@@ -268,7 +252,6 @@ src/
 ├── search.rs      # FTS 查询 + 二次精确过滤 + 按文档聚合与高亮
 ├── maintain.rs    # 统计 / 完整性检查 / 重建 / optimize / 清空
 ├── filebrowser.rs # 目录列举/排序/过滤等文件浏览纯逻辑
-└── bin/cli.rs     # rsou-cli
 build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)
 assets/            # icon.png / icon.ico、rsou-launcher.sh、rsou.desktop
 tests/             # 解析 fixture 矩阵与端到端导入测试

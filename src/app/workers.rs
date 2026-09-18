@@ -193,6 +193,12 @@ impl RsouApp {
         }
     }
 
+    /// 使在途的文档列表读取结果作废(删除/清空之后调用):
+    /// 落地时按世代丢弃,再由补读拿最终状态。
+    pub(crate) fn invalidate_documents_snapshot(&mut self) {
+        self.docs_gen += 1;
+    }
+
     /// 删除一篇文档并刷新缓存(用 GUI 连接做一次短写;导入中禁用由页面把关)。
     pub(crate) fn delete_document(&mut self, id: i64) {
         let Some(conn) = self.db.as_mut() else {
@@ -205,6 +211,7 @@ impl RsouApp {
                 self.documents.retain(|d| d.id != id);
                 self.failed_documents.retain(|d| d.id != id);
                 self.documents_version += 1;
+                self.invalidate_documents_snapshot();
                 self.request_documents_refresh();
             }
             Err(error) => self.library_notice = Some(format!("移除失败: {error:#}")),
@@ -433,45 +440,48 @@ impl RsouApp {
                 self.refresh_index_stats();
                 // 清空后文档列表必须跟着空;重建/优化后也顺手刷新,成本一样。
                 if !matches!(kind, MaintainKind::Check) {
+                    self.invalidate_documents_snapshot();
                     self.request_documents_refresh();
                 }
             }
         }
     }
 
-    /// 消费文档列表读取结果;pending 时在落地后再发一次,保证读到最终状态。
+    /// 消费文档列表读取结果。世代不匹配(删除/清空已作废)的快照直接丢弃;
+    /// 作废或在途期间有过刷新请求都在落地后补读一次,保证读到最终状态。
     fn poll_docs(&mut self) {
-        if let Some((generation, rx)) = &self.docs_rx
-            && *generation == self.docs_gen
-        {
-            let mut msg = None;
-            while let Ok(event) = rx.try_recv() {
-                msg = Some(event);
-            }
-            if let Some(DocsMsg { generation, result }) = msg
-                && generation == self.docs_gen
-            {
-                self.docs_loading = false;
-                self.docs_rx = None;
-                self.docs_last_refresh = Some(std::time::Instant::now());
-                match result {
-                    Ok((documents, failed)) => {
-                        // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
-                        let old = std::mem::replace(&mut self.documents, documents);
-                        drop_in_background(old);
-                        self.failed_documents = failed;
-                        self.documents_version += 1;
-                    }
-                    Err(error) => {
-                        self.library_notice = Some(format!("读取文档列表失败: {error}"));
-                    }
+        let Some((_, rx)) = &self.docs_rx else {
+            return;
+        };
+        let mut msg = None;
+        while let Ok(event) = rx.try_recv() {
+            msg = Some(event);
+        }
+        let Some(DocsMsg { generation, result }) = msg else {
+            return;
+        };
+        self.docs_loading = false;
+        self.docs_rx = None;
+        self.docs_last_refresh = Some(std::time::Instant::now());
+        let stale = generation != self.docs_gen;
+        if !stale {
+            match result {
+                Ok((documents, failed)) => {
+                    // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
+                    let old = std::mem::replace(&mut self.documents, documents);
+                    drop_in_background(old);
+                    self.failed_documents = failed;
+                    self.documents_version += 1;
                 }
-                // 在途期间又收到过刷新请求:结果已落地,补读一次拿最终状态。
-                if self.docs_refresh_pending {
-                    self.docs_refresh_pending = false;
-                    self.request_documents_refresh();
+                Err(error) => {
+                    self.library_notice = Some(format!("读取文档列表失败: {error}"));
                 }
             }
+        }
+        // 过期快照(删除/清空后已作废)直接丢弃;作废或在途期间有过刷新请求都补读一次拿最终状态。
+        if stale || self.docs_refresh_pending {
+            self.docs_refresh_pending = false;
+            self.request_documents_refresh();
         }
     }
 
