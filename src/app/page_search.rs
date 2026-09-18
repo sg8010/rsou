@@ -93,6 +93,13 @@ fn hit_offset(hit: &Hit) -> usize {
     hit.start_offset + hit.highlights.first().map(|span| span.start).unwrap_or(0)
 }
 
+/// 预览导航按文档中的阅读顺序排列,而不是按检索相关度排列。
+fn preview_hit_offsets(doc_hit: &DocumentHit) -> Vec<usize> {
+    let mut offsets: Vec<usize> = doc_hit.hits.iter().map(hit_offset).collect();
+    offsets.sort_unstable();
+    offsets
+}
+
 impl RsouApp {
     pub(crate) fn ui_page_search(&mut self, ui: &mut egui::Ui) {
         let mut want_search = false;
@@ -318,7 +325,7 @@ impl RsouApp {
                     .iter()
                     .find(|d| d.document.id == id)
             })
-            .map(|doc_hit| doc_hit.hits.iter().map(hit_offset).collect::<Vec<_>>())
+            .map(preview_hit_offsets)
             .unwrap_or_default();
         let current_hit_index = self
             .preview_hit_index
@@ -503,7 +510,7 @@ fn preview_window(text: &str, target: Option<usize>) -> (&str, usize) {
 /// 整张卡片可点击,命中内容统一在右侧预览区显示。
 fn ui_doc_card(ui: &mut egui::Ui, doc_hit: &DocumentHit, focus: &mut Option<(i64, usize, usize)>) {
     let doc = &doc_hit.document;
-    let first_hit_offset = doc_hit.hits.first().map(hit_offset).unwrap_or(0);
+    let first_hit_offset = preview_hit_offsets(doc_hit).first().copied().unwrap_or(0);
     let card = RsouApp::card_frame(RsouApp::surface(), RsouApp::line(), 12).show(ui, |ui| {
         // 让可点击区域铺满结果列,点击卡片的空白处也能切换预览。
         ui.set_min_width(ui.available_width());
