@@ -141,6 +141,8 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
         .execute_batch(SCHEMA_SQL)
         .context("创建索引库表结构失败")?;
 
+    crate::normalize::normalize(connection)?;
+
     if stored_schema_version(connection)?.is_none() {
         connection
             .execute(

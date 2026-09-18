@@ -198,6 +198,14 @@ fn find_ignoring_whitespace(text: &str, literal: &str) -> Option<Span> {
     None
 }
 
+/// 转义 SQL LIKE 模式里的特殊字符(`\` 是转义符,另有 `%` 与 `_` 通配)。
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 /// 文档的 plain_text(预览用);没有内容时返回 None。
 pub fn plain_text_for_preview(
     conn: &Connection,
@@ -372,12 +380,25 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         params.push(to.into());
     }
     if let Some(prefix) = &request.filters.path_prefix {
-        filter_sql.push_str(" AND d.path LIKE ? ESCAPE '\\'");
-        let escaped = prefix
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        params.push(format!("{escaped}%").into());
+        // 同时匹配带与不带 `\\?\` 前缀的存储值。
+        //
+        // 库里的路径已经由 `normalize` 归一化(见 crate 注释),所以正常情况下
+        // 第一种就够;但用户还可能手动填 `\\?\C:\...`,或者从旧版本一路升上来
+        // 而某行因 UNIQUE 冲突/非 Unicode 没被剥成功。多一个 OR 分支的代价可忽略,
+        // 却能避开“明明有这个目录却搜不到”的困惑。
+        let escaped = escape_like(prefix);
+        let mut alternatives = vec![format!("{escaped}%")];
+        if !prefix.starts_with(r"\\?\") {
+            let with_prefix = escape_like(&format!(r"\\?\{prefix}"));
+            alternatives.push(format!("{with_prefix}%"));
+        }
+        let clause = std::iter::repeat_n("d.path LIKE ? ESCAPE '\\'", alternatives.len())
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        filter_sql.push_str(&format!(" AND ({clause})"));
+        for value in alternatives {
+            params.push(value.into());
+        }
     }
     where_sql.push_str(&filter_sql);
 
@@ -729,6 +750,72 @@ mod tests {
         assert_eq!(
             hit_paths(&prefixed),
             ["/data/docs/a.pdf", "/data/docs/b.docx"]
+        );
+    }
+
+    #[test]
+    fn path_prefix_filter_tolerates_verbatim_prefix() {
+        // Windows 上早期版本的入库路径带 `\\?\` 前缀。归一化之后不应再有,
+        // 但用户手填或极端情况下仍可能遇到;过滤要能两边都对上,
+        // 否则「明明有这个目录却搜不到」。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        // 直接造两行:一行干净、一行带前缀(模拟未归一化的旧库)。
+        for (path, tag) in [
+            (r"C:\docs\干净.docx", "干净"),
+            (r"\\?\C:\docs\带前缀.docx", "带前缀"),
+        ] {
+            let meta = FileMeta {
+                path: path.into(),
+                canonical_path: path.into(),
+                file_name: path.rsplit('\\').next().unwrap_or(path).to_owned(),
+                ext: "docx".to_owned(),
+                file_type: FileType::Word,
+                file_size: 0,
+                file_mtime_ms: 1_000,
+            };
+            let plain = crate::text::markdown_to_plain(&format!("检索词正文 {tag}"));
+            let chunks = chunk::chunk_document(&meta.stem(), &plain);
+            let parsed = ParsedDocument {
+                title: meta.stem(),
+                markdown: String::new(),
+                plain,
+                chunks,
+                warnings: Vec::new(),
+                parser_name: "text",
+                parser_version: "text.v1",
+            };
+            repo::save_parsed(&mut conn, &meta, "hash", &parsed, 1_000).unwrap();
+        }
+
+        // 用户输入常见的盘符前缀 → 两种存储形态都应命中。
+        let by_plain = search(
+            &conn,
+            &SearchRequest {
+                filters: Filters {
+                    path_prefix: Some(r"C:\docs\".to_owned()),
+                    ..Filters::default()
+                },
+                ..request("检索词")
+            },
+        )
+        .unwrap();
+        assert_eq!(by_plain.total_documents, 2, "普通前缀应同时命中两种形态");
+
+        // 用户自己敲了 `\\?\` → 也应命中。
+        let by_verbatim = search(
+            &conn,
+            &SearchRequest {
+                filters: Filters {
+                    path_prefix: Some(r"\\?\C:\docs\".to_owned()),
+                    ..Filters::default()
+                },
+                ..request("检索词")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_verbatim.total_documents, 1,
+            "带前缀的输入应命中带前缀的行"
         );
     }
 

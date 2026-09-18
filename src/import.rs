@@ -112,7 +112,9 @@ pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
             continue;
         }
         // 规范化用于去重与入库;失败时退回绝对路径。
-        let normalized = std::fs::canonicalize(&path).unwrap_or_else(|_| absolute(&path));
+        // 走 dunce 而不是 std:Windows 上 std 会返回 `\\?\C:\...` 形式,
+        // 既不适合展示,也会让「目录前缀」过滤匹配不上(见 crate 注释)。
+        let normalized = dunce::canonicalize(&path).unwrap_or_else(|_| absolute(&path));
         if seen.insert(normalized.clone()) {
             files.push(normalized);
         }

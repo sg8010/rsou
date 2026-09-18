@@ -86,6 +86,12 @@ rusqlite-ext = "0.39"
 anydoc = "=0.2.4"
 # txt/md 自读时的 GB18030 回退解码(已在 anydoc 依赖树中)。
 encoding_rs = "0.8"
+# Windows 路径规范化:std 的 canonicalize 在 Windows 上返回 \\?\C:\... 形式
+# (extended-length 前缀),它既难读又会打坏「目录前缀」过滤。dunce 剥掉该前缀,
+# 且只在安全时剥(盘符路径、无 . / ..、每段是合法文件名、非保留名、长度 < 260),
+# 否则保留原样。纯 Rust、零依赖、无 FFI,不引入新的 DLL 导入(Win7 审计不受影响)。
+# Linux 上是 std::fs::canonicalize 的直通。
+dunce = "1.0"
 # 导入去重的内容哈希。
 sha2 = "0.10"
 # 解析阶段的并行(写库仍在调用线程串行;已在 pdf-inspector 依赖树中)。

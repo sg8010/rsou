@@ -93,7 +93,10 @@ impl FileMeta {
         };
         let meta = std::fs::metadata(path)
             .with_context(|| format!("读取文件信息失败: {}", path.display()))?;
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // 与 import::scan_paths 用同一个规范化口径(见那里的注释):
+        // 两边必须一致,否则「扫描到的路径」与「已有的 canonical_path」
+        // 拼写不同,同一文件会被当成两个文件重复入库。
+        let canonical = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mtime_ms = meta
             .modified()
             .ok()
