@@ -27,7 +27,7 @@ use rsou_lib::import::ImportEvent;
 use rsou_lib::maintain::IndexStats;
 use rsou_lib::query::Scope;
 use rsou_lib::repo::{DocumentRow, ImportCounts};
-use rsou_lib::search::SearchResponse;
+use rsou_lib::search::{SearchResponse, Span};
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
 
@@ -113,6 +113,15 @@ pub(crate) struct PreviewMsg {
 pub(crate) struct DocsMsg {
     pub generation: u64,
     pub result: Result<(Vec<DocumentRow>, Vec<DocumentRow>), String>,
+}
+
+/// 预览高亮定位缓存:同一预览文本、同一窗口、同一组字面量时不重算 locate_literals。
+pub(crate) struct PreviewSpanCache {
+    pub preview_gen: u64,
+    pub base: usize,
+    pub window_len: usize,
+    pub literals: Vec<String>,
+    pub spans: Vec<Span>,
 }
 
 /// 索引维护任务的种类(设置页四个按钮一一对应)。
@@ -242,6 +251,8 @@ pub struct RsouApp {
     pending_scroll: Option<usize>,
     /// 预览窗口的稳定中心(plain_text 字节偏移;只在 focus_preview 时更新)
     preview_anchor: usize,
+    /// 预览高亮区间缓存(窗口/字面量不变时复用 locate_literals 结果)
+    preview_spans_cache: Option<PreviewSpanCache>,
     /// 索引统计缓存(设置页卡片;进入设置页/维护完成后刷新,不每帧查)
     index_stats: Option<IndexStats>,
     /// 是否有索引维护任务在后台进行
@@ -325,6 +336,7 @@ impl RsouApp {
             preview_loading: false,
             pending_scroll: None,
             preview_anchor: 0,
+            preview_spans_cache: None,
             index_stats: None,
             maintenance_active: false,
             maintain_rx: None,

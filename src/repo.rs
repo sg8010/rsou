@@ -222,8 +222,22 @@ pub fn save_parsed(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启写入事务失败")?;
+    let id = save_parsed_in(&tx, meta, content_hash, parsed, now_ms)?;
+    tx.commit().context("提交写入事务失败")?;
+    Ok(id)
+}
+
+/// `save_parsed` 的事务内版本:假定调用方已在事务内,不自己开/提交事务
+/// (导入批量写库时多个文档共用一个事务)。
+pub fn save_parsed_in(
+    conn: &Connection,
+    meta: &FileMeta,
+    content_hash: &str,
+    parsed: &ParsedDocument,
+    now_ms: i64,
+) -> anyhow::Result<i64> {
     let id = upsert_document(
-        &tx,
+        conn,
         meta,
         content_hash,
         parsed.title.as_str(),
@@ -231,9 +245,9 @@ pub fn save_parsed(
         parsed.parser_version,
         now_ms,
     )?;
-    clear_document_body(&tx, id)?;
+    clear_document_body(conn, id)?;
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO document_contents(document_id, markdown, plain_text, warnings_json) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
@@ -245,11 +259,11 @@ pub fn save_parsed(
     )
     .context("写入 document_contents 失败")?;
 
-    let mut insert_chunk = tx.prepare(
+    let mut insert_chunk = conn.prepare(
         "INSERT INTO chunks(document_id, chunk_index, context_header, start_offset, end_offset) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
-    let mut insert_fts = tx.prepare(
+    let mut insert_fts = conn.prepare(
         "INSERT INTO chunks_fts(rowid, title, context_header, content) VALUES (?1, ?2, ?3, ?4)",
     )?;
     for chunk in &parsed.chunks {
@@ -260,7 +274,7 @@ pub fn save_parsed(
             chunk.start as i64,
             chunk.end as i64,
         ])?;
-        let chunk_id = tx.last_insert_rowid();
+        let chunk_id = conn.last_insert_rowid();
         insert_fts.execute(params![
             chunk_id,
             parsed.title,
@@ -271,7 +285,7 @@ pub fn save_parsed(
     drop(insert_fts);
     drop(insert_chunk);
 
-    tx.execute(
+    conn.execute(
         "UPDATE documents SET parse_status = 'parsed', parse_error_code = NULL, \
          parse_error_message = NULL, text_length = ?2, chunk_count = ?3, indexed_at = ?4 \
          WHERE id = ?1",
@@ -282,7 +296,6 @@ pub fn save_parsed(
             now_ms
         ],
     )?;
-    tx.commit().context("提交写入事务失败")?;
     Ok(id)
 }
 
@@ -297,22 +310,34 @@ pub fn save_failed(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启写入事务失败")?;
+    let id = save_failed_in(&tx, meta, content_hash, error, now_ms)?;
+    tx.commit().context("提交写入事务失败")?;
+    Ok(id)
+}
+
+/// `save_failed` 的事务内版本:假定调用方已在事务内,不自己开/提交事务。
+pub fn save_failed_in(
+    conn: &Connection,
+    meta: &FileMeta,
+    content_hash: &str,
+    error: &ParseError,
+    now_ms: i64,
+) -> anyhow::Result<i64> {
     // 失败文档拿不到标题,用文件名去扩展名顶替;解析器信息无从得知,留空。
-    let id = upsert_document(&tx, meta, content_hash, &meta.stem(), "", "", now_ms)?;
-    clear_document_body(&tx, id)?;
-    tx.execute(
+    let id = upsert_document(conn, meta, content_hash, &meta.stem(), "", "", now_ms)?;
+    clear_document_body(conn, id)?;
+    conn.execute(
         "UPDATE documents SET parse_status = 'failed', parse_error_code = ?2, \
          parse_error_message = ?3, text_length = 0, chunk_count = 0, indexed_at = NULL \
          WHERE id = ?1",
         params![id, error.code.as_str(), error.to_string()],
     )?;
-    tx.commit().context("提交写入事务失败")?;
     Ok(id)
 }
 
 /// 按 path UPSERT documents 行,保留已有 id/created_at;返回行 id。
 fn upsert_document(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &Connection,
     meta: &FileMeta,
     content_hash: &str,
     title: &str,
@@ -320,7 +345,7 @@ fn upsert_document(
     parser_version: &str,
     now_ms: i64,
 ) -> anyhow::Result<i64> {
-    tx.execute(
+    let id: i64 = conn.query_row(
         "INSERT INTO documents(path, canonical_path, file_name, title, ext, file_type, \
          file_size, file_mtime_ms, content_hash, parse_status, parser_name, parser_version, \
          indexed_at, created_at, updated_at) \
@@ -336,7 +361,8 @@ fn upsert_document(
            content_hash = excluded.content_hash, \
            parser_name = excluded.parser_name, \
            parser_version = excluded.parser_version, \
-           updated_at = excluded.updated_at",
+           updated_at = excluded.updated_at \
+         RETURNING id",
         params![
             meta.path.to_string_lossy(),
             meta.canonical_path.to_string_lossy(),
@@ -352,26 +378,22 @@ fn upsert_document(
             now_ms,
             now_ms,
         ],
-    )?;
-    let id: i64 = tx.query_row(
-        "SELECT id FROM documents WHERE path = ?1",
-        params![meta.path.to_string_lossy()],
         |row| row.get(0),
     )?;
     Ok(id)
 }
 
 /// 清掉文档旧的正文/分块/FTS(重解析与失败写库共用)。
-fn clear_document_body(tx: &rusqlite::Transaction<'_>, document_id: i64) -> anyhow::Result<()> {
-    tx.execute(
+fn clear_document_body(conn: &Connection, document_id: i64) -> anyhow::Result<()> {
+    conn.execute(
         "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
         params![document_id],
     )?;
-    tx.execute(
+    conn.execute(
         "DELETE FROM chunks WHERE document_id = ?1",
         params![document_id],
     )?;
-    tx.execute(
+    conn.execute(
         "DELETE FROM document_contents WHERE document_id = ?1",
         params![document_id],
     )?;

@@ -130,23 +130,30 @@ pub fn highlight_spans(marked: &str, open: char, close: char) -> (String, Vec<Sp
 fn squash(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .to_ascii_lowercase()
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
 }
 
-/// 二次精确过滤:区间文本剔除空白后包含任一字面量(同样剔除空白)即保留。
+/// 一组字面量的比对形态:逐个 squash,丢弃空结果(调用方一次预计算、逐区间复用)。
+pub fn squash_literals(literals: &[String]) -> Vec<String> {
+    literals
+        .iter()
+        .map(|literal| squash(literal))
+        .filter(|needle| !needle.is_empty())
+        .collect()
+}
+
+/// 二次精确过滤:区间文本剔除空白后包含任一已归一化字面量即保留。
 ///
+/// `needles` 必须已是 `squash_literals` 的产物(剔空白 + ASCII 小写)。
 /// 用 contains 而不是相等:highlight() 会把相邻/重叠短语合并成一个区间,
 /// 区间可能比单个字面量长。标点不剔除,所以 `文、档` 会被丢弃。
-pub fn accept_span(text: &str, span: &Span, literals: &[String]) -> bool {
+pub fn accept_span(text: &str, span: &Span, needles: &[String]) -> bool {
     let Some(slice) = text.get(span.start..span.end) else {
         return false;
     };
     let hay = squash(slice);
-    literals.iter().any(|literal| {
-        let needle = squash(literal);
-        !needle.is_empty() && hay.contains(&needle)
-    })
+    needles.iter().any(|needle| hay.contains(needle))
 }
 
 /// 预览用:在全文里定位所有字面量(ASCII 大小写不敏感子串),合并重叠区间。
@@ -195,6 +202,8 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     let started = Instant::now();
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
+    // 字面量归一化只做一次,逐区间复用。
+    let needles = squash_literals(&compiled.literals);
 
     let mut sql = String::from(
         "SELECT c.id, c.document_id, c.context_header, c.start_offset, c.end_offset, \
@@ -272,17 +281,17 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
 
         let highlights: Vec<Span> = content_spans
             .iter()
-            .filter(|span| accept_span(&content, span, &compiled.literals))
+            .filter(|span| accept_span(&content, span, &needles))
             .copied()
             .collect();
         let header_highlights: Vec<Span> = header_spans
             .iter()
-            .filter(|span| accept_span(&header, span, &compiled.literals))
+            .filter(|span| accept_span(&header, span, &needles))
             .copied()
             .collect();
         let title_highlights: Vec<Span> = title_spans
             .iter()
-            .filter(|span| accept_span(&title_text, span, &compiled.literals))
+            .filter(|span| accept_span(&title_text, span, &needles))
             .copied()
             .collect();
         if highlights.is_empty() && header_highlights.is_empty() && title_highlights.is_empty() {
@@ -609,6 +618,20 @@ mod tests {
         let (text, spans) = highlight_spans("没有标记", '\u{1}', '\u{2}');
         assert_eq!(text, "没有标记");
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn squash_literals_drops_empty_and_normalizes() {
+        let needles = squash_literals(&["  ".to_owned(), "A 4".to_owned(), "文 档".to_owned()]);
+        assert_eq!(needles, ["a4".to_owned(), "文档".to_owned()]);
+        // "合同编号 " 是 13 字节(4×3 + 空格),"A4" 占 13..15。
+        let span = Span { start: 13, end: 15 };
+        assert_eq!(&"合同编号 A4"[13..15], "A4");
+        assert!(accept_span(
+            "合同编号 A4",
+            &span,
+            &squash_literals(&["a4".to_owned()])
+        ));
     }
 
     #[test]

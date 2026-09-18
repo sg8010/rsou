@@ -139,6 +139,60 @@ fn unchanged_content_with_new_mtime_is_skipped() {
 }
 
 #[test]
+fn many_small_files_import_in_batches() {
+    let dir = common::temp_dir("e2e-batch");
+    let db_path = dir.join("index.sqlite3");
+    let docs_dir = dir.join("docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    for i in 0..150 {
+        std::fs::write(
+            docs_dir.join(format!("第{i}篇.txt")),
+            format!("第 {i} 篇\n\n正文 {i}"),
+        )
+        .unwrap();
+    }
+
+    // 每个 FileDone 都带消费该条时的计数快照;批量写库下事件在事务提交后回放。
+    let mut progressions = Vec::new();
+    let counts = import::run_import(
+        &db_path,
+        vec![docs_dir.clone()],
+        ImportOptions::default(),
+        Arc::new(AtomicBool::new(false)),
+        &mut |event| {
+            if let ImportEvent::FileDone { counts, .. } = event {
+                progressions.push(counts.processed);
+            }
+        },
+    )
+    .expect("导入应成功");
+    assert_eq!(counts.ok, 150);
+    assert_eq!(counts.processed, 150);
+    assert_eq!(progressions.len(), 150);
+    for pair in progressions.windows(2) {
+        assert!(
+            pair[0] < pair[1],
+            "processed 应严格单调递增: {progressions:?}"
+        );
+    }
+    assert_eq!(progressions.last().copied(), Some(150));
+
+    let conn = store::open(&db_path, OpenMode::ReadOnly).unwrap();
+    let documents: i64 = conn
+        .query_row("SELECT count(*) FROM documents", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(documents, 150);
+    let ok_items: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM import_items WHERE status = 'ok'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ok_items, 150);
+}
+
+#[test]
 fn import_skip_reimport_and_delete() {
     let dir = common::temp_dir("e2e");
     let db_path = dir.join("index.sqlite3");

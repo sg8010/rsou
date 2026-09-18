@@ -206,19 +206,30 @@ pub fn run_import(
             });
         });
 
-        // 调用线程做消费者:写库串行。
-        while let Ok(msg) = rx.recv() {
+        // 调用线程做消费者:写库串行。收到一条就开事务;通道里紧随其后
+        // 已到达的条目并入同一事务,通道空或攒满一批即提交,不为凑批次等待。
+        while let Ok(first) = rx.recv() {
             if first_error.is_some() {
                 continue;
             }
-            let outcome = consume(&mut conn, run_id, msg, &mut counts);
-            match outcome {
-                Ok((path, outcome)) => {
-                    on_event(ImportEvent::FileDone {
-                        path,
-                        outcome,
-                        counts,
-                    });
+            let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
+            batch.push(first);
+            while batch.len() < WRITE_BATCH_MAX {
+                match rx.try_recv() {
+                    Ok(msg) => batch.push(msg),
+                    Err(_) => break,
+                }
+            }
+            match write_batch(&mut conn, run_id, batch, counts) {
+                Ok((new_counts, events)) => {
+                    counts = new_counts;
+                    for (path, outcome, event_counts) in events {
+                        on_event(ImportEvent::FileDone {
+                            path,
+                            outcome,
+                            counts: event_counts,
+                        });
+                    }
                 }
                 Err(error) => {
                     // 记首个写库错误,置 cancel 让 worker 收工,排空通道后统一返回。
@@ -409,9 +420,40 @@ fn build_document(meta: &FileMeta, parsed: parse::Parsed) -> Result<ParsedDocume
     })
 }
 
-/// 写库线程:把一条 worker 结果落库,转成对外事件。
-fn consume(
+/// 一次事务最多并入的 worker 结果条数(上限防大事务;不为凑批次等待)。
+const WRITE_BATCH_MAX: usize = 64;
+
+/// 一批结果消费后待回放的 FileDone 事件(path、outcome、消费该条时的计数快照)。
+type BatchEvents = Vec<(PathBuf, FileOutcome, ImportCounts)>;
+
+/// 一批 worker 结果在同一个 BEGIN IMMEDIATE 事务里落库。
+///
+/// commit 成功才返回 (新计数, 逐条 FileDone 事件缓存);任何一步出错事务随
+/// drop 回滚,计数与事件都不发布。`on_event` 由调用方在提交后逐条回放,
+/// 不在持锁期间调用。
+fn write_batch(
     conn: &mut rusqlite::Connection,
+    run_id: i64,
+    batch: Vec<FileResult>,
+    counts: ImportCounts,
+) -> anyhow::Result<(ImportCounts, BatchEvents)> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .context("开启写入事务失败")?;
+    let mut counts = counts;
+    let mut events = Vec::with_capacity(batch.len());
+    for msg in batch {
+        let (path, outcome) = consume(&tx, run_id, msg, &mut counts)?;
+        events.push((path, outcome, counts));
+    }
+    tx.commit().context("提交写入事务失败")?;
+    Ok((counts, events))
+}
+
+/// 写库线程:把一条 worker 结果落库,转成对外事件。
+/// `conn` 是调用方已开事务的连接(`Transaction` Deref 到 `Connection`)。
+fn consume(
+    conn: &rusqlite::Connection,
     run_id: i64,
     msg: FileResult,
     counts: &mut ImportCounts,
@@ -441,13 +483,13 @@ fn consume(
         }
         FileResult::Done { meta, hash, result } => match result {
             Ok(parsed) => {
-                let id = repo::save_parsed(conn, &meta, &hash, &parsed, now)?;
+                let id = repo::save_parsed_in(conn, &meta, &hash, &parsed, now)?;
                 repo::upsert_item(conn, run_id, &meta.path, "ok", None, None, Some(id), now)?;
                 counts.ok += 1;
                 (meta.path.clone(), FileOutcome::Ok { document_id: id })
             }
             Err(error) => {
-                let id = repo::save_failed(conn, &meta, &hash, &error, now)?;
+                let id = repo::save_failed_in(conn, &meta, &hash, &error, now)?;
                 repo::upsert_item(
                     conn,
                     run_id,

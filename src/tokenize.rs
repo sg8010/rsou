@@ -25,12 +25,16 @@ pub struct TokenSpan {
     pub range: Range<usize>,
 }
 
-/// 不走 SQLite,直接返回 `rsou 0` 的词元序列(便于单测与调试)。
+/// 分词核心:按模块头规则逐词元回调,不为每个词元建 String。
 ///
-/// 词元区间始终指向原始字符串,而不是归一化后的副本。
-pub fn token_spans(text: &str) -> Vec<TokenSpan> {
+/// 数字段与非 ASCII 码点直接传原文字节切片(零拷贝);ASCII 字母段经一个
+/// 复用缓冲小写化后传出。词元区间始终指向原始字符串。
+fn for_each_token<E>(
+    text: &str,
+    mut f: impl FnMut(&[u8], Range<usize>) -> Result<(), E>,
+) -> Result<(), E> {
     let bytes = text.as_bytes();
-    let mut spans = Vec::new();
+    let mut lowered: Vec<u8> = Vec::new();
     let mut iter = text.char_indices().peekable();
 
     while let Some((start, ch)) = iter.next() {
@@ -44,13 +48,9 @@ pub fn token_spans(text: &str) -> Vec<TokenSpan> {
                     break;
                 }
             }
-            spans.push(TokenSpan {
-                text: bytes[start..end]
-                    .iter()
-                    .map(|byte| byte.to_ascii_lowercase() as char)
-                    .collect(),
-                range: start..end,
-            });
+            lowered.clear();
+            lowered.extend(bytes[start..end].iter().map(u8::to_ascii_lowercase));
+            f(&lowered, start..end)?;
         } else if ch.is_ascii_digit() {
             let mut end = start + ch.len_utf8();
             while let Some(&(next_start, next)) = iter.peek() {
@@ -61,18 +61,30 @@ pub fn token_spans(text: &str) -> Vec<TokenSpan> {
                     break;
                 }
             }
-            spans.push(TokenSpan {
-                text: text[start..end].to_owned(),
-                range: start..end,
-            });
+            f(&bytes[start..end], start..end)?;
         } else if !ch.is_ascii() && ch.is_alphanumeric() {
-            spans.push(TokenSpan {
-                text: text[start..start + ch.len_utf8()].to_owned(),
-                range: start..start + ch.len_utf8(),
-            });
+            let end = start + ch.len_utf8();
+            f(&bytes[start..end], start..end)?;
         }
     }
 
+    Ok(())
+}
+
+/// 不走 SQLite,直接返回 `rsou 0` 的词元序列(便于单测与调试)。
+///
+/// 词元区间始终指向原始字符串,而不是归一化后的副本。
+pub fn token_spans(text: &str) -> Vec<TokenSpan> {
+    let mut spans = Vec::new();
+    for_each_token(text, |token, range| {
+        spans.push(TokenSpan {
+            // 词元一定来自有效 UTF-8(原文字节切片或 ASCII 小写缓冲)。
+            text: String::from_utf8(token.to_vec()).expect("词元应为有效 UTF-8"),
+            range,
+        });
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("for_each_token 不产生错误");
     spans
 }
 
@@ -108,10 +120,7 @@ impl Tokenizer for RsouTokenizer {
     {
         let text = std::str::from_utf8(text)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-        for span in token_spans(text) {
-            push_token(span.text.as_bytes(), span.range, false)?;
-        }
-        Ok(())
+        for_each_token(text, |token, range| push_token(token, range, false))
     }
 }
 
@@ -140,6 +149,28 @@ mod tests {
             assert_eq!(text[token.range.clone()].to_ascii_lowercase(), token.text);
             assert!(token.range.end <= text.len());
         }
+    }
+
+    #[test]
+    fn streaming_tokenize_matches_token_spans() {
+        let text = "A4 foo中文,文、档 😀 Bar99";
+        let mut streamed: Vec<(String, Range<usize>)> = Vec::new();
+        RsouTokenizer
+            .tokenize(
+                TokenizeReason::Document,
+                text.as_bytes(),
+                |token, range, colocated| {
+                    assert!(!colocated);
+                    streamed.push((String::from_utf8(token.to_vec()).unwrap(), range));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let expected: Vec<(String, Range<usize>)> = token_spans(text)
+            .into_iter()
+            .map(|span| (span.text, span.range))
+            .collect();
+        assert_eq!(streamed, expected);
     }
 
     #[test]

@@ -311,11 +311,6 @@ impl RsouApp {
                 .find(|d| d.document.id == id)
                 .map(|d| d.document.clone())
         });
-        let literals = self
-            .search_result
-            .as_ref()
-            .map(|r| r.compiled.literals.clone())
-            .unwrap_or_default();
         let hit_offsets = self
             .preview_doc_id
             .and_then(|id| {
@@ -423,7 +418,32 @@ impl RsouApp {
                         );
                         ui.add_space(4.0);
                     }
-                    let spans = search::locate_literals(window, &literals);
+                    // 高亮定位缓存:同一预览文本同一窗口、同一组字面量不重算。
+                    let literals: &[String] = self
+                        .search_result
+                        .as_ref()
+                        .map(|r| r.compiled.literals.as_slice())
+                        .unwrap_or(&[]);
+                    let cache_hit = self.preview_spans_cache.as_ref().is_some_and(|cache| {
+                        cache.preview_gen == self.preview_gen
+                            && cache.base == base
+                            && cache.window_len == window.len()
+                            && cache.literals == literals
+                    });
+                    if !cache_hit {
+                        self.preview_spans_cache = Some(PreviewSpanCache {
+                            preview_gen: self.preview_gen,
+                            base,
+                            window_len: window.len(),
+                            literals: literals.to_vec(),
+                            spans: search::locate_literals(window, literals),
+                        });
+                    }
+                    let spans: &[Span] = self
+                        .preview_spans_cache
+                        .as_ref()
+                        .map(|cache| cache.spans.as_slice())
+                        .unwrap_or(&[]);
                     let target = self
                         .pending_scroll
                         .map(|offset| offset.saturating_sub(base));
@@ -511,7 +531,7 @@ fn preview_window(text: &str, anchor: usize) -> (&str, usize) {
 /// 整张卡片可点击,命中内容统一在右侧预览区显示。
 fn ui_doc_card(ui: &mut egui::Ui, doc_hit: &DocumentHit, focus: &mut Option<(i64, usize, usize)>) {
     let doc = &doc_hit.document;
-    let first_hit_offset = preview_hit_offsets(doc_hit).first().copied().unwrap_or(0);
+    let first_hit_offset = doc_hit.hits.iter().map(hit_offset).min().unwrap_or(0);
     let card = RsouApp::card_frame(RsouApp::surface(), RsouApp::line(), 12).show(ui, |ui| {
         // 让可点击区域铺满结果列,点击卡片的空白处也能切换预览。
         ui.set_min_width(ui.available_width());
