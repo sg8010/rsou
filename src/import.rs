@@ -580,7 +580,7 @@ mod tests {
         assert!(result.is_err(), "触发器应让整批失败");
         // 整批回滚:触发器之前已写成功的 甲.txt 也不能留。
         assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
-        assert_eq!(row_count(&conn, "SELECT count(*) FROM chunks_fts"), 0);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents_fts"), 0);
         assert_eq!(row_count(&conn, "SELECT count(*) FROM import_items"), 0);
         assert!(conn.is_autocommit(), "失败事务应已随 drop 回滚");
 

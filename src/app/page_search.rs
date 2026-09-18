@@ -199,14 +199,24 @@ impl RsouApp {
                     .color(Self::muted()),
             );
         } else if let Some(response) = &self.search_result {
-            ui.label(
-                egui::RichText::new(format!(
+            // 「N 处」是已展示文档的片段数之和(下界);被 max_documents 截断时
+            // 额外标出来,不把下界说成全量。
+            let truncated = response.total_documents > response.documents.len();
+            let summary = if truncated {
+                format!(
+                    "命中 {} 篇(展示前 {} 篇) · {} 处 · 耗时 {:.0} ms",
+                    response.total_documents,
+                    response.documents.len(),
+                    response.total_hits,
+                    response.elapsed_ms
+                )
+            } else {
+                format!(
                     "命中 {} 篇 · {} 处 · 耗时 {:.0} ms",
                     response.total_documents, response.total_hits, response.elapsed_ms
-                ))
-                .size(13.0)
-                .color(Self::muted()),
-            );
+                )
+            };
+            ui.label(egui::RichText::new(summary).size(13.0).color(Self::muted()));
         }
         ui.add_space(6.0);
 

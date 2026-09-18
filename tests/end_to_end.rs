@@ -45,21 +45,25 @@ fn run(
     (counts, outcomes)
 }
 
-/// 验证每个已索引文档:chunks_fts.content == plain_text[start..end](逐字节)。
+/// 验证索引不变式(文档级 FTS):
+/// - 每篇已解析文档恰好一行 FTS,且 `content == plain_text`、`title == documents.title`;
+/// - FTS 行数 == 已解析文档数;
+/// - 展示分块 `chunks` 的区间落在 `plain_text` 内且与原文逐字节一致、互不重叠。
 fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
     let mut stmt = conn
         .prepare(
-            "SELECT c.start_offset, c.end_offset, dc.plain_text, f.content \
-             FROM chunks c \
-             JOIN document_contents dc ON dc.document_id = c.document_id \
-             JOIN chunks_fts f ON f.rowid = c.id",
+            "SELECT d.title, f.title, dc.plain_text, f.content \
+             FROM documents d \
+             JOIN documents_fts f ON f.rowid = d.id \
+             JOIN document_contents dc ON dc.document_id = d.id \
+             WHERE d.parse_status = 'parsed'",
         )
         .unwrap();
     let rows = stmt
         .query_map([], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
@@ -67,30 +71,60 @@ fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert!(!rows.is_empty(), "应至少有一条分块");
-    for (start, end, plain, content) in &rows {
-        assert_eq!(
-            &plain[*start as usize..*end as usize],
-            content.as_str(),
-            "FTS 内容应与 plain_text 切片逐字节相等"
-        );
+    assert!(!rows.is_empty(), "应至少有一篇已索引文档");
+    for (doc_title, fts_title, plain, content) in &rows {
+        assert_eq!(fts_title, doc_title, "FTS 标题应与 documents.title 相等");
+        assert_eq!(content, plain, "FTS 内容应与 plain_text 逐字节相等");
     }
-    // FTS 行数 == chunks 行数 == sum(documents.chunk_count)
+
+    // FTS 行数 == 已解析文档数。
     let fts: i64 = conn
-        .query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0))
+        .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
         .unwrap();
-    let chunks: i64 = conn
-        .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
-        .unwrap();
-    let declared: i64 = conn
+    let parsed: i64 = conn
         .query_row(
-            "SELECT COALESCE(sum(chunk_count), 0) FROM documents",
+            "SELECT count(*) FROM documents WHERE parse_status = 'parsed'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(fts, chunks);
-    assert_eq!(fts, declared);
+    assert_eq!(fts, parsed);
+
+    // 展示分块的偏移不变式:区间落在 plain_text 内、与原文一致、单调不重叠。
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.document_id, c.start_offset, c.end_offset, dc.plain_text \
+             FROM chunks c JOIN document_contents dc ON dc.document_id = c.document_id \
+             ORDER BY c.document_id, c.chunk_index",
+        )
+        .unwrap();
+    let chunks = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(!chunks.is_empty(), "应至少有一个展示分块");
+    let mut current_doc = None;
+    let mut prev_end = 0i64;
+    for (document_id, start, end, plain) in &chunks {
+        if current_doc != Some(*document_id) {
+            current_doc = Some(*document_id);
+            prev_end = 0;
+        }
+        assert!(*start >= prev_end, "分块区间不应重叠");
+        assert!(*end > *start, "分块区间应非空");
+        assert!(*end as usize <= plain.len(), "分块区间不应越界");
+        assert!(plain.is_char_boundary(*start as usize));
+        assert!(plain.is_char_boundary(*end as usize));
+        prev_end = *end;
+    }
 }
 
 #[test]
@@ -277,14 +311,30 @@ fn import_skip_reimport_and_delete() {
     repo::delete_document(&mut wconn, doc.id).unwrap();
     drop(wconn);
     let conn = store::open(&db_path, OpenMode::ReadOnly).unwrap();
-    let leftover: i64 = conn
+    let leftover_fts: i64 = conn
         .query_row(
-            "SELECT count(*) FROM chunks_fts f JOIN chunks c ON f.rowid = c.id WHERE c.document_id = ?1",
+            "SELECT count(*) FROM documents_fts WHERE rowid = ?1",
             [doc.id],
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(leftover, 0);
+    assert_eq!(leftover_fts, 0);
+    let leftover_chunks: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM chunks WHERE document_id = ?1",
+            [doc.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leftover_chunks, 0);
+    let leftover_contents: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM document_contents WHERE document_id = ?1",
+            [doc.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(leftover_contents, 0);
     let stats = repo::stats(&conn).unwrap();
     assert_eq!(stats.documents, 3);
     drop(conn);

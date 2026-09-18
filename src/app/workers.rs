@@ -257,6 +257,7 @@ impl RsouApp {
                 },
             },
             max_documents: 100,
+            max_fragments_per_document: search::DEFAULT_MAX_FRAGMENTS,
         };
         let spawned = std::thread::Builder::new()
             .name("rsou-search".to_owned())

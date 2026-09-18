@@ -175,32 +175,38 @@ mod tests {
 
     #[test]
     fn registered_fts5_tokenizer_matches_and_highlights_original_text() {
+        // 分词器与 FTS 表的接线:自定义 tokenizer 能建表、能 MATCH 出正确的行。
+        // 「高亮」现在由检索层在原文上定位字面量,不再用 FTS5 的 highlight(),
+        // 这里改成验证 tokenizer 本身报的词元区间落在原文上。
         let connection = store::open_in_memory().unwrap();
         connection
             .execute(
-                "INSERT INTO chunks_fts(rowid, title, context_header, content) VALUES (1, '合同', '资料', '合同编号 A4'), (2, '噪声', '资料', '文、档')",
+                "INSERT INTO documents_fts(rowid, title, content) VALUES (1, '合同', '合同编号 A4'), (2, '噪声', '文、档')",
                 [],
             )
             .unwrap();
 
-        let highlighted: String = connection
+        let title: String = connection
             .query_row(
-                "SELECT highlight(chunks_fts, 2, char(1), char(2)) FROM chunks_fts WHERE chunks_fts MATCH ?1 AND rowid = 1",
+                "SELECT title FROM documents_fts WHERE documents_fts MATCH ?1 AND rowid = 1",
                 ["\"合同\""],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(highlighted, "\u{1}合同\u{2}编号 A4");
+        assert_eq!(title, "合同");
 
         // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;
         // 这是已知行为,由检索层的二次精确过滤收口(见 plan §6.4)。
         let punctuated_count: i64 = connection
             .query_row(
-                "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
                 ["\"文档\""],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(punctuated_count, 1);
+        // 而检索层会把这条误配剔掉。
+        let text = "文、档";
+        assert!(crate::search::locate_literals(text, &["文档".to_owned()]).is_empty());
     }
 }

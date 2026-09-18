@@ -1,9 +1,12 @@
 //! 索引维护:统计、完整性检查、FTS 重建、optimize/VACUUM 与清空。
-//!
-//! 一致性约定(与 repo.rs 相同):`chunks_fts.rowid == chunks.id`,且
-//! `chunks_fts.content == document_contents.plain_text[start_offset..end_offset]`。
+//! 一致性约定(与 repo.rs 相同):`documents_fts.rowid == documents.id`,且
+//! `documents_fts.content == document_contents.plain_text`,
+//! `documents_fts.title == documents.title`。
 //! `check_integrity` 验证这两层不变式与 SQLite/FTS5 自身的健康;
-//! `rebuild_fts` 按该约定从 chunks + plain_text 全量重写 FTS 表。
+//! `rebuild_fts` 按该约定从 documents + plain_text 全量重写 FTS 表。
+//!
+//! 文档级 FTS 让不变式退化得很干净:一行对一篇,`rowid` 差集就是全部,
+//! 不再需要「分块偏移 → FTS 内容」的逐片比对。
 //!
 //! 本模块只拿 `Connection`,不碰文件扫描与 GUI:设置页/CLI 共用同一批函数。
 
@@ -24,7 +27,7 @@ pub struct IndexStats {
     pub parsed: i64,
     pub failed: i64,
     pub chunks: i64,
-    /// chunks_fts 行数(应与 parsed 文档的 chunk 总数一致)
+    /// documents_fts 行数(应与已解析文档数一致)
     pub fts_rows: i64,
     /// index.sqlite3 + -wal + -shm 之和
     pub db_bytes: u64,
@@ -34,7 +37,8 @@ pub struct IndexStats {
 
 pub fn index_stats(conn: &Connection, db_path: &Path) -> anyhow::Result<IndexStats> {
     let base = repo::stats(conn)?;
-    let fts_rows: i64 = conn.query_row("SELECT count(*) FROM chunks_fts", [], |row| row.get(0))?;
+    let fts_rows: i64 =
+        conn.query_row("SELECT count(*) FROM documents_fts", [], |row| row.get(0))?;
     let text_bytes: i64 = conn.query_row(
         "SELECT COALESCE(sum(text_length), 0) FROM documents",
         [],
@@ -74,11 +78,11 @@ pub struct IntegrityReport {
     /// FTS5 自带的 integrity-check 命令是否成功
     pub fts_ok: bool,
     pub fts_message: Option<String>,
-    /// chunks 有、chunks_fts 无的行数
+    /// documents 有、documents_fts 无的行数
     pub missing_in_fts: i64,
-    /// chunks_fts 有、chunks 无的孤儿行数
+    /// documents_fts 有、documents 无的孤儿行数
     pub orphan_in_fts: i64,
-    /// 抽样比对中 content != plain_text[start..end] 的条数
+    /// 抽样比对中 content/title 与 documents/plain_text 不一致的条数
     pub content_mismatch: i64,
     /// 实际抽样的行数
     pub sampled: i64,
@@ -97,7 +101,7 @@ impl IntegrityReport {
     pub fn summary(&self) -> String {
         if self.is_consistent() {
             return format!(
-                "索引一致:SQLite 结构正常,抽样 {} 条分块内容与原文全部吻合",
+                "索引一致:SQLite 结构正常,抽样 {} 篇文档的标题与正文全部吻合",
                 self.sampled
             );
         }
@@ -112,16 +116,16 @@ impl IntegrityReport {
             problems.push(format!("全文索引自检失败({message})"));
         }
         if self.missing_in_fts > 0 {
-            problems.push(format!("{} 个分块没有索引行", self.missing_in_fts));
+            problems.push(format!("{} 篇文档没有索引行", self.missing_in_fts));
         }
         if self.orphan_in_fts > 0 {
-            problems.push(format!("{} 条索引行找不到分块", self.orphan_in_fts));
+            problems.push(format!("{} 条索引行找不到文档", self.orphan_in_fts));
         }
         if self.content_mismatch > 0 {
             problems.push(format!("{} 条索引内容与原文不一致", self.content_mismatch));
         }
         format!(
-            "索引不一致:{}(抽样 {} 条);建议执行「重建全文索引」",
+            "索引不一致:{}(抽样 {} 篇);建议执行「重建全文索引」",
             problems.join(","),
             self.sampled
         )
@@ -145,39 +149,40 @@ pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result
     // FTS5 的 integrity-check 以「写入特殊命令」的形式存在;只读连接也会失败,
     // 失败信息原样进报告而不上抛,让调用方决定怎么展示。
     let (fts_ok, fts_message) = match conn.execute(
-        "INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')",
+        "INSERT INTO documents_fts(documents_fts) VALUES('integrity-check')",
         [],
     ) {
         Ok(_) => (true, None),
         Err(error) => (false, Some(error.to_string())),
     };
 
+    // 双向差集:只比对已解析文档(FTS 里只有它们)。
     let missing_in_fts: i64 = conn.query_row(
-        "SELECT count(*) FROM chunks \
-         WHERE id NOT IN (SELECT rowid FROM chunks_fts)",
+        "SELECT count(*) FROM documents d \
+         WHERE d.parse_status = 'parsed' AND d.id NOT IN (SELECT rowid FROM documents_fts)",
         [],
         |row| row.get(0),
     )?;
     let orphan_in_fts: i64 = conn.query_row(
-        "SELECT count(*) FROM chunks_fts \
-         WHERE rowid NOT IN (SELECT id FROM chunks)",
+        "SELECT count(*) FROM documents_fts \
+         WHERE rowid NOT IN (SELECT id FROM documents)",
         [],
         |row| row.get(0),
     )?;
 
-    // 抽样比对:FTS 表按 rowid 等值 JOIN 回 chunks,再取 plain_text 做切片比对。
+    // 抽样比对:FTS 行按 rowid 等值 JOIN 回 documents/contents,逐列核对。
     let rows = conn
         .prepare(
-            "SELECT c.start_offset, c.end_offset, f.content, dc.plain_text \
-             FROM chunks c \
-             JOIN chunks_fts f ON f.rowid = c.id \
-             JOIN document_contents dc ON dc.document_id = c.document_id \
-             ORDER BY c.id LIMIT ?1",
+            "SELECT f.title, d.title, f.content, dc.plain_text \
+             FROM documents_fts f \
+             JOIN documents d ON d.id = f.rowid \
+             JOIN document_contents dc ON dc.document_id = d.id \
+             ORDER BY f.rowid LIMIT ?1",
         )?
         .query_map(params![sample_limit as i64], |row| {
             Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
@@ -185,11 +190,8 @@ pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result
         .collect::<Result<Vec<_>, _>>()?;
     let sampled = rows.len() as i64;
     let mut content_mismatch = 0i64;
-    for (start, end, fts_content, plain) in &rows {
-        let slice = plain
-            .get(*start as usize..*end as usize)
-            .unwrap_or_default();
-        if slice != fts_content {
+    for (fts_title, title, fts_content, plain) in &rows {
+        if fts_title != title || fts_content != plain {
             content_mismatch += 1;
         }
     }
@@ -206,18 +208,18 @@ pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result
     })
 }
 
-/// 全量重建 chunks_fts:一个 BEGIN IMMEDIATE 事务里先整表 DELETE 清表
+/// 全量重建 documents_fts:一个 BEGIN IMMEDIATE 事务里先整表 DELETE 清表
 /// (顺带清掉孤儿行;'delete-all' 命令只适用 contentless/external-content
-/// 表,普通 FTS5 表不可用),再从 chunks + plain_text 按字节偏移切片重插。
-/// 返回重建行数;每 PROGRESS_STEP 行回调一次进度(done, total)。
+/// 表,普通 FTS5 表不可用),再从 documents + plain_text 整篇重插。
+/// 返回重建行数(= 已解析文档数);每 PROGRESS_STEP 行回调一次进度(done, total)。
 pub fn rebuild_fts(
     conn: &mut Connection,
     progress: &mut dyn FnMut(u64, u64),
 ) -> anyhow::Result<u64> {
     let total: u64 = conn
         .query_row(
-            "SELECT count(*) FROM chunks c \
-             JOIN documents d ON d.id = c.document_id \
+            "SELECT count(*) FROM documents d \
+             JOIN document_contents dc ON dc.document_id = d.id \
              WHERE d.parse_status = 'parsed'",
             [],
             |row| row.get::<_, i64>(0),
@@ -227,60 +229,45 @@ pub fn rebuild_fts(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启重建事务失败")?;
-    tx.execute("DELETE FROM chunks_fts", [])
+    tx.execute("DELETE FROM documents_fts", [])
         .context("清空全文索引失败")?;
 
+    // 分批 INSERT:整库一行一批会让进度回调只能报一次,大资料库上界面
+    // 会长时间停在 0%。按 id 区间切,每 PROGRESS_STEP 篇回调一次。
     let mut inserted = 0u64;
-    {
-        // 两层查询:外层按文档取一次 plain_text,内层按 document_id 逐块取
-        // (单行查询把 plain_text 按分块数成倍拷贝,大文档 × 多分块会放大内存)。
-        let mut select_docs = tx.prepare(
-            "SELECT d.id, d.title, dc.plain_text \
-             FROM documents d \
-             JOIN document_contents dc ON dc.document_id = d.id \
-             WHERE d.parse_status = 'parsed' ORDER BY d.id",
-        )?;
-        // Transaction 上没有 prepare_cached(它是 Connection 的方法,且与事务
-        // 的 &mut 借用冲突);这里 prepare 一次、事务内循环执行,效果相同。
-        let mut select_chunks = tx.prepare(
-            "SELECT id, context_header, start_offset, end_offset \
-             FROM chunks WHERE document_id = ?1 ORDER BY id",
-        )?;
-        let mut insert = tx.prepare(
-            "INSERT INTO chunks_fts(rowid, title, context_header, content) \
-             VALUES (?1, ?2, ?3, ?4)",
-        )?;
-        let mut doc_rows = select_docs.query([])?;
-        while let Some(doc) = doc_rows.next()? {
-            let doc_id: i64 = doc.get(0)?;
-            let title: String = doc.get(1)?;
-            let plain: String = doc.get(2)?;
-            let mut chunk_rows = select_chunks.query(params![doc_id])?;
-            while let Some(chunk) = chunk_rows.next()? {
-                let chunk_id: i64 = chunk.get(0)?;
-                let header: String = chunk.get(1)?;
-                let start = chunk.get::<_, i64>(2)? as usize;
-                let end = chunk.get::<_, i64>(3)? as usize;
-                // 切片在 Rust 侧做:偏移是 UTF-8 字节偏移,越界/非边界时写空串
-                // (等于跳过这条,行数仍占一席,便于事后用完整性检查发现)。
-                let content = plain.get(start..end).unwrap_or_default();
-                insert.execute(params![chunk_id, title, header, content])?;
-                inserted += 1;
-                if inserted.is_multiple_of(PROGRESS_STEP) {
-                    progress(inserted, total);
-                }
-            }
+    loop {
+        let batch = tx
+            .execute(
+                "INSERT INTO documents_fts(rowid, title, content) \
+                 SELECT d.id, d.title, dc.plain_text \
+                 FROM documents d \
+                 JOIN document_contents dc ON dc.document_id = d.id \
+                 WHERE d.parse_status = 'parsed' AND d.id > ?1 \
+                 ORDER BY d.id LIMIT ?2",
+                params![inserted as i64, PROGRESS_STEP as i64],
+            )
+            .context("重建全文索引失败")? as u64;
+        if batch == 0 {
+            break;
+        }
+        inserted += batch;
+        progress(inserted.min(total), total);
+        if batch < PROGRESS_STEP {
+            break;
         }
     }
+
     tx.commit().context("提交重建事务失败")?;
-    progress(inserted, total);
     Ok(inserted)
 }
 
 /// 索引优化:FTS5 'optimize' 合并内部段 → WAL 截断 → VACUUM。
 pub fn optimize(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')", [])
-        .context("FTS optimize 失败")?;
+    conn.execute(
+        "INSERT INTO documents_fts(documents_fts) VALUES('optimize')",
+        [],
+    )
+    .context("FTS optimize 失败")?;
     // wal_checkpoint 返回一行结果,execute_batch 直接丢弃它即可。
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .context("WAL checkpoint 失败")?;
@@ -294,7 +281,7 @@ pub fn clear_all(conn: &mut Connection) -> anyhow::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启清空事务失败")?;
-    tx.execute("DELETE FROM chunks_fts", [])
+    tx.execute("DELETE FROM documents_fts", [])
         .context("清空全文索引失败")?;
     tx.execute("DELETE FROM documents", [])
         .context("清空文档表失败")?;
@@ -339,8 +326,8 @@ mod tests {
         repo::save_parsed(conn, &meta, "hash", &parsed, 1_000).unwrap()
     }
 
-    /// 检索结果的可比签名:(document_id, [(chunk_id, 高亮区间)])。
-    type HitSig = Vec<(i64, Vec<(i64, Vec<(usize, usize)>)>)>;
+    /// 检索结果的可比签名:(document_id, [(片段起点, 高亮区间)])。
+    type HitSig = Vec<(i64, Vec<(usize, Vec<(usize, usize)>)>)>;
     fn signature(response: &SearchResponse) -> HitSig {
         response
             .documents
@@ -352,7 +339,7 @@ mod tests {
                         .iter()
                         .map(|hit| {
                             (
-                                hit.chunk_id,
+                                hit.start_offset,
                                 hit.highlights
                                     .iter()
                                     .map(|span| (span.start, span.end))
@@ -383,12 +370,15 @@ mod tests {
         let before_sig = signature(&before);
         assert_eq!(before.total_documents, 2);
 
-        // 制造不一致:删掉一条 FTS 行。
+        // 制造不一致:删掉一篇文档的 FTS 行。
         let victim: i64 = conn
-            .query_row("SELECT rowid FROM chunks_fts LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT rowid FROM documents_fts LIMIT 1", [], |r| r.get(0))
             .unwrap();
-        conn.execute("DELETE FROM chunks_fts WHERE rowid = ?1", params![victim])
-            .unwrap();
+        conn.execute(
+            "DELETE FROM documents_fts WHERE rowid = ?1",
+            params![victim],
+        )
+        .unwrap();
 
         let report = check_integrity(&conn, 2000).unwrap();
         assert_eq!(report.missing_in_fts, 1);
@@ -415,8 +405,8 @@ mod tests {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc(&mut conn, "/d/a.txt", "孤儿测试文档");
         conn.execute(
-            "INSERT INTO chunks_fts(rowid, title, context_header, content) \
-             VALUES (999999, 'x', 'x', 'x')",
+            "INSERT INTO documents_fts(rowid, title, content) \
+             VALUES (999999, 'x', 'x')",
             [],
         )
         .unwrap();
@@ -436,10 +426,10 @@ mod tests {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc(&mut conn, "/d/a.txt", "内容是正常的原文");
         let victim: i64 = conn
-            .query_row("SELECT rowid FROM chunks_fts LIMIT 1", [], |r| r.get(0))
+            .query_row("SELECT rowid FROM documents_fts LIMIT 1", [], |r| r.get(0))
             .unwrap();
         conn.execute(
-            "UPDATE chunks_fts SET content = '被篡改的内容' WHERE rowid = ?1",
+            "UPDATE documents_fts SET content = '被篡改的内容' WHERE rowid = ?1",
             params![victim],
         )
         .unwrap();
@@ -447,6 +437,18 @@ mod tests {
         let report = check_integrity(&conn, 2000).unwrap();
         assert_eq!(report.content_mismatch, 1);
         assert_eq!(report.sampled, 1);
+        assert!(!report.is_consistent());
+    }
+
+    #[test]
+    fn tampered_title_detected_by_sampling() {
+        // title 也是不变式的一部分,不只 content。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/a.txt", "# 原标题\n\n正文");
+        conn.execute("UPDATE documents_fts SET title = '被换掉的标题'", [])
+            .unwrap();
+        let report = check_integrity(&conn, 2000).unwrap();
+        assert_eq!(report.content_mismatch, 1);
         assert!(!report.is_consistent());
     }
 
@@ -462,7 +464,7 @@ mod tests {
         assert_eq!(stats.documents, 0);
         assert_eq!(stats.chunks, 0);
         let fts_rows: i64 = conn
-            .query_row("SELECT count(*) FROM chunks_fts", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
             .unwrap();
         assert_eq!(fts_rows, 0);
         let runs: i64 = conn
@@ -489,5 +491,23 @@ mod tests {
         // optimize 不改变可检索内容。
         let report = check_integrity(&conn, 2000).unwrap();
         assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn rebuild_reports_incremental_progress() {
+        // 分批重建:进度回调应多于一次(旧的单条 INSERT 只能报一次)。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        for i in 0..(PROGRESS_STEP as usize + 10) {
+            save_doc(&mut conn, &format!("/d/{i}.txt"), "正文内容");
+        }
+        let mut calls = Vec::new();
+        let rows = rebuild_fts(&mut conn, &mut |done, total| calls.push((done, total))).unwrap();
+        assert_eq!(rows, PROGRESS_STEP + 10);
+        assert!(calls.len() >= 2, "应分批回调: {calls:?}");
+        assert_eq!(
+            calls.last().copied(),
+            Some((PROGRESS_STEP + 10, PROGRESS_STEP + 10))
+        );
+        assert!(check_integrity(&conn, 2000).unwrap().is_consistent());
     }
 }

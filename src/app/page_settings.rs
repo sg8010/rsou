@@ -112,7 +112,11 @@ impl RsouApp {
                         ),
                     );
                     Self::text_row(ui, "分块", &format!("{} 个", stats.chunks));
-                    Self::text_row(ui, "FTS 行数", &format!("{} 行", stats.fts_rows));
+                    Self::text_row(
+                        ui,
+                        "FTS 行数",
+                        &format!("{} 行(每篇文档一行)", stats.fts_rows),
+                    );
                     Self::text_row(
                         ui,
                         "原文字节",
@@ -176,7 +180,7 @@ impl RsouApp {
                             action = Some(MaintainKind::Check);
                         }
                         if Self::secondary_button(ui, "重建全文索引", 120.0)
-                            .on_hover_text("按分块与原文全量重写 FTS 表")
+                            .on_hover_text("按文档与原文全文重写 FTS 表")
                             .clicked()
                         {
                             action = Some(MaintainKind::Rebuild);

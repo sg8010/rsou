@@ -1,12 +1,12 @@
-//! 索引库读写:documents/contents/chunks/chunks_fts/import_*/settings。
+//! 索引库读写:documents/contents/chunks/documents_fts/import_*/settings。
 //!
 //! 写入约定:
 //! - 单文档的「内容+分块+FTS」在一个 `BEGIN IMMEDIATE` 事务里完成,
 //!   不会出现半成品可检索(见 docs/plan.md §5.2);
-//! - FTS 是普通表,删除即 `DELETE FROM chunks_fts WHERE rowid = ?`,
-//!   rowid 显式等于 chunks.id;
-//! - `chunks_fts.content` 与 `document_contents.plain_text[start..end]` 是
-//!   同一份文本(切片存入,不是预分段文本);
+//! - FTS 是普通表,**一行一篇文档**,删除即 `DELETE FROM documents_fts WHERE rowid = ?`,
+//!   rowid 显式等于 documents.id;
+//! - `documents_fts.content` 与 `document_contents.plain_text` 是同一份全文
+//!   (不是分块文本);分块只用于展示,由检索层按字节偏移切片段;
 //! - 时间戳一律 Unix 毫秒。
 
 use std::path::{Path, PathBuf};
@@ -211,7 +211,7 @@ pub fn get_plain_text(conn: &Connection, document_id: i64) -> anyhow::Result<Opt
 // ---------- 写入 ----------
 
 /// 已解析文档落库:一个 BEGIN IMMEDIATE 事务写完 documents + contents +
-/// chunks + chunks_fts。返回 documents.id。
+/// chunks + documents_fts。返回 documents.id。
 pub fn save_parsed(
     conn: &mut Connection,
     meta: &FileMeta,
@@ -263,9 +263,6 @@ pub fn save_parsed_in(
         "INSERT INTO chunks(document_id, chunk_index, context_header, start_offset, end_offset) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
-    let mut insert_fts = conn.prepare(
-        "INSERT INTO chunks_fts(rowid, title, context_header, content) VALUES (?1, ?2, ?3, ?4)",
-    )?;
     for chunk in &parsed.chunks {
         insert_chunk.execute(params![
             id,
@@ -274,16 +271,14 @@ pub fn save_parsed_in(
             chunk.start as i64,
             chunk.end as i64,
         ])?;
-        let chunk_id = conn.last_insert_rowid();
-        insert_fts.execute(params![
-            chunk_id,
-            parsed.title,
-            chunk.context_header,
-            &parsed.plain.text[chunk.start..chunk.end],
-        ])?;
     }
-    drop(insert_fts);
     drop(insert_chunk);
+
+    // 一篇文档一行:FTS 的 AND/OR/NOT 因而都是文档级语义。
+    conn.execute(
+        "INSERT INTO documents_fts(rowid, title, content) VALUES (?1, ?2, ?3)",
+        params![id, parsed.title, parsed.plain.text],
+    )?;
 
     conn.execute(
         "UPDATE documents SET parse_status = 'parsed', parse_error_code = NULL, \
@@ -386,7 +381,7 @@ fn upsert_document(
 /// 清掉文档旧的正文/分块/FTS(重解析与失败写库共用)。
 fn clear_document_body(conn: &Connection, document_id: i64) -> anyhow::Result<()> {
     conn.execute(
-        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
+        "DELETE FROM documents_fts WHERE rowid = ?1",
         params![document_id],
     )?;
     conn.execute(
@@ -405,10 +400,7 @@ pub fn delete_document(conn: &mut Connection, id: i64) -> anyhow::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启删除事务失败")?;
-    tx.execute(
-        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM chunks WHERE document_id = ?1)",
-        params![id],
-    )?;
+    tx.execute("DELETE FROM documents_fts WHERE rowid = ?1", params![id])?;
     let affected = tx.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
     if affected == 0 {
         bail!("文档不存在: id = {id}");

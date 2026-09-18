@@ -41,9 +41,12 @@
 - **检索模式**:**精确**(默认)按输入原样做短语匹配;**宽松**先用 jieba 把
   查询切成若干段、各段都要命中,能找回「文档…管理」这类非连续文本。
   编译时去掉 `jieba` feature 后宽松自动退化为精确
-- **结果展示**:按文档分组,标题/标题路径/片段三级高亮;点击片段右侧预览原文并
-  自动定位;可按文件类型、目录前缀、时间范围(最近 7 天/30 天/一年)过滤
-- **索引维护**(设置页):完整性检查(SQLite + FTS 自检 + 双向差集 + 内容抽样)、
+- **检索语义是文档级的**:多个词只要出现在**同一篇文档**里就算命中,
+  不会被分块边界切断;短语可以跨段落、跨章节匹配(`文 档` 也算命中,`文、档` 不算)
+- **结果展示**:按文档分组,标题/片段两级高亮;片段按原文分块切出,点击片段
+  右侧预览原文并自动定位;可按文件类型、目录前缀、时间范围(最近 7 天/30 天/
+  一年)过滤;每篇最多展示 20 个片段(超出只计入首段的命中数)
+- **索引维护**(设置页):完整性检查(SQLite + FTS 自检 + 双向差集 + 标题/正文抽样)、
   重建全文索引、optimize + VACUUM、清空资料库(二次确认)
 - **单文件体积上限**:默认 100 MB,可在设置页调 1–2048 MB
 - **中文界面**:Windows / Linux 均自动使用系统中文字体
@@ -106,14 +109,14 @@ chmod +x rsou-linux-arm64
 
 ## 索引文件只应由本程序打开
 
-`index.sqlite3` 里的全文表 `chunks_fts` 使用的是**本程序内置注册的自定义
+`index.sqlite3` 里的全文表 `documents_fts` 使用的是**本程序内置注册的自定义
 分词器 `rsou`**(参数 `0`,关闭拼音)。SQLite 的分词器注册是 per-connection
-的:用系统 `sqlite3` 命令行或第三方工具打开这个库后,对 `chunks_fts` 执行
-`MATCH`/`highlight()` 会报 `no such tokenizer: rsou`;普通表的查询、
-`integrity_check` 不受影响。
+的:用系统 `sqlite3` 命令行或第三方工具打开这个库后,对 `documents_fts` 执行
+`MATCH` 会报 `no such tokenizer: rsou`;普通表的查询、`integrity_check`
+不受影响。
 
-因此：只读翻看 `documents`/`chunks` 等普通表没有问题;任何涉及 `chunks_fts`
-的读写请通过本程序 (GUI) 进行，不要手工改这个文件。
+因此:只读翻看 `documents`/`chunks` 等普通表没有问题;任何涉及 `documents_fts`
+的读写请通过本程序 (GUI) 进行,不要手工改这个文件。
 
 
 
@@ -226,7 +229,7 @@ cargo test -p rsou   # 解析/文本化/分块/导入/查询/检索/维护全链
 |---|---|
 | GUI | egui / eframe 0.36(即时模式,自带虚拟化表格) |
 | 文档解析 | anydoc 0.2.4(Office/PDF/EPUB → Markdown)+ encoding_rs(txt/md 编码探测) |
-| 全文检索 | SQLite FTS5(bundled)+ 自注册 `rsou` 分词器(vendored rusqlite-ext) |
+| 全文检索 | SQLite FTS5(bundled)+ 自注册 `rsou` 分词器(vendored rusqlite-ext);`documents_fts` 一行一篇文档 |
 | 中文分词 | jieba-rs(仅宽松模式查询用,可关 feature) |
 | 文件对话框 | Linux:内置 egui 对话框;Windows:rfd(原生) |
 | 并行导入 | rayon 解析 + 单线程串行写库 |
@@ -245,11 +248,11 @@ src/
 ├── tokenize.rs    # 自定义 FTS5 分词器 rsou
 ├── parse.rs       # 扩展名路由 + anydoc/文本解析 + 中文错误映射
 ├── text.rs        # Markdown → 纯文本(保留块级字节偏移)
-├── chunk.rs       # 标题感知分块(400–900 字符)
+├── chunk.rs       # 标题感知分块(400–900 字符;只用于展示片段)
 ├── repo.rs        # documents/contents/chunks/fts/import_*/settings 读写
 ├── import.rs      # 扫描 + rayon 并行解析 + 串行写库 + 进度/取消
 ├── query.rs       # 检索语法编译(照搬 wsou query-parser 的规则子集)
-├── search.rs      # FTS 查询 + 二次精确过滤 + 按文档聚合与高亮
+├── search.rs      # FTS 查询(文档级)+ 原文定位 + 按展示分块切片段
 ├── maintain.rs    # 统计 / 完整性检查 / 重建 / optimize / 清空
 ├── filebrowser.rs # 目录列举/排序/过滤等文件浏览纯逻辑
 build.rs           # Windows 目标时把 assets/icon.ico 嵌入 exe(交叉编译也生效)

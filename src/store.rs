@@ -5,18 +5,22 @@
 //! 报「no such tokenizer」,因此读连接与写连接都必须从这里走。
 //!
 //! schema 单版本管理(见 docs/plan.md §5.2):版本号写在 `settings.schema_version`,
-//! 打开到版本不兼容的库时直接报中文错误,不做自动迁移。
+//! 打开到版本不兼容的库时直接报中文错误,不做自动迁移。版本检查在建表之前,
+//! 因此拒绝一个旧库时不会在它里面留下任何新表。
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::tokenize;
 
 /// 当前 schema 版本;写入 `settings` 表,版本不一致时拒绝打开。
-pub const SCHEMA_VERSION: &str = "1";
+///
+/// 版本 2 把全文索引从「每分块一行」改成「每文档一行」(`documents_fts`)。
+/// 索引语义变了(FTS 的 AND/OR/NOT 从分块级升到文档级),旧库无法就地沿用。
+pub const SCHEMA_VERSION: &str = "2";
 
 /// 数据目录布局:`data_dir/index.sqlite3` + `data_dir/tmp/`。
 #[derive(Debug, Clone)]
@@ -121,36 +125,58 @@ fn configure(connection: Connection, mode: OpenMode) -> anyhow::Result<Connectio
 }
 
 /// 建立全部表与索引(幂等),并校验 schema 版本。
+///
+/// 顺序有意为之:先比对已有库的版本,再建表。反过来的话,拒绝一个旧库之前
+/// 已经把新表建了进去,旧版本程序再打开同一个库就会看到一个半新半旧的库。
 pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
+    if let Some(v) = stored_schema_version(connection)?
+        && v != SCHEMA_VERSION
+    {
+        bail!(
+            "索引文件版本不兼容:期望 schema_version = {SCHEMA_VERSION},实际为 {v};请使用与索引版本匹配的程序版本,或删除旧索引后重建"
+        );
+    }
+
     connection
         .execute_batch(SCHEMA_SQL)
         .context("创建索引库表结构失败")?;
 
-    let version: Option<String> = connection
-        .query_row(
-            "SELECT value FROM settings WHERE key = 'schema_version'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-    match version.as_deref() {
-        Some(v) if v != SCHEMA_VERSION => bail!(
-            "索引文件版本不兼容:期望 schema_version = {SCHEMA_VERSION},实际为 {v};请使用与索引版本匹配的程序版本,或删除旧索引后重建"
-        ),
-        Some(_) => {}
-        None => {
-            connection
-                .execute(
-                    "INSERT INTO settings(key, value) VALUES ('schema_version', ?1)",
-                    [SCHEMA_VERSION],
-                )
-                .context("写入 schema_version 失败")?;
-        }
+    if stored_schema_version(connection)?.is_none() {
+        connection
+            .execute(
+                "INSERT INTO settings(key, value) VALUES ('schema_version', ?1)",
+                [SCHEMA_VERSION],
+            )
+            .context("写入 schema_version 失败")?;
     }
     Ok(())
 }
 
+/// 读 `settings.schema_version`;库还没有 `settings` 表(全新文件)时返回 None。
+fn stored_schema_version(connection: &Connection) -> anyhow::Result<Option<String>> {
+    let has_settings: bool = connection
+        .query_row(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'settings'",
+            [],
+            |row| row.get(0),
+        )
+        .context("读取 sqlite_master 失败")?;
+    if !has_settings {
+        return Ok(None);
+    }
+    let version = connection
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("读取 schema_version 失败")?;
+    Ok(version)
+}
+
 // docs/plan.md §5.2 的单版本表结构(STRICT 表);追加本阶段定的四个辅助索引。
+// chunks 是**展示**分块:检索命中后按它把原文切成片段、并给出标题路径。
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS documents (
   id INTEGER PRIMARY KEY,
@@ -190,10 +216,13 @@ CREATE TABLE IF NOT EXISTS chunks (
   UNIQUE (document_id, chunk_index)
 ) STRICT;
 
--- 普通 FTS5 表:rowid 显式取 chunks.id,三列存分块原文。
+-- 普通 FTS5 表:rowid 显式取 documents.id,**一行 = 一篇文档**。
+-- 因此 FTS 的隐式 AND / OR / NOT 都是文档级语义(多词只要同篇命中即可),
+-- 不会因为分块边界丢掉召回。content 就是 document_contents.plain_text 全文,
+-- 高亮由检索层直接在原文上定位字面量,不用 FTS5 的 highlight()。
 -- tokenizer 'rsou' 由本程序注册(参数 '0' = 关闭拼音,与 wsou 的 simple 0 对齐)。
-CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-  title, context_header, content,
+CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
+  title, content,
   tokenize = 'rsou 0'
 );
 
@@ -244,13 +273,13 @@ mod tests {
             // tokenizer 已注册:能建 rsou 表并向其中写入/查询。
             connection
                 .execute(
-                    "INSERT INTO chunks_fts(rowid, content) VALUES (1, '中文索引')",
+                    "INSERT INTO documents_fts(rowid, content) VALUES (1, '中文索引')",
                     [],
                 )
                 .unwrap();
             let count: i64 = connection
                 .query_row(
-                    "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '\"索引\"'",
+                    "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"索引\"'",
                     [],
                     |row| row.get(0),
                 )
@@ -267,7 +296,7 @@ mod tests {
             let connection = open(&path, OpenMode::ReadOnly).unwrap();
             let count: i64 = connection
                 .query_row(
-                    "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH '\"索引\"'",
+                    "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"索引\"'",
                     [],
                     |row| row.get(0),
                 )
@@ -313,6 +342,38 @@ mod tests {
             format!("{error:#}").contains("索引文件版本不兼容"),
             "{error:#}"
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rejecting_a_stale_version_leaves_no_new_tables() {
+        // 旧库(版本 1)只应被拒绝,不应被建进 documents_fts。
+        let path = temp_db("stale");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            connection
+                .execute("DROP TABLE IF EXISTS documents_fts", [])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE settings SET value = '1' WHERE key = 'schema_version'",
+                    [],
+                )
+                .unwrap();
+        }
+        let error = open(&path, OpenMode::ReadWrite).unwrap_err();
+        assert!(format!("{error:#}").contains("索引文件版本不兼容"));
+
+        let connection = Connection::open(&path).unwrap();
+        let created: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'documents_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created, 0, "被拒绝的旧库不应被写入新表");
+        drop(connection);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -47,11 +47,19 @@ pub fn chunk_document(title: &str, plain: &PlainText) -> Vec<Chunk> {
     let mut pending: Option<Pending> = None;
 
     let context_of = |stack: &[Heading]| -> String {
-        let mut parts = Vec::with_capacity(stack.len() + 1);
+        // 文档标题本身就是第一个 H1/H2 时(extract_title 的常见结果),
+        // 标题栈里已经有一模一样的一级标题;直接拼会得到「标题 › 标题」,
+        // 所以与首项相同时不再重复前置。
+        let mut parts: Vec<&str> = Vec::with_capacity(stack.len() + 1);
         if !title.is_empty() {
-            parts.push(title.to_owned());
+            parts.push(title);
         }
-        parts.extend(stack.iter().map(|h| h.text.clone()));
+        for heading in stack {
+            let text = heading.text.as_str();
+            if !parts.last().is_some_and(|last| *last == text) {
+                parts.push(text);
+            }
+        }
         parts.join(" › ")
     };
 
@@ -270,6 +278,31 @@ mod tests {
         assert_eq!(chunks[0].context_header, "文档");
         // 新 chunk 的标题路径含压入的标题块本身。
         assert_eq!(chunks[1].context_header, "文档 › 新章节");
+    }
+
+    #[test]
+    fn document_title_is_not_repeated_in_context() {
+        // extract_title 取的就是第一个 H1/H2,标题栈里会有同一串文字;
+        // 上下文不应变成「标题 › 标题」。
+        let md = "# 采购合同管理办法\n\n正文。\n\n## 付款条款\n\n后文。";
+        let plain = plain_of(md);
+        let chunks = chunk_document("采购合同管理办法", &plain);
+        // 全是短块 → 一个 chunk,上下文就是文档标题本身(不重复)。
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].context_header, "采购合同管理办法");
+    }
+
+    #[test]
+    fn meaningful_section_path_is_kept_after_title() {
+        // 第一章够长先封口,第二章的 chunk 应带上小节名,且不重复文档标题。
+        let mut md = String::from("# 采购合同管理办法\n\n");
+        md.push_str(&"第一章正文。".repeat(120));
+        md.push_str("\n\n## 付款条款\n\n这里出现合同。");
+        let plain = plain_of(&md);
+        let chunks = chunk_document("采购合同管理办法", &plain);
+        assert!(chunks.len() >= 2, "第一章应已封口: {}", chunks.len());
+        assert_eq!(chunks[0].context_header, "采购合同管理办法");
+        assert_eq!(chunks[1].context_header, "采购合同管理办法 › 付款条款");
     }
 
     #[test]

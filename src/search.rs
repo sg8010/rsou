@@ -1,14 +1,16 @@
-//! 检索:FTS5 查询、二次精确过滤、按文档聚合与高亮区间。
+//! 检索:FTS5 查询、字面量定位、按文档聚合与展示分块切分。
 //!
-//! 关键点(见 docs/plan.md §6.3/§6.4):
-//! - 单条 SQL 取前 1000 行,`highlight(chunks_fts, N, char(1), char(2))` 的标记
-//!   直接落在原文字节上(自建 tokenizer 上报原文区间,无需坐标映射);
-//! - `highlight()` 会把同一短语的相邻词元合并成一个区间,区间文本可能含
-//!   空白或标点(逐字索引下 `文、档` 也会被短语 `"文档"` 命中),所以必须有
-//!   二次精确过滤:区间文本剔除空白后 **包含** 任一查询字面量才保留;
-//! - 按 document_id 保序聚合(行序 = rank 序),保留每篇的全部命中片段。
+//! 关键点:
+//! - FTS 表 `documents_fts` **一行一篇文档**,所以 MATCH 里的隐式 AND / OR / NOT
+//!   都是**文档级**语义(多词只要同篇命中即可),不会因为分块边界丢召回;
+//! - 高亮不走 FTS5 的 `highlight()`:逐字索引下标点不产生词元,`文、档` 会被
+//!   短语 `"文档"` 命中,而 `highlight()` 只返回区间、要判对错得再把区间文本取
+//!   出来比对——既然要取文本,直接在 `plain_text` 上查字面量更直接。`locate_literals`
+//!   一次完成「定位 + 精确过滤」:标点不剔除,因此 `文、档` 天然不命中,
+//!   而空白/换行的 `文 档` 命中(与 plan §6.4 的收口规则一致);
+//! - 展示分块由命中偏移 + `chunks` 边界切出,分块只影响「怎么展示」,
+//!   不影响「能不能搜到」。
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -38,6 +40,8 @@ pub struct SearchRequest {
     pub filters: Filters,
     /// 返回文档数上限(总命中文档数仍记真实值)
     pub max_documents: usize,
+    /// 每篇最多返回几个展示片段(`chunks` 中命中块 + 相邻块,按命中位置取前 N)
+    pub max_fragments_per_document: usize,
 }
 
 impl Default for SearchRequest {
@@ -48,9 +52,16 @@ impl Default for SearchRequest {
             loose: false,
             filters: Filters::default(),
             max_documents: 100,
+            max_fragments_per_document: DEFAULT_MAX_FRAGMENTS,
         }
     }
 }
+
+/// 每篇文档默认返回的展示片段数上限。
+///
+/// 「命中 N 处」现在指「N 个展示片段」,而不是 FTS 行数。不设上限的话,
+/// 一篇长文档可能命中几百个块,右侧预览的「上一批/下一批」就失去意义了。
+pub const DEFAULT_MAX_FRAGMENTS: usize = 20;
 
 /// 字节区间(content 内 / 列文本内)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,35 +70,36 @@ pub struct Span {
     pub end: usize,
 }
 
-/// 单个分块命中(一条片段)。
+/// 一个展示片段。
+///
+/// `content` 取的是一个 `chunks` 块(命中位置所在块,必要时并入命中所在的相邻
+/// 块),`highlights` 是 `content` 内的字节区间。`start_offset` 是 `content`
+/// 在 `plain_text` 里的起点,所以「片段内偏移 + start_offset」能直接定位到
+/// 预览全文。
 #[derive(Debug, Clone)]
 pub struct Hit {
-    pub chunk_id: i64,
-    /// 标题路径(已剥标记)
-    pub context_header: String,
-    /// chunk 在 plain_text 中的字节区间
+    /// 片段起点在 plain_text 中的字节偏移
     pub start_offset: usize,
     pub end_offset: usize,
-    /// chunk 原文(已剥标记)
+    /// 片段原文
     pub content: String,
-    /// content 内的高亮区间(过滤后)
+    /// 标题路径(块所属章节;块无标题信息时为空)
+    pub context_header: String,
+    /// content 内的高亮区间
     pub highlights: Vec<Span>,
-    /// context_header 内的高亮区间(过滤后)
-    pub header_highlights: Vec<Span>,
-    /// bm25 分数(越小越相关)
-    pub rank: f64,
 }
 
 /// 一篇文档的聚合结果。
 #[derive(Debug)]
 pub struct DocumentHit {
     pub document: DocumentRow,
-    /// 文档标题内的高亮区间(取该文档首个命中行的 title 列)
+    /// 文档标题内的高亮区间
     pub title_highlights: Vec<Span>,
-    /// 全部命中片段,按 rank
+    /// 展示片段,按在文档中的位置升序
     pub hits: Vec<Hit>,
-    /// 该文档过滤后的命中分块总数(与 hits.len() 一致)
+    /// 该文档的全部命中批次(可能多于 `hits`,超出上限的部分不再展示)
     pub total_hits: usize,
+    /// bm25 分数(越小越相关)
     pub best_rank: f64,
 }
 
@@ -95,68 +107,20 @@ pub struct DocumentHit {
 #[derive(Debug)]
 pub struct SearchResponse {
     pub documents: Vec<DocumentHit>,
-    /// 过滤后的分块命中总数
+    /// 已展示文档的命中片段总数;文档被 `max_documents` 截断时是下界
+    /// (完整总数需要为每篇都切片段,不值得)
     pub total_hits: usize,
-    /// 过滤后的命中文档总数(未按 max_documents 截断)
+    /// 命中文档总数(不受 `max_documents` 截断)
     pub total_documents: usize,
     pub elapsed_ms: f64,
     /// 编译产物(literals 供预览定位)
     pub compiled: CompiledQuery,
 }
 
-/// highlight() 输出剥标记:返回原文与各命中区间(字节,相对于返回文本)。
-pub fn highlight_spans(marked: &str, open: char, close: char) -> (String, Vec<Span>) {
-    let mut text = String::with_capacity(marked.len());
-    let mut spans = Vec::new();
-    let mut open_at: Option<usize> = None;
-    for ch in marked.chars() {
-        if ch == open {
-            open_at = Some(text.len());
-        } else if ch == close {
-            if let Some(start) = open_at.take() {
-                spans.push(Span {
-                    start,
-                    end: text.len(),
-                });
-            }
-        } else {
-            text.push(ch);
-        }
-    }
-    (text, spans)
-}
-
-/// 剔除 Unicode 空白并按 ASCII 小写归一(二次过滤的比对形态)。
-fn squash(text: &str) -> String {
-    text.chars()
-        .filter(|c| !c.is_whitespace())
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-/// 一组字面量的比对形态:逐个 squash,丢弃空结果(调用方一次预计算、逐区间复用)。
-pub fn squash_literals(literals: &[String]) -> Vec<String> {
-    literals
-        .iter()
-        .map(|literal| squash(literal))
-        .filter(|needle| !needle.is_empty())
-        .collect()
-}
-
-/// 二次精确过滤:区间文本剔除空白后包含任一已归一化字面量即保留。
-///
-/// `needles` 必须已是 `squash_literals` 的产物(剔空白 + ASCII 小写)。
-/// 用 contains 而不是相等:highlight() 会把相邻/重叠短语合并成一个区间,
-/// 区间可能比单个字面量长。标点不剔除,所以 `文、档` 会被丢弃。
-pub fn accept_span(text: &str, span: &Span, needles: &[String]) -> bool {
-    let Some(slice) = text.get(span.start..span.end) else {
-        return false;
-    };
-    let hay = squash(slice);
-    needles.iter().any(|needle| hay.contains(needle))
-}
-
 /// 预览用:在全文里定位所有字面量(ASCII 大小写不敏感子串),合并重叠区间。
+///
+/// 这是唯一的定位与精确过滤入口:标点不剔除,所以 `文档` 不会命中 `文、档`;
+/// 空白/换行不参与比对,所以 `文档` 会命中 `文 档` 与 `文\n档`。
 pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
     let hay = text.to_ascii_lowercase();
     let mut spans: Vec<Span> = Vec::new();
@@ -170,6 +134,11 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
                 start,
                 end: start + part.len(),
             });
+        }
+        // 逐字索引把空白也当分隔符,所以字面量可能跨空白:`document 管理`
+        // 对 `document\n管理` 也应命中。逐字定位一次去空白后的形态。
+        if let Some(skipped) = find_ignoring_whitespace(text, literal) {
+            spans.push(skipped);
         }
     }
     spans.sort_by_key(|span| (span.start, span.end));
@@ -185,6 +154,50 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
     merged
 }
 
+/// 在 `text` 里找 `literal`,允字面量的字符之间隔着空白(与 FTS 逐字索引一致)。
+/// 返回原文字节区间;找不到返回 None。
+fn find_ignoring_whitespace(text: &str, literal: &str) -> Option<Span> {
+    let needle: Vec<char> = literal.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let hay: Vec<(usize, char)> = text.char_indices().collect();
+    for start_index in 0..hay.len() {
+        let mut cursor = start_index;
+        let mut matched = 0usize;
+        // 区间从**第一个非空白字符**起:不能把匹配前跳过的空白算进去,
+        // 否则「合同编号 A4」会把前面的空格高亮进去。
+        let mut start_byte: Option<usize> = None;
+        let mut last_end = hay[start_index].0;
+        while cursor < hay.len() && matched < needle.len() {
+            let (byte, ch) = hay[cursor];
+            if ch.is_whitespace() {
+                cursor += 1;
+                continue;
+            }
+            // ASCII 大小写不敏感(与 locate_literals 的比对口径一致)。
+            if !ch.eq_ignore_ascii_case(&needle[matched]) {
+                break;
+            }
+            if start_byte.is_none() {
+                start_byte = Some(byte);
+            }
+            matched += 1;
+            last_end = byte + ch.len_utf8();
+            cursor += 1;
+        }
+        if matched == needle.len()
+            && let Some(start) = start_byte
+        {
+            return Some(Span {
+                start,
+                end: last_end,
+            });
+        }
+    }
+    None
+}
+
 /// 文档的 plain_text(预览用);没有内容时返回 None。
 pub fn plain_text_for_preview(
     conn: &Connection,
@@ -193,159 +206,252 @@ pub fn plain_text_for_preview(
     repo::get_plain_text(conn, document_id)
 }
 
-const ROW_LIMIT: usize = 1000;
+/// 展示分块:某篇文档在 plain_text 中的块边界(用于把命中切成片段)。
+pub fn chunk_ranges(
+    conn: &Connection,
+    document_id: i64,
+) -> anyhow::Result<Vec<(usize, usize, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT start_offset, end_offset, context_header FROM chunks \
+         WHERE document_id = ?1 ORDER BY chunk_index",
+    )?;
+    let rows = stmt
+        .query_map([document_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)? as usize,
+                row.get::<_, i64>(1)? as usize,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
 
-/// 执行检索:编译查询 → MATCH → 过滤/聚合 → 文档元数据回填。
+/// 把命中区间切成展示片段。
+///
+/// 输入是**已定位好在 `content` 内的**区间(升序、互不重叠),输出片段序列:
+/// 同一块内的命中合并成一个片段,不同块各出一个片段。
+///
+/// `bounds` 是展示块边界;为空(没有块信息)时整篇一段。
+/// 命中跨块边界时把它两侧的块并进同一片段,保证短语两半都在片段里。
+fn group_into_fragments(
+    content: &str,
+    spans: &[Span],
+    bounds: &[(usize, usize, String)],
+    document_title: &str,
+    limit: usize,
+) -> Vec<Hit> {
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    // 无块信息:整篇一段。
+    let fallback;
+    let bounds: &[(usize, usize, String)] = if bounds.is_empty() {
+        fallback = vec![(0, content.len(), String::new())];
+        &fallback
+    } else {
+        bounds
+    };
+    // 有的文档根本没有标题(或标题没被识别出来),此时所有块共用同一个
+    // 路径。那种路径只是重复文档标题,没有导航价值,一律不展示。
+    let header_count = distinct_header_count(bounds);
+    let header_count = if header_count <= 1 { 0 } else { header_count };
+
+    // 每个命中归到它起点所在的块。
+    let block_of = |byte: usize| -> usize {
+        bounds
+            .iter()
+            .position(|(start, end, _)| byte >= *start && byte < *end)
+            .unwrap_or_else(|| bounds.len().saturating_sub(1))
+    };
+
+    // 把命中归组:同一个块内的命中合为一个片段;**相邻但不共享块的命中各自
+    // 成段**(它们本来就是不同的「命中处」)。跨块短语(一个 span 横跨两个块)
+    // 把两个块并进同一段,因为它是一处命中,不该被切断。
+    //
+    // spans 已按 start 升序,所以只需与最后一组比较。
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for span in spans {
+        let first = block_of(span.start);
+        // 末字节所在的块(span.end 是开区间,减 1 才落在片段内)。
+        let last = block_of(span.end.saturating_sub(1)).max(first);
+        match groups.last_mut() {
+            // first 落在上一段内 ⇔ 两处命中共享同一块 → 并段。
+            Some(group) if first <= group.1 => group.1 = group.1.max(last),
+            _ => groups.push((first, last)),
+        }
+    }
+
+    let mut hits = Vec::with_capacity(groups.len().min(limit));
+    for (first, last) in groups {
+        if hits.len() >= limit {
+            break;
+        }
+        let start = bounds[first].0;
+        let end = bounds[last].1;
+        let Some(piece) = content.get(start..end) else {
+            continue;
+        };
+        let highlights: Vec<Span> = spans
+            .iter()
+            .filter(|span| span.start >= start && span.end <= end)
+            .map(|span| Span {
+                start: span.start - start,
+                end: span.end - start,
+            })
+            .collect();
+        hits.push(Hit {
+            start_offset: start,
+            end_offset: end,
+            content: piece.to_owned(),
+            context_header: fragment_header(&bounds[first].2, header_count, document_title),
+            highlights,
+        });
+    }
+    hits
+}
+
+/// 不同的标题路径个数(用于判断标题是否具有区分度)。
+fn distinct_header_count(bounds: &[(usize, usize, String)]) -> usize {
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, _, header) in bounds {
+        if !header.is_empty() && !seen.contains(&header.as_str()) {
+            seen.push(header);
+        }
+    }
+    seen.len()
+}
+
+/// 片段的标题路径:去掉只重复文档标题的头一段。
+///
+/// `chunks.context_header` 是「文档标题 › H1 › H2」形式;文档标题在预览区顶部
+/// 已经单独显示,片段再重复一次没有信息量。去掉后剩下的 H1 › H2 才是定位用的。
+fn fragment_header(header: &str, header_count: usize, document_title: &str) -> String {
+    if header_count == 0 || header.is_empty() {
+        return String::new();
+    }
+    let without_title = match header.split_once(" › ") {
+        Some((first, rest)) if first == document_title => rest,
+        _ => header,
+    };
+    // 只剩文档标题本身(单级标题文档)→ 没有额外信息,不展示。
+    if without_title.is_empty() || without_title == document_title {
+        return String::new();
+    }
+    without_title.to_owned()
+}
+
+/// 执行检索:编译查询 → MATCH(文档级)→ 取回正文 → 在原文上定位字面量
+/// → 按展示分块切片段 → 回填元数据。
 ///
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
     let started = Instant::now();
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
-    // 字面量归一化只做一次,逐区间复用。
-    let needles = squash_literals(&compiled.literals);
 
-    let mut sql = String::from(
-        "SELECT c.id, c.document_id, c.context_header, c.start_offset, c.end_offset, \
-         highlight(chunks_fts, 0, char(1), char(2)), \
-         highlight(chunks_fts, 1, char(1), char(2)), \
-         highlight(chunks_fts, 2, char(1), char(2)), \
-         bm25(chunks_fts, 5.0, 2.0, 1.0) AS rank \
-         FROM chunks_fts \
-         JOIN chunks c ON c.id = chunks_fts.rowid \
-         JOIN documents d ON d.id = c.document_id \
-         WHERE chunks_fts MATCH ?1",
-    );
+    // WHERE 子句与参数只拼一次,给「取结果」与「数总数」两条 SQL 共用。
+    let mut where_sql = String::from("WHERE documents_fts MATCH ?");
     let mut params: Vec<rusqlite::types::Value> = vec![compiled.match_expr.clone().into()];
-
+    let mut filter_sql = String::new();
     if !request.filters.file_types.is_empty() {
         let marks = std::iter::repeat_n("?", request.filters.file_types.len())
             .collect::<Vec<_>>()
             .join(",");
-        sql.push_str(&format!(" AND d.file_type IN ({marks})"));
+        filter_sql.push_str(&format!(" AND d.file_type IN ({marks})"));
         for file_type in &request.filters.file_types {
             params.push(file_type.clone().into());
         }
     }
     if let Some(from) = request.filters.mtime_from_ms {
-        sql.push_str(" AND d.file_mtime_ms >= ?");
+        filter_sql.push_str(" AND d.file_mtime_ms >= ?");
         params.push(from.into());
     }
     if let Some(to) = request.filters.mtime_to_ms {
-        sql.push_str(" AND d.file_mtime_ms <= ?");
+        filter_sql.push_str(" AND d.file_mtime_ms <= ?");
         params.push(to.into());
     }
     if let Some(prefix) = &request.filters.path_prefix {
-        sql.push_str(" AND d.path LIKE ? ESCAPE '\\'");
+        filter_sql.push_str(" AND d.path LIKE ? ESCAPE '\\'");
         let escaped = prefix
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
         params.push(format!("{escaped}%").into());
     }
-    sql.push_str(&format!(
-        " ORDER BY rank ASC, chunks_fts.rowid ASC LIMIT {ROW_LIMIT}"
-    ));
+    where_sql.push_str(&filter_sql);
 
-    let mut stmt = conn.prepare(&sql).context("准备检索语句失败")?;
-    let mut rows = stmt
-        .query(params_from_iter(params))
-        .context("执行检索失败")?;
+    // 候选集:MATCH 的正例 + 结构化过滤。按 bm25 升序、rowid 次升序,稳定。
+    let candidate_sql = format!(
+        "SELECT documents_fts.rowid, documents_fts.title, documents_fts.content, \
+         bm25(documents_fts, 5.0, 1.0) AS rank \
+         FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid \
+         {where_sql} ORDER BY rank ASC, documents_fts.rowid ASC"
+    );
 
-    struct DocAcc {
-        title_highlights: Vec<Span>,
-        hits: Vec<Hit>,
-        total_hits: usize,
-        best_rank: f64,
-    }
-
-    let mut doc_order: Vec<i64> = Vec::new();
-    let mut docs: HashMap<i64, DocAcc> = HashMap::new();
-    let mut total_hits = 0usize;
-
-    while let Some(row) = rows.next().context("读取检索结果失败")? {
-        let chunk_id: i64 = row.get(0)?;
-        let document_id: i64 = row.get(1)?;
-        let context_header: String = row.get(2)?;
-        let start_offset: i64 = row.get(3)?;
-        let end_offset: i64 = row.get(4)?;
-        // highlight 列序与 FTS 列序一致:0=title、1=context_header、2=content。
-        let marked_title: String = row.get(5)?;
-        let marked_header: String = row.get(6)?;
-        let marked_content: String = row.get(7)?;
-        let rank: f64 = row.get(8)?;
-
-        let (content, content_spans) = highlight_spans(&marked_content, '\u{1}', '\u{2}');
-        let (header, header_spans) = highlight_spans(&marked_header, '\u{1}', '\u{2}');
-        let (title_text, title_spans) = highlight_spans(&marked_title, '\u{1}', '\u{2}');
-
-        let highlights: Vec<Span> = content_spans
-            .iter()
-            .filter(|span| accept_span(&content, span, &needles))
-            .copied()
-            .collect();
-        let header_highlights: Vec<Span> = header_spans
-            .iter()
-            .filter(|span| accept_span(&header, span, &needles))
-            .copied()
-            .collect();
-        let title_highlights: Vec<Span> = title_spans
-            .iter()
-            .filter(|span| accept_span(&title_text, span, &needles))
-            .copied()
-            .collect();
-        if highlights.is_empty() && header_highlights.is_empty() && title_highlights.is_empty() {
-            // 三列过滤后全空:误配行(如 文、档),整行丢弃。
-            continue;
-        }
-
-        total_hits += 1;
-        let acc = docs.entry(document_id).or_insert_with(|| {
-            doc_order.push(document_id);
-            DocAcc {
-                title_highlights: title_highlights.clone(),
-                hits: Vec::new(),
-                total_hits: 0,
-                best_rank: rank,
+    // 逐字索引的 MATCH 只是**候选**:标点不产生词元,所以短语 `"文档"` 也会
+    // 命中 `文、档`。必须再把每篇的正文/标题取回来做一次真实子串定位,才能
+    // 得到准确的命中集合——「命中篇数」与「返回的卡片」因此出自同一个集合。
+    //
+    // 这里做全量扫描而不是 LIMIT:把 LIMIT 放在前面会让计数变成「前 N 篇里
+    // 有几篇」,和界面上的「命中 N 篇」对不上(那正是改动前的缺陷)。
+    // 实测 2 万篇 × 5 千字(282 MB 正文)全量扫描 + 定位约 350 ms,
+    // 是一次可接受的本地检索延迟。
+    let literals = &compiled.literals;
+    let mut matched: Vec<(i64, String, String, f64)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&candidate_sql).context("准备检索语句失败")?;
+        let mut rows = stmt
+            .query(params_from_iter(params.iter()))
+            .context("执行检索失败")?;
+        while let Some(row) = rows.next().context("读取检索结果失败")? {
+            let id: i64 = row.get(0)?;
+            let title: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let rank: f64 = row.get(3)?;
+            // 标题或正文里真实含任一查询字面量,才算命中。
+            if locate_literals(&content, literals).is_empty()
+                && locate_literals(&title, literals).is_empty()
+            {
+                continue;
             }
-        });
-        acc.total_hits += 1;
-        let start_offset = start_offset.max(0) as usize;
-        acc.hits.push(Hit {
-            chunk_id,
-            context_header,
-            start_offset,
-            end_offset: end_offset.max(0) as usize,
-            content,
-            highlights,
-            header_highlights,
-            rank,
-        });
+            matched.push((id, title, content, rank));
+        }
     }
-    drop(rows);
-    drop(stmt);
 
-    let total_documents = docs.len();
-    let kept_ids: Vec<i64> = doc_order.into_iter().take(request.max_documents).collect();
+    let total_documents = matched.len();
+    let kept = matched.split_off(total_documents.min(request.max_documents));
+    drop(kept);
+    let kept_ids: Vec<i64> = matched.iter().map(|(id, _, _, _)| *id).collect();
     let meta = repo::get_documents_by_ids(conn, &kept_ids).context("读取文档元数据失败")?;
 
-    let mut documents = Vec::with_capacity(kept_ids.len());
-    for id in kept_ids {
-        let Some(acc) = docs.remove(&id) else {
-            continue;
-        };
+    let mut documents = Vec::with_capacity(matched.len());
+    for (id, title, content, rank) in matched {
         let Some(document) = meta.get(&id) else {
-            // 行还在 chunks 里但 documents 已被并发删掉——跳过。
+            // 行还在 FTS 里但 documents 已被并发删掉——跳过。
             continue;
         };
+        let title_highlights = locate_literals(&title, literals);
+        let hits = group_into_fragments(
+            &content,
+            &locate_literals(&content, literals),
+            &chunk_ranges(conn, id).unwrap_or_default(),
+            &document.title,
+            request.max_fragments_per_document,
+        );
+        let total_for_doc = hits.len();
         documents.push(DocumentHit {
             document: document.clone(),
-            title_highlights: acc.title_highlights,
-            hits: acc.hits,
-            total_hits: acc.total_hits,
-            best_rank: acc.best_rank,
+            title_highlights,
+            hits,
+            total_hits: total_for_doc,
+            best_rank: rank,
         });
     }
+
+    // 「命中处数」= 所有**已展示**文档的片段数之和。文档被 max_documents 截断时
+    // 它是个下界,调用方可以用 `total_documents > documents.len()` 判断并说明。
+    let total_hits = documents.iter().map(|doc| doc.hits.len()).sum();
 
     Ok(SearchResponse {
         documents,
@@ -457,6 +563,8 @@ mod tests {
         let response = search(&conn, &request("文档")).unwrap();
         let paths = hit_paths(&response);
         assert_eq!(response.total_documents, 3, "{paths:?}");
+        // 二次过滤现在由 locate_literals 承担:「文、档」不产生任何片段,
+        // 于是整篇被丢掉(与分块实现的结论一致)。
         assert!(!paths.iter().any(|p| p.contains("顿号")));
         assert_eq!(response.total_hits, 3);
     }
@@ -483,6 +591,40 @@ mod tests {
     }
 
     #[test]
+    fn fragment_header_drops_redundant_document_title() {
+        // 文档标题就是唯一的一级标题时,片段路径会退化成「标题 › 标题」。
+        // 预览区顶部已经显示文档标题,片段不再重复。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(
+            &mut conn,
+            "/d/重复标题.txt",
+            FileType::Text,
+            "# 采购合同管理办法\n\n正文里出现合同二字。",
+        );
+        let response = search(&conn, &request("合同")).unwrap();
+        let hit = &response.documents[0].hits[0];
+        assert_eq!(hit.context_header, "", "重复的文档标题不应展示");
+    }
+
+    #[test]
+    fn fragment_header_keeps_meaningful_section_path() {
+        // 有多级标题时,片段应带上小节名(去掉重复的文档标题)。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let mut md = String::from("# 总则\n\n");
+        md.push_str(&"第一章正文。".repeat(120));
+        md.push_str("\n\n## 付款条款\n\n这里出现合同二字。");
+        save_doc(&mut conn, "/d/多节.txt", FileType::Text, &md);
+        let response = search(&conn, &request("合同")).unwrap();
+        let doc = &response.documents[0];
+        let hit = doc
+            .hits
+            .iter()
+            .find(|h| h.content.contains("合同"))
+            .expect("应有命中片段");
+        assert_eq!(hit.context_header, "付款条款");
+    }
+
+    #[test]
     fn title_scope_only_matches_title() {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc(
@@ -503,6 +645,22 @@ mod tests {
         // 默认 scope 下两者都命中。
         let response = search(&conn, &request("合同")).unwrap();
         assert_eq!(response.total_documents, 2);
+    }
+
+    #[test]
+    fn title_only_hit_keeps_the_document() {
+        // 标题命中但正文没有该字面量(宽松模式只切中标题时会出现):
+        // 文档必须保留,不能因为没有片段而被丢掉。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(
+            &mut conn,
+            "/d/仅标题.txt",
+            FileType::Text,
+            "# 合同管理\n\n正文完全无关",
+        );
+        let response = search(&conn, &request("title:合同")).unwrap();
+        assert_eq!(response.total_documents, 1);
+        assert!(!response.documents[0].title_highlights.is_empty());
     }
 
     #[test]
@@ -585,6 +743,7 @@ mod tests {
         );
         save_doc(&mut conn, "/d/单段.txt", FileType::Text, "合同只有一处");
         let response = search(&conn, &request("合同")).unwrap();
+        // 「命中处数」是已展示文档的片段数之和:5 + 1 = 6。
         assert_eq!(response.total_hits, 6);
         assert_eq!(response.total_documents, 2);
         let doc = response
@@ -592,8 +751,16 @@ mod tests {
             .iter()
             .find(|d| d.document.path == "/d/多段.txt")
             .expect("多段文档应命中");
+        // 5 个块各含一次命中 → 5 个展示片段。
         assert_eq!(doc.hits.len(), 5);
         assert_eq!(doc.total_hits, 5);
+        // 片段按文档内位置升序,且每条片段都真的含高亮。
+        let mut prev = 0usize;
+        for hit in &doc.hits {
+            assert!(hit.start_offset >= prev, "片段应按位置升序");
+            prev = hit.start_offset;
+            assert!(!hit.highlights.is_empty());
+        }
         // max_documents 截断 documents,但 total_documents 记真实数。
         let truncated = search(
             &conn,
@@ -605,33 +772,79 @@ mod tests {
         .unwrap();
         assert_eq!(truncated.documents.len(), 1);
         assert_eq!(truncated.total_documents, 2);
-        assert_eq!(truncated.total_hits, 6);
+        // 截断后 total_hits 只是下界(只算了已展示的那篇的片段)。
+        assert_eq!(truncated.total_hits, 5);
     }
 
     #[test]
-    fn highlight_spans_strips_markers() {
-        let (text, spans) = highlight_spans("前文\u{1}合同编号\u{2}后文", '\u{1}', '\u{2}');
-        assert_eq!(text, "前文合同编号后文");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(&text[spans[0].start..spans[0].end], "合同编号");
-        // 无标记 → 原文、空区间。
-        let (text, spans) = highlight_spans("没有标记", '\u{1}', '\u{2}');
-        assert_eq!(text, "没有标记");
-        assert!(spans.is_empty());
+    fn fragments_per_document_are_capped() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc_chunks(
+            &mut conn,
+            "/d/多段.txt",
+            FileType::Text,
+            &["合同甲", "合同乙", "合同丙", "合同丁", "合同戊"],
+        );
+        let response = search(
+            &conn,
+            &SearchRequest {
+                max_fragments_per_document: 2,
+                ..request("合同")
+            },
+        )
+        .unwrap();
+        let doc = &response.documents[0];
+        assert_eq!(
+            doc.hits.len(),
+            2,
+            "片段数应受 max_fragments_per_document 限制"
+        );
+        // 文档本身仍算命中,总数不变。
+        assert_eq!(response.total_documents, 1);
     }
 
     #[test]
-    fn squash_literals_drops_empty_and_normalizes() {
-        let needles = squash_literals(&["  ".to_owned(), "A 4".to_owned(), "文 档".to_owned()]);
-        assert_eq!(needles, ["a4".to_owned(), "文档".to_owned()]);
-        // "合同编号 " 是 13 字节(4×3 + 空格),"A4" 占 13..15。
-        let span = Span { start: 13, end: 15 };
-        assert_eq!(&"合同编号 A4"[13..15], "A4");
-        assert!(accept_span(
-            "合同编号 A4",
-            &span,
-            &squash_literals(&["a4".to_owned()])
-        ));
+    fn words_far_apart_in_one_document_still_intersect() {
+        // 这是改成文档级 FTS 的核心原因:两个词分居不同的展示块,
+        // 隐式 AND 仍应命中(分块级 FTS 下会漏)。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc_chunks(
+            &mut conn,
+            "/d/远距.txt",
+            FileType::Text,
+            &["前段提到合同", "无关内容", "后段提到发票"],
+        );
+        let response = search(&conn, &request("合同 发票")).unwrap();
+        assert_eq!(response.total_documents, 1, "同篇不同块的两词应命中");
+        let doc = &response.documents[0];
+        assert_eq!(doc.hits.len(), 2, "两个块各出一个片段");
+        // 片段内偏移 + start_offset 能定位回全文。
+        for hit in &doc.hits {
+            assert_eq!(hit.content.len(), hit.end_offset - hit.start_offset);
+        }
+    }
+
+    #[test]
+    fn phrase_split_across_fragment_boundary_is_found() {
+        // 字面量定位在原文上做,不经过块边界,所以跨块短语也能命中;
+        // build_fragments 会把触及的两个块并进同一个片段。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc_chunks(
+            &mut conn,
+            "/d/跨界.txt",
+            FileType::Text,
+            &["前文到公文", "编号后续内容"],
+        );
+        let response = search(&conn, &request("公文编号")).unwrap();
+        assert_eq!(response.total_documents, 1);
+        let doc = &response.documents[0];
+        assert_eq!(doc.hits.len(), 1, "跨块短语应并入一个片段");
+        let hit = &doc.hits[0];
+        assert!(
+            hit.content.contains("公文") && hit.content.contains("编号"),
+            "片段应同时含短语两半:{}",
+            hit.content
+        );
     }
 
     #[test]
@@ -646,6 +859,18 @@ mod tests {
         // 词元边界:多字节字符不会错位。
         let spans = locate_literals("前合同后", &["合同".to_owned()]);
         assert_eq!(&"前合同后"[spans[0].start..spans[0].end], "合同");
+    }
+
+    #[test]
+    fn locate_literals_tolerates_whitespace_inside_literal() {
+        // 逐字索引把空白当分隔符,所以「文 档」应命中「文档」与「文\n档」。
+        for text in ["文 档", "文\n档"] {
+            let spans = locate_literals(text, &["文档".to_owned()]);
+            assert_eq!(spans.len(), 1, "应命中 {text:?}");
+            assert_eq!(&text[spans[0].start..spans[0].end], text);
+        }
+        // 标点不剔除:「文、档」不命中。
+        assert!(locate_literals("文、档", &["文档".to_owned()]).is_empty());
     }
 
     #[test]

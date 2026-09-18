@@ -356,6 +356,7 @@ fn cmd_search(
                 ..Filters::default()
             },
             max_documents,
+            max_fragments_per_document: search::DEFAULT_MAX_FRAGMENTS,
         },
     )?;
     for doc_hit in &response.documents {
@@ -370,9 +371,19 @@ fn cmd_search(
             println!("  {}", mark_snippet(&hit.content, &hit.highlights));
         }
     }
+    // 被 max_documents 截断时说明一下,避免把下界当成全量。
+    let truncated = response.total_documents > response.documents.len();
     println!(
-        "命中 {} 篇 · {} 处 · 耗时 {:.0} ms",
-        response.total_documents, response.total_hits, response.elapsed_ms
+        "命中 {} 篇 · 展示 {} 篇 · {} 处 · 耗时 {:.0} ms{}",
+        response.total_documents,
+        response.documents.len(),
+        response.total_hits,
+        response.elapsed_ms,
+        if truncated {
+            "(已按 --limit 截断)"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -415,7 +426,7 @@ fn cmd_check(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<
     Ok(())
 }
 
-/// rebuild:全量重建 chunks_fts,打印进度与最终行数。
+/// rebuild:全量重建 documents_fts,打印进度与最终行数。
 fn cmd_rebuild(db_path: &Path) -> anyhow::Result<()> {
     let mut conn = store::open(db_path, OpenMode::ReadWrite)?;
     let rows = maintain::rebuild_fts(&mut conn, &mut |done, total| {
