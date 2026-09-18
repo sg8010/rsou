@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rsou_lib::import::{self, FileOutcome, ImportEvent, ImportOptions};
+use rsou_lib::maintain;
 use rsou_lib::query::Scope;
 use rsou_lib::search::{self, Filters, SearchRequest, Span};
 use rsou_lib::store::{self, OpenMode};
@@ -26,6 +27,10 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   parse <文件>          解析单个文件,把 Markdown 打到 stdout
   text <文件>           解析单个文件,打印 plain_text 与分块边界摘要
   search <查询>         全文检索,片段用【】标出高亮段
+  check                 完整性检查;索引不一致时退出码 1
+  rebuild               重建全文索引(打印进度与行数)
+  optimize              FTS optimize + WAL 截断 + VACUUM
+  clear                 清空资料库(需 --yes;保留 settings)
 
 选项:
   --db PATH   索引库路径,缺省用应用数据目录下的 index.sqlite3
@@ -33,12 +38,14 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   --loose     search:宽松模式(jieba 切词;无该 feature 时等同精确)
   --scope S   search:检索范围 all|title|content(缺省 all)
   --type T    search:限定类型,逗号分隔(如 word,pdf 或扩展名)
-  --limit N   search:最多返回 N 篇文档(缺省 100)";
+  --limit N   search:最多返回 N 篇文档(缺省 100)
+  --yes       clear:确认清空(不可恢复)";
 
 fn main() -> ExitCode {
     let mut db_path: Option<PathBuf> = None;
     let mut force = false;
     let mut loose = false;
+    let mut yes = false;
     let mut scope_arg: Option<String> = None;
     let mut type_arg: Option<String> = None;
     let mut limit_arg: Option<String> = None;
@@ -55,6 +62,7 @@ fn main() -> ExitCode {
             },
             "--force" => force = true,
             "--loose" => loose = true,
+            "--yes" => yes = true,
             "--scope" => match args.next() {
                 Some(value) => scope_arg = Some(value),
                 None => {
@@ -127,6 +135,16 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
         },
+        "check" => run(&db_path, cmd_check),
+        "rebuild" => cmd_rebuild(&db_path),
+        "optimize" => run(&db_path, cmd_optimize),
+        "clear" => {
+            if !yes {
+                eprintln!("clear 会删除全部文档与索引,请加 --yes 确认\n{USAGE}");
+                return ExitCode::from(2);
+            }
+            cmd_clear(&db_path)
+        }
         _ => {
             eprintln!("未知命令: {command}\n{USAGE}");
             return ExitCode::from(2);
@@ -176,17 +194,18 @@ fn cmd_docs(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<(
 }
 
 fn cmd_stats(connection: &rusqlite::Connection, path: &Path) -> anyhow::Result<()> {
-    let documents: i64 =
-        connection.query_row("SELECT count(*) FROM documents", [], |row| row.get(0))?;
-    let chunks: i64 = connection.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
-    let index_bytes = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+    let stats = maintain::index_stats(connection, path)?;
     let data_dir = path
         .parent()
         .map(|dir| dir.display().to_string())
         .unwrap_or_default();
-    println!("文档数: {documents}");
-    println!("分块数: {chunks}");
-    println!("索引文件大小: {index_bytes} 字节");
+    println!("文档数: {}", stats.documents);
+    println!("已索引: {}", stats.parsed);
+    println!("失败: {}", stats.failed);
+    println!("分块数: {}", stats.chunks);
+    println!("FTS 行数: {}", stats.fts_rows);
+    println!("原文字节: {}", stats.text_bytes);
+    println!("索引文件大小: {} 字节", stats.db_bytes);
     println!("数据目录: {data_dir}");
     Ok(())
 }
@@ -384,4 +403,39 @@ fn mark_snippet(content: &str, spans: &[Span]) -> String {
     }
     out.push_str(&content[pos..]);
     out
+}
+
+/// check:打印完整性报告;不一致时返回 Err(退出码 1)。
+fn cmd_check(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
+    let report = maintain::check_integrity(connection, 2000)?;
+    println!("{}", report.summary());
+    if !report.is_consistent() {
+        anyhow::bail!("索引不一致");
+    }
+    Ok(())
+}
+
+/// rebuild:全量重建 chunks_fts,打印进度与最终行数。
+fn cmd_rebuild(db_path: &Path) -> anyhow::Result<()> {
+    let mut conn = store::open(db_path, OpenMode::ReadWrite)?;
+    let rows = maintain::rebuild_fts(&mut conn, &mut |done, total| {
+        println!("重建进度: {done}/{total}");
+    })?;
+    println!("全文索引已重建: {rows} 条");
+    Ok(())
+}
+
+/// optimize:FTS optimize + WAL 截断 + VACUUM。
+fn cmd_optimize(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
+    maintain::optimize(connection)?;
+    println!("索引已优化");
+    Ok(())
+}
+
+/// clear:清空文档与索引(调用方已校验 --yes)。
+fn cmd_clear(db_path: &Path) -> anyhow::Result<()> {
+    let mut conn = store::open(db_path, OpenMode::ReadWrite)?;
+    maintain::clear_all(&mut conn)?;
+    println!("资料库已清空");
+    Ok(())
 }

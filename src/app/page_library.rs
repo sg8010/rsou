@@ -33,7 +33,8 @@ impl RsouApp {
         let mut want_files = false;
         let mut want_folder = false;
         let db_ready = self.db.is_some();
-        let importing = self.import_active;
+        // 维护(重建/清空)进行中时导入也禁用,两条写路径互斥。
+        let importing = self.import_active || self.maintenance_active;
         Self::work_panel(
             ui,
             "文档",
@@ -164,7 +165,7 @@ impl RsouApp {
             .collect();
 
         let mut action: Option<RowAction> = None;
-        let busy = self.import_active;
+        let busy = self.import_active || self.maintenance_active;
         Self::work_panel(
             ui,
             "列表",
@@ -319,7 +320,7 @@ impl RsouApp {
     /// 失败清单抽屉:文件名 + 中文原因 + 重试/移除。
     fn ui_failures_drawer(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<RowAction> = None;
-        let busy = self.import_active;
+        let busy = self.import_active || self.maintenance_active;
         Self::work_panel(
             ui,
             "失败",

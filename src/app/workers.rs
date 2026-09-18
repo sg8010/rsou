@@ -7,6 +7,7 @@
 use std::sync::mpsc;
 
 use rsou_lib::import::{self, FileOutcome, ImportOptions};
+use rsou_lib::maintain;
 use rsou_lib::repo;
 use rsou_lib::search::{self, Filters, SearchRequest};
 
@@ -23,7 +24,38 @@ impl RsouApp {
         app.open_store();
         // 启动时先读一遍,资料库页首次进入就有数据
         app.refresh_documents();
+        app.load_settings();
         app
+    }
+
+    /// 读 settings 里的用户配置(当前只有单文件体积上限)。
+    fn load_settings(&mut self) {
+        let Some(conn) = &self.db else { return };
+        self.max_file_mb = repo::get_setting(conn, "max_file_mb")
+            .ok()
+            .flatten()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|mb| (1..=repo::MAX_FILE_MB_LIMIT).contains(mb))
+            .unwrap_or(repo::DEFAULT_MAX_FILE_MB);
+    }
+
+    /// 设置页 DragValue 变更时持久化(GUI 连接的零散小写)。
+    pub(crate) fn set_max_file_mb(&mut self, mb: u64) {
+        self.max_file_mb = mb;
+        if let Some(conn) = &self.db
+            && let Err(error) = repo::set_setting(conn, "max_file_mb", &mb.to_string())
+        {
+            log::warn!("保存 max_file_mb 失败: {error:#}");
+        }
+    }
+
+    /// 重新读取索引统计(进入设置页 / 维护完成 / 手动刷新时调用)。
+    pub(crate) fn refresh_index_stats(&mut self) {
+        let Some(conn) = &self.db else { return };
+        match maintain::index_stats(conn, &self.dirs.db_path) {
+            Ok(stats) => self.index_stats = Some(stats),
+            Err(error) => log::warn!("读取索引统计失败: {error:#}"),
+        }
     }
 
     /// 带启动完成标记的构造入口,供二进制入口的启动 watchdog 使用。
@@ -53,9 +85,9 @@ impl RsouApp {
         }
     }
 
-    /// 启动一次导入(已在导入中则忽略;GUI 一次只跑一个导入)。
+    /// 启动一次导入(已在导入中或索引维护中则忽略;GUI 一次只跑一个导入)。
     pub(crate) fn start_import(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>, force: bool) {
-        if self.import_active || inputs.is_empty() || self.db.is_none() {
+        if self.import_active || self.maintenance_active || inputs.is_empty() || self.db.is_none() {
             return;
         }
         self.import_active = true;
@@ -67,6 +99,12 @@ impl RsouApp {
         let (tx, rx) = mpsc::channel::<ImportEvent>();
         self.import_rx = Some((generation, rx));
 
+        // 单文件体积上限从 settings 读(GUI 连接只做这一次小读)。
+        let max_file_bytes = self
+            .db
+            .as_ref()
+            .map(repo::max_file_bytes)
+            .unwrap_or(repo::DEFAULT_MAX_FILE_MB * 1024 * 1024);
         let db_path = self.dirs.db_path.clone();
         let ctx = ctx.clone();
         let spawned = std::thread::Builder::new()
@@ -76,8 +114,8 @@ impl RsouApp {
                     &db_path,
                     inputs,
                     ImportOptions {
+                        max_file_bytes,
                         force,
-                        ..ImportOptions::default()
                     },
                     cancel,
                     &mut |event| {
@@ -156,13 +194,17 @@ impl RsouApp {
         let db_path = self.dirs.db_path.clone();
         let ctx = ctx.clone();
         // 无 jieba feature 时宽松模式退化为精确(库层已保证,这里固定精确保持一致)。
+        // 时间范围:最近 N 天 → mtime 下界(Unix 毫秒)。
+        let mtime_from_ms = self
+            .search_mtime_days
+            .map(|days| repo::now_ms().saturating_sub(days.saturating_mul(86_400_000) as i64));
         let request = SearchRequest {
             query,
             scope: self.search_scope,
             loose: !self.search_exact,
             filters: Filters {
                 file_types: self.search_types.iter().cloned().collect(),
-                mtime_from_ms: None,
+                mtime_from_ms,
                 mtime_to_ms: None,
                 path_prefix: {
                     let prefix = self.search_path_prefix.trim();
@@ -244,12 +286,109 @@ impl RsouApp {
         }
     }
 
+    /// 启动一次索引维护(检查/重建/优化/清空共用一条 rsou-maintain 通道;
+    /// 已在维护或导入中则忽略,GUI 一次只跑一个)。
+    pub(crate) fn start_maintain(&mut self, ctx: &egui::Context, kind: MaintainKind) {
+        if self.maintenance_active || self.import_active {
+            return;
+        }
+        self.maintenance_active = true;
+        self.maintain_result = None;
+        self.maintain_gen += 1;
+        let generation = self.maintain_gen;
+        let (tx, rx) = mpsc::channel::<MaintainMsg>();
+        self.maintain_rx = Some((generation, rx));
+        let progress = Arc::new(MaintainProgress::default());
+        self.maintain_progress = Some(progress.clone());
+
+        let db_path = self.dirs.db_path.clone();
+        let ctx = ctx.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rsou-maintain".to_owned())
+            .spawn(move || {
+                let result =
+                    store::open(&db_path, OpenMode::ReadWrite).and_then(|mut conn| match kind {
+                        MaintainKind::Check => maintain::check_integrity(&conn, 2000)
+                            .map(|report| (report.summary(), !report.is_consistent())),
+                        MaintainKind::Rebuild => {
+                            maintain::rebuild_fts(&mut conn, &mut |done, total| {
+                                progress.done.store(done, Ordering::Relaxed);
+                                progress.total.store(total, Ordering::Relaxed);
+                                ctx.request_repaint();
+                            })
+                            .map(|rows| (format!("全文索引已重建: {rows} 条"), false))
+                        }
+                        MaintainKind::Optimize => {
+                            maintain::optimize(&conn).map(|()| ("索引已优化".to_owned(), false))
+                        }
+                        MaintainKind::Clear => maintain::clear_all(&mut conn)
+                            .map(|()| ("资料库已清空".to_owned(), false)),
+                    });
+                let (result, inconsistent) = match result {
+                    Ok((message, inconsistent)) => (Ok(message), inconsistent),
+                    Err(error) => (Err(format!("{error:#}")), false),
+                };
+                if tx
+                    .send(MaintainMsg {
+                        generation,
+                        kind,
+                        result,
+                        inconsistent,
+                    })
+                    .is_ok()
+                {
+                    ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(handle) => self.workers.push(handle),
+            Err(error) => {
+                self.maintenance_active = false;
+                self.maintain_rx = None;
+                self.maintain_progress = None;
+                self.maintain_result = Some(Err(format!("无法启动维护线程: {error}")));
+            }
+        }
+    }
+
     /// 每帧非阻塞地收取后台任务消息;回收已结束的 worker 线程。
     pub(crate) fn poll_workers(&mut self) {
         self.poll_import();
         self.poll_search();
         self.poll_preview();
+        self.poll_maintain();
         self.workers.retain(|worker| !worker.is_finished());
+    }
+
+    /// 消费维护结果;完成后刷新统计与文档列表缓存。
+    fn poll_maintain(&mut self) {
+        if let Some((generation, rx)) = &self.maintain_rx
+            && *generation == self.maintain_gen
+        {
+            let mut msg = None;
+            while let Ok(event) = rx.try_recv() {
+                msg = Some(event);
+            }
+            if let Some(MaintainMsg {
+                generation,
+                kind,
+                result,
+                inconsistent,
+            }) = msg
+                && generation == self.maintain_gen
+            {
+                self.maintenance_active = false;
+                self.maintain_rx = None;
+                self.maintain_progress = None;
+                self.maintain_result = Some(result);
+                self.maintain_inconsistent = inconsistent;
+                self.refresh_index_stats();
+                // 清空后文档列表必须跟着空;重建/优化后也顺手刷新,成本一样。
+                if !matches!(kind, MaintainKind::Check) {
+                    self.refresh_documents();
+                }
+            }
+        }
     }
 
     /// 消费检索结果;世代号不匹配(新查询已发出)时丢弃过期消息。

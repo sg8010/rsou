@@ -18,12 +18,13 @@ mod workers;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use rsou_lib::import::ImportEvent;
+use rsou_lib::maintain::IndexStats;
 use rsou_lib::query::Scope;
 use rsou_lib::repo::{DocumentRow, ImportCounts};
 use rsou_lib::search::SearchResponse;
@@ -108,6 +109,31 @@ pub(crate) struct PreviewMsg {
     pub text: Option<String>,
 }
 
+/// 索引维护任务的种类(设置页四个按钮一一对应)。
+#[derive(Clone, Copy)]
+pub(crate) enum MaintainKind {
+    Check,
+    Rebuild,
+    Optimize,
+    Clear,
+}
+
+/// 维护 worker 回传的消息。`inconsistent` 仅在 kind==Check 时有意义:
+/// 检查不一致时卡片上额外出现「立即重建」按钮。
+pub(crate) struct MaintainMsg {
+    pub generation: u64,
+    pub kind: MaintainKind,
+    pub result: Result<String, String>,
+    pub inconsistent: bool,
+}
+
+/// 重建进度(维护线程写、UI 线程读)。
+#[derive(Default)]
+pub(crate) struct MaintainProgress {
+    pub done: AtomicU64,
+    pub total: AtomicU64,
+}
+
 /// 正在显示的内置对话框(Linux)
 #[cfg(target_os = "linux")]
 pub(crate) struct ActiveDialog {
@@ -164,6 +190,8 @@ pub struct RsouApp {
     search_types: std::collections::BTreeSet<String>,
     /// 目录前缀过滤(规范化路径前缀)
     search_path_prefix: String,
+    /// 时间范围过滤(None = 全部;Some(N) = 最近 N 天)
+    search_mtime_days: Option<u64>,
     /// 最近一次检索结果(新结果回来前保留展示)
     search_result: Option<SearchResponse>,
     /// 检索/语法错误文案(状态行显示,不弹窗)
@@ -184,8 +212,26 @@ pub struct RsouApp {
     preview_loading: bool,
     /// 点片段后待滚动的 plain_text 字节偏移(渲染一次后清除)
     pending_scroll: Option<usize>,
-    /// 是否有索引维护任务在后台进行(阶段 4 接入)
+    /// 索引统计缓存(设置页卡片;进入设置页/维护完成后刷新,不每帧查)
+    index_stats: Option<IndexStats>,
+    /// 是否有索引维护任务在后台进行
     maintenance_active: bool,
+    /// 维护任务消息通道(世代号随通道存)
+    maintain_rx: Option<(u64, Receiver<MaintainMsg>)>,
+    /// 维护世代号
+    maintain_gen: u64,
+    /// 重建进度(维护线程写、UI 读;仅 Rebuild 任务期间有意义)
+    maintain_progress: Option<Arc<MaintainProgress>>,
+    /// 最近一次维护任务的结果文案(卡片内显示)
+    maintain_result: Option<Result<String, String>>,
+    /// 上次完整性检查不一致(显示「立即重建」按钮)
+    maintain_inconsistent: bool,
+    /// 「清空资料库」二次确认开关
+    confirm_clear: bool,
+    /// 设置页的操作提示(复制路径 / 打开目录结果等)
+    settings_notice: Option<String>,
+    /// 单文件体积上限(MB;settings.max_file_mb,设置页 DragValue)
+    max_file_mb: u64,
     /// 已点击待处理的对话框请求(帧末统一处理)
     pending_dialog: Option<DialogRequest>,
     /// 内置文件对话框(Linux;其他平台用系统原生 rfd 对话框)
@@ -226,6 +272,7 @@ impl RsouApp {
             search_exact: true,
             search_types: std::collections::BTreeSet::new(),
             search_path_prefix: String::new(),
+            search_mtime_days: None,
             search_result: None,
             search_error: None,
             search_rx: None,
@@ -236,7 +283,16 @@ impl RsouApp {
             preview_gen: 0,
             preview_loading: false,
             pending_scroll: None,
+            index_stats: None,
             maintenance_active: false,
+            maintain_rx: None,
+            maintain_gen: 0,
+            maintain_progress: None,
+            maintain_result: None,
+            maintain_inconsistent: false,
+            confirm_clear: false,
+            settings_notice: None,
+            max_file_mb: rsou_lib::repo::DEFAULT_MAX_FILE_MB,
             pending_dialog: None,
             #[cfg(target_os = "linux")]
             dialog: None,
@@ -312,6 +368,10 @@ impl eframe::App for RsouApp {
                         // 进入资料库页时刷新文档列表缓存(不每帧查库)
                         if self.page == Page::Library && self.prev_page != Page::Library {
                             self.refresh_documents();
+                        }
+                        // 进入设置页时刷新索引统计(同样不每帧查库)
+                        if self.page == Page::Settings && self.prev_page != Page::Settings {
+                            self.refresh_index_stats();
                         }
                         self.prev_page = self.page;
                         self.ui_workspace(ui);

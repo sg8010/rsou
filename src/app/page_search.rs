@@ -31,6 +31,16 @@ fn scope_label(scope: Scope) -> &'static str {
     }
 }
 
+fn mtime_label(days: Option<u64>) -> &'static str {
+    match days {
+        None => "全部时间",
+        Some(7) => "最近 7 天",
+        Some(30) => "最近 30 天",
+        Some(365) => "最近一年",
+        Some(_) => "自定义",
+    }
+}
+
 /// 高亮底色(命中段上底色)。
 fn highlight_bg() -> Color32 {
     RsouApp::amber().gamma_multiply(0.3)
@@ -141,11 +151,18 @@ impl RsouApp {
                             .desired_width(180.0)
                             .hint_text("路径前缀"),
                     );
-                    ui.label(
-                        egui::RichText::new("时间范围:待接入")
-                            .size(12.0)
-                            .color(Self::soft()),
-                    );
+                    ui.label(egui::RichText::new("时间:").size(13.0).color(Self::muted()));
+                    egui::ComboBox::from_id_salt("search_mtime")
+                        .selected_text(mtime_label(self.search_mtime_days))
+                        .show_ui(ui, |ui| {
+                            for days in [None, Some(7), Some(30), Some(365)] {
+                                ui.selectable_value(
+                                    &mut self.search_mtime_days,
+                                    days,
+                                    mtime_label(days),
+                                );
+                            }
+                        });
                 });
             },
         );

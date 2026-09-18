@@ -522,6 +522,21 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> anyhow::Result<
     Ok(())
 }
 
+/// settings.max_file_mb 的默认与允许范围(设置页 DragValue 用同一组常量)。
+pub const DEFAULT_MAX_FILE_MB: u64 = 100;
+pub const MAX_FILE_MB_LIMIT: u64 = 2048;
+
+/// 单文件体积上限(字节):读 settings.max_file_mb,缺失或非法时回默认。
+pub fn max_file_bytes(conn: &Connection) -> u64 {
+    let mb = get_setting(conn, "max_file_mb")
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|mb| (1..=MAX_FILE_MB_LIMIT).contains(mb))
+        .unwrap_or(DEFAULT_MAX_FILE_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Stats {
     pub documents: i64,
