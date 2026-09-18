@@ -3,7 +3,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-LIBSIMPLE="${RSOU_LIBSIMPLE:-/home/ljw/wsou/resources/simple/linux-x64/libsimple.so}"
+if [[ -z "${RSOU_LIBSIMPLE:-}" ]]; then
+    echo "请设置 RSOU_LIBSIMPLE,指定 libsimple.so 的路径" >&2
+    exit 2
+fi
+LIBSIMPLE="$RSOU_LIBSIMPLE"
 SQLITE_HEADER="${SQLITE_HEADER:-$HOME/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/libsqlite3-sys-0.37.0/sqlite3}"
 ORACLE_BIN="${TMPDIR:-/tmp}/rsou-fts5-oracle-$$"
 RUST_OUTPUT="${TMPDIR:-/tmp}/rsou-rust-tokens-$$"
@@ -23,11 +27,6 @@ gcc -std=c11 -I"$SQLITE_HEADER" \
     spikes/tokenizer/oracle.c -Wl,-l:libsqlite3.so.0 -ldl -o "$ORACLE_BIN"
 
 export LD_LIBRARY_PATH="$(dirname "$LIBSIMPLE")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:10808}"
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:10808}"
-export http_proxy="${http_proxy:-$HTTP_PROXY}"
-export https_proxy="${https_proxy:-$HTTPS_PROXY}"
-
 cargo build -q -p rsou-tokenizer-spike --bin dump-tokens
 RUST_BIN="target/debug/dump-tokens"
 

@@ -3,11 +3,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-export HTTP_PROXY="${HTTP_PROXY:-http://127.0.0.1:10808}"
-export HTTPS_PROXY="${HTTPS_PROXY:-http://127.0.0.1:10808}"
-export http_proxy="${http_proxy:-$HTTP_PROXY}"
-export https_proxy="${https_proxy:-$HTTPS_PROXY}"
-
 echo '== host tests =='
 cargo fmt --all -- --check
 cargo test --workspace
