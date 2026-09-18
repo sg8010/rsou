@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
+# 检查 Windows 产物是否误引用 Windows 7 没有的 API。
 set -euo pipefail
 
-exe="${1:?usage: check-win7-imports.sh EXE TARGET}"
-target="${2:?usage: check-win7-imports.sh EXE TARGET}"
-
-if [[ ! -f "$exe" ]]; then
-    echo "missing PE: $exe" >&2
-    exit 2
+EXE="${1:-target/x86_64-win7-windows-gnu/release/rsou.exe}"
+TARGET="${2:-x86_64-win7-windows-gnu}"
+if [ -z "${OBJDUMP:-}" ]; then
+    case "$TARGET" in
+        x86_64-*) OBJDUMP=x86_64-w64-mingw32-objdump ;;
+        i686-*) OBJDUMP=i686-w64-mingw32-objdump ;;
+        *) OBJDUMP=x86_64-w64-mingw32-objdump ;;
+    esac
 fi
 
-case "$target" in
-    x86_64-*) objdump_bin="${OBJDUMP:-x86_64-w64-mingw32-objdump}"; expected=("PE32+ executable" "x86-64") ;;
-    i686-*) objdump_bin="${OBJDUMP:-i686-w64-mingw32-objdump}"; expected=("PE32 executable" "Intel 80386") ;;
-    *) echo "unsupported target: $target" >&2; exit 2 ;;
-esac
-
-if ! command -v "$objdump_bin" >/dev/null 2>&1; then
-    echo "missing PE inspection tool: $objdump_bin" >&2
-    exit 2
+if [ ! -f "$EXE" ]; then
+    echo "❌ 找不到 Windows 产物: $EXE" >&2
+    exit 1
+fi
+if ! command -v "$OBJDUMP" >/dev/null 2>&1; then
+    echo "❌ 未找到 PE 导入表检查工具: $OBJDUMP" >&2
+    exit 1
 fi
 
-imports="$($objdump_bin -p "$exe")"
+IMPORTS=$("$OBJDUMP" -p "$EXE")
+
+# 这些 API/API-set 分别来自 Windows 8 或 Windows 10。尤其是
+# PathCchStripPrefix：arboard 的文件列表剪贴板代码会引用它，但本应用
+# 不使用该接口，release fat LTO 应将这段未使用代码删除。
 for forbidden in \
     "combase.dll" \
     "PathCchStripPrefix" \
@@ -28,18 +33,30 @@ for forbidden in \
     "WaitOnAddress" \
     "api-ms-win-core-synch-l1-2-0.dll" \
     "ProcessPrng"; do
-    if grep -Fqi "$forbidden" <<<"$imports"; then
-        echo "forbidden Windows 8+ import: $forbidden" >&2
+    if grep -Fq "$forbidden" <<<"$IMPORTS"; then
+        echo "❌ 产物引用了 Windows 7 不支持的 API: $forbidden" >&2
         exit 1
     fi
 done
 
-file_type="$(file -b "$exe")"
-for marker in "${expected[@]}"; do
-    if ! grep -Fq "$marker" <<<"$file_type"; then
-        echo "unexpected PE architecture: $file_type" >&2
+FILE_TYPE=$(file -b "$EXE")
+case "$TARGET" in
+    x86_64-*)
+        EXPECTED_FILE_MARKERS=("PE32+ executable" "x86-64")
+        ;;
+    i686-*)
+        EXPECTED_FILE_MARKERS=("PE32 executable" "Intel 80386")
+        ;;
+    *)
+        echo "❌ 不支持的 Windows 目标架构: $TARGET" >&2
         exit 1
-    fi
-done
+        ;;
+esac
 
-echo "Win7 import audit: PASS ($target)"
+if ! grep -Fq "${EXPECTED_FILE_MARKERS[0]}" <<<"$FILE_TYPE" || \
+   ! grep -Fq "${EXPECTED_FILE_MARKERS[1]}" <<<"$FILE_TYPE"; then
+    echo "❌ 产物架构与目标不符: $EXE ($FILE_TYPE)" >&2
+    exit 1
+fi
+
+echo "✅ Windows 7 导入表检查通过: $TARGET"

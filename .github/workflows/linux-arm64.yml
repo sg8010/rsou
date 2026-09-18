@@ -1,0 +1,133 @@
+name: CI Linux arm64
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-arm64:
+    name: Build Linux arm64 (glibc 2.28)
+    runs-on: ubuntu-24.04-arm
+    # debian:buster = glibc 2.28,与目标平台一致;容器内编译保证产物
+    # glibc 需求 ≤ 2.28(在 24.04 runner 上直接编译会要求 glibc 2.39,无法在 2.28 机器运行)
+    container:
+      image: debian:buster
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs 需要标签来写入应用内版本号;不要使用默认的浅克隆。
+          fetch-depth: 0
+
+      - name: 切到 archive 源 (buster 已 EOL)
+        run: |
+          printf '%s\n' \
+            'deb http://archive.debian.org/debian/ buster main' \
+            'deb http://archive.debian.org/debian/ buster-updates main' \
+            'deb http://archive.debian.org/debian-security/ buster/updates main' \
+            > /etc/apt/sources.list
+          apt-get -o Acquire::Check-Valid-Until=false update
+
+      - name: 装 rustup + gcc
+        run: |
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates git gcc libc6-dev dpkg-dev desktop-file-utils
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: 安装 cargo-deb
+        run: cargo install cargo-deb --locked --version 3.8.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: 打包 Debian 软件包
+        run: |
+          desktop-file-validate assets/rsou.desktop
+          sh -n assets/rsou-launcher.sh
+          case "$GITHUB_REF" in
+            refs/tags/v*) cargo deb --no-build --deb-version "${GITHUB_REF_NAME#v}-1" ;;
+            *) cargo deb --no-build ;;
+          esac
+
+      - name: 校验 Debian 软件包
+        run: |
+          DEB=$(find target/debian -maxdepth 1 -type f -name '*.deb' -print -quit)
+          test -n "$DEB"
+          dpkg-deb --info "$DEB"
+          test "$(dpkg-deb --field "$DEB" Architecture)" = "arm64"
+          dpkg-deb --contents "$DEB" | grep -F './usr/share/applications/rsou.desktop'
+          dpkg-deb --contents "$DEB" | grep -F './usr/share/icons/hicolor/256x256/apps/rsou.png'
+
+          # 二进制必须装在 /usr/lib、/usr/bin 留作启动器脚本。启动器负责把发生在
+          # main() 之前的动态链接/exec 报错写进启动日志,退回成直接装二进制会静默
+          # 丢掉这一类诊断,所以在这里挡住。
+          dpkg-deb --contents "$DEB" | grep -F './usr/lib/rsou/rsou'
+          dpkg-deb --field "$DEB" Depends | grep -qF 'libxkbcommon-x11-0'
+          dpkg-deb --field "$DEB" Depends | grep -qF 'libx11-6'
+
+          ROOT=$(mktemp -d)
+          dpkg-deb -x "$DEB" "$ROOT"
+          test -x "$ROOT/usr/lib/rsou/rsou"
+          test -x "$ROOT/usr/bin/rsou"
+          head -1 "$ROOT/usr/bin/rsou" | grep -qF '#!/bin/sh'
+          sh -n "$ROOT/usr/bin/rsou"
+          # 启动器里解析真实二进制的相对路径必须与安装布局一致。
+          grep -qF 'lib/rsou/rsou' "$ROOT/usr/bin/rsou"
+
+      - name: 校验产物 glibc 需求 ≤ 2.28
+        run: |
+          echo "=== 文件类型 ==="
+          readelf -h target/release/rsou | grep -E "Class|Machine"
+          echo "=== 最高 glibc 符号版本 ==="
+          objdump -T target/release/rsou 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -3
+          MAX=$(objdump -T target/release/rsou 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+          echo "最高需求 glibc: $MAX"
+          HIGH=$(printf '%s\n' "$MAX" "2.28" | sort -V | tail -1)
+          if [ "$HIGH" != "2.28" ]; then
+            echo "❌ 产物要求 glibc $MAX,超过目标 2.28"
+            exit 1
+          fi
+          echo "✅ 产物 glibc 需求 ≤ 2.28"
+
+      - name: 准备发布文件
+        run: |
+          mkdir -p dist
+          cp target/release/rsou dist/rsou-linux-arm64
+          cp target/debian/*.deb dist/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsou-linux-arm64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-linux-arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rsou-linux-arm64
+          path: dist
+
+      - name: 设置裸二进制权限
+        run: chmod +x dist/rsou-linux-arm64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

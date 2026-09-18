@@ -1,0 +1,20 @@
+# vendored 自 rusqlite-ext 0.39.0(crates.io),原包用 workspace 继承,
+# 这里展开为显式字段以便作为 path 依赖直接构建;内容与发布版一致。
+[package]
+name = "rusqlite-ext"
+version = "0.39.0"
+authors = ["Cathy Luking <cathyluking@foxmail.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "This is a Rusqlite extension for building the FTS5 tokenizer."
+keywords = ["SQLite", "Extension", "Rusqlite", "Tokenizer"]
+readme = "README.md"
+repository = "https://github.com/lukingcathy/sqlite-simple-tokenizer"
+
+[lib]
+name = "rusqlite_ext"
+path = "lib.rs"
+
+[dependencies]
+log = "0.4"
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled", "functions", "vtab", "array"] }

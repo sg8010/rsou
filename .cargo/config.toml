@@ -1,13 +1,10 @@
-# The Win7 target triples are Tier 3 targets: nightly + rust-src + build-std
-# are required, rather than a downloadable prebuilt standard library.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+
+# Rust 官方的 Windows 7+ GNU 目标没有预编译 std，需要用 nightly 的
+# -Z build-std 从 rust-src 构建；链接器仍使用系统 mingw-w64。
 [target.x86_64-win7-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 
 [target.i686-win7-windows-gnu]
-linker = "i686-w64-mingw32-gcc"
-
-[target.x86_64-pc-windows-gnu]
-linker = "x86_64-w64-mingw32-gcc"
-
-[target.i686-pc-windows-gnu]
 linker = "i686-w64-mingw32-gcc"

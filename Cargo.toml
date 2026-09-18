@@ -1,12 +1,92 @@
+[package]
+name = "rsou"
+version = "0.1.0"
+edition = "2024"
+default-run = "rsou"
+description = "本地文档全文检索工具"
+
+[lib]
+name = "rsou_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsou"
+path = "src/main.rs"
+
+[[bin]]
+name = "rsou-cli"
+path = "src/bin/cli.rs"
+
 [workspace]
 members = [
     "spikes/anydoc-matrix",
     "spikes/tokenizer",
     "spikes/scale",
 ]
-resolver = "2"
+
+[package.metadata.deb]
+maintainer = "sg8010 <sg8011@outlook.com>"
+copyright = "sg8010"
+section = "utils"
+priority = "optional"
+# $auto 只能看到二进制的 DT_NEEDED(libc6/libgcc-s1)。glutin/winit 是通过 dlopen
+# 加载 X11/GL 库的,dpkg-shlibdeps 看不见,所以这些运行库必须显式声明,否则包
+# 装得上、运行时却因为找不到库而起不来。libgl1 在 buster 系发行版(UOS)由
+# libgl1-mesa-glx 提供,故保留可选写法。
+depends = "$auto, libgl1 | libgl1-mesa-glx, libegl1, libx11-6, libx11-xcb1, libxcb1, libxkbcommon0, libxkbcommon-x11-0, libxcursor1, libxi6, libxrandr2, libxfixes3, libxrender1"
+# DRI 驱动缺失时 EGL/GLX 仍会失败,但用哪个驱动取决于显卡厂商,因此只做推荐。
+recommends = "libgl1-mesa-dri"
+maintainer-scripts = "debian"
+assets = [
+    # 真正的二进制放在 /usr/lib;usr/bin/rsou 是启动器脚本,负责把发生在
+    # main() 之前的动态链接/exec 报错也写进启动日志。
+    ["target/release/rsou", "usr/lib/rsou/rsou", "755"],
+    ["assets/rsou-launcher.sh", "usr/bin/rsou", "755"],
+    ["assets/rsou.desktop", "usr/share/applications/rsou.desktop", "644"],
+    ["assets/icon.png", "usr/share/icons/hicolor/256x256/apps/rsou.png", "644"],
+]
 
 [profile.release]
+# Win7 target 不能把未使用的高版本 Windows API 留在 PE 导入表中。
+# fat LTO 会跨 crate 删除 arboard 的文件列表剪贴板代码，其中包含
+# Windows 8 才提供的 PathCchStripPrefix；同时也让最终导入表更容易审计。
 codegen-units = 1
 lto = "fat"
 strip = "symbols"
+
+# eframe 0.36 固定优先使用 GLX。UOS 20 的旧 Mesa 18.3.6 会在该路径异步
+# 返回 GLXBadContextTag，导致 winit 显示首窗时崩溃。项目补丁只把 Linux 的
+# 图形 API 顺序改为 EGL 优先、GLX 兜底；详见 vendor/glutin-winit/RSOU_PATCH.md。
+[patch.crates-io]
+glutin-winit = { path = "vendor/glutin-winit" }
+# windows-sys 0.61 把 CoTaskMemFree 改为从 combase.dll 导入,而 Windows 7
+# 只在 ole32.dll 提供这个兼容 API。保留 windows-sys 的声明,仅替换链接宏
+# 对该函数的 DLL,避免 x86/x64 的 Win7 产物在启动时加载不存在的 combase.dll。
+windows-link = { path = "vendor/windows-link" }
+# FTS5 自定义 tokenizer 的注册胶水(unsafe 收在这一处、可审计);
+# 本地 vendor 便于审查,详见 docs/plan.md §6.0 方案 A。
+rusqlite-ext = { path = "vendor/rusqlite-ext" }
+
+[dependencies]
+# Linux 目标仅需 X11 + glow(OpenGL) 渲染;关 default 去掉 wayland/wgpu/accesskit。
+# 本地 glutin-winit 补丁会让 Linux 上的 glow 优先通过 EGL 创建上下文。
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "glow", "x11"] }
+egui_extras = "0.36"
+# bundled 自带 SQLite 源码(已开 FTS5),目标机无需系统 libsqlite3;
+# 自定义 tokenizer 需要较新的 fts5_tokenizer_v2 接口,bundled 版本满足。
+rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
+# FTS5 tokenizer 注册胶水(经 [patch] 指向 vendor/rusqlite-ext)。
+rusqlite-ext = "0.39"
+anyhow = "1"
+log = "0.4"
+
+# 信号处理器要直接用 write(2) 往日志 fd 里写"崩溃前最后一口气",只能用 libc。
+# 该 crate 本来就在依赖树里(winit/glutin 间接引入),不产生额外下载。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+# Linux 目标不使用 rfd:它靠 XDG Desktop Portal,Portal 缺失时会回退成调用
+# `zenity` 外部进程,精简桌面/无桌面环境上会直接没反应。Linux 改用内置的 egui
+# 文件对话框(src/file_dialog.rs + rsou_lib::filebrowser),只依赖 std::fs。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.17", default-features = false }

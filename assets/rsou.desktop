@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=rsou
+Comment=本地文档全文检索工具
+Exec=rsou
+Icon=rsou
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=true
