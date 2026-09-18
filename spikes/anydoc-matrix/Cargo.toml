@@ -1,0 +1,9 @@
+[package]
+name = "rsou-anydoc-matrix-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anydoc = "=0.2.4"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

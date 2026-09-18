@@ -1,0 +1,13 @@
+[package]
+name = "rsou-tokenizer-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "rsou_tokenizer_spike"
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+rusqlite-ext = "=0.39.0"

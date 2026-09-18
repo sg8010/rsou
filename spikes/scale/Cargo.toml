@@ -1,0 +1,9 @@
+[package]
+name = "rsou-scale-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+rusqlite = { version = "0.39.0", default-features = false, features = ["bundled"] }
+rsou-tokenizer-spike = { path = "../tokenizer" }
