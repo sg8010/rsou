@@ -310,6 +310,7 @@ mod tests {
             file_type: FileType::Text,
             file_size: 0,
             file_mtime_ms: 1_000,
+            source_root: None,
         };
         let plain = text::markdown_to_plain(markdown);
         let title = text::extract_title(&plain, &meta.stem());

@@ -174,6 +174,20 @@ pub fn run_import(
     let now = repo::now_ms();
     let (kind, root) = classify_inputs(&inputs);
     let run_id = repo::create_run(&conn, kind, root.as_deref(), files.len(), now)?;
+    // 本次导入的「来源文件夹」:只有「单个目录」这种输入才算文件夹导入。
+    // 选多个文件、或「文件+文件夹」混合时,一律按单独文件处理——那种混合
+    // 输入没有唯一的归属,硬指定会让树形归属失真。
+    //
+    // 注意 root 是**输入时用户选的**路径,可能与文档的 canonical 路径不同形
+    // (符号链接/相对路径)。这里统一用 dunce 规范化一次,保证与 documents.path
+    // 同口径,树形分组才能对得上。
+    let source_root: Option<String> = match (&kind, &root) {
+        (&"folder", Some(dir)) => {
+            let normalized = dunce::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+            Some(normalized.to_string_lossy().into_owned())
+        }
+        _ => None,
+    };
     // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
     seed_items(&mut conn, run_id, &files, now)?;
 
@@ -192,6 +206,7 @@ pub fn run_import(
     let options_ref = &options;
     let cancel_ref = &cancel;
     let existing_ref = &existing;
+    let source_root_ref = source_root.as_deref();
     // 生产者线程跑 rayon 并行解析,消费(写库)留在调用线程:
     // Receiver/回调/连接都不需要跨线程。
     std::thread::scope(|scope| {
@@ -200,7 +215,7 @@ pub fn run_import(
                 if cancel_ref.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = process_file(path, options_ref, existing_ref);
+                let result = process_file(path, options_ref, existing_ref, source_root_ref);
                 if tx.send(result).is_err() {
                     // 消费者已退出(写库出错),直接收工。
                     cancel_ref.store(true, Ordering::Relaxed);
@@ -316,9 +331,14 @@ fn process_file(
     path: &Path,
     options: &ImportOptions,
     existing: &HashMap<String, Existing>,
+    source_root: Option<&str>,
 ) -> FileResult {
     let meta = match FileMeta::of(path) {
-        Ok(Some(meta)) => meta,
+        Ok(Some(mut meta)) => {
+            // 注入来源文件夹(FileMeta::of 只读文件本身,不知道这次是谁导入的)。
+            meta.source_root = source_root.map(str::to_owned);
+            meta
+        }
         Ok(None) => {
             // 扫描与处理之间文件被改名/替换导致扩展名不再受支持。
             return FileResult::Done {
@@ -403,6 +423,7 @@ fn dummy_meta(path: &Path) -> FileMeta {
         file_type: parse::FileType::Text,
         file_size: 0,
         file_mtime_ms: 0,
+        source_root: None,
     }
 }
 
@@ -531,6 +552,7 @@ mod tests {
             file_type: crate::parse::FileType::Text,
             file_size: 0,
             file_mtime_ms: 1_000,
+            source_root: None,
         }
     }
 

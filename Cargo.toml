@@ -77,6 +77,10 @@ rusqlite-ext = { path = "vendor/rusqlite-ext" }
 # 本地 glutin-winit 补丁会让 Linux 上的 glow 优先通过 EGL 创建上下文。
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "glow", "x11"] }
 egui_extras = "0.36"
+# 资料库页的「已添加文件夹」树:文件夹可展开、叶子可点击。
+# 选它是因为版本正好对 0.36、默认零额外依赖(不启用 persistence/doc feature),
+# 且提供 dir()/leaf() 区分、节点级上下文菜单与展开状态。MIT。
+egui_ltreeview = "0.9"
 # bundled 自带 SQLite 源码(已开 FTS5),目标机无需系统 libsqlite3;
 # 自定义 tokenizer 需要较新的 fts5_tokenizer_v2 接口,bundled 版本满足。
 rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }

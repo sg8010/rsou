@@ -85,6 +85,61 @@ pub(crate) enum DialogRequest {
     ImportFolder,
 }
 
+/// 资料库列表页签。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum LibraryTab {
+    #[default]
+    Folders,
+    Files,
+}
+
+/// 一个「已添加文件夹」及其下属文档。
+#[derive(Debug, Clone)]
+pub(crate) struct FolderGroup {
+    /// 规范化绝对路径(即 documents.source_root)
+    pub root: String,
+    pub documents: Vec<DocumentRow>,
+}
+
+impl FolderGroup {
+    /// 未命中过滤(或原名包含过滤词)的文档数。
+    pub fn matched(&self, filter: &str) -> usize {
+        self.documents
+            .iter()
+            .filter(|d| file_name_matches(&d.file_name, filter))
+            .count()
+    }
+}
+
+/// 树形视图的节点标识(egui_ltreeview 需要 Clone+Eq+Hash)。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum LibraryNode {
+    /// 一个来源文件夹(值是 source_root 路径)
+    Folder(String),
+    /// 一篇文档(值是 documents.id)
+    Document(i64),
+}
+
+/// 文档文件名是否命中过滤词(空词 = 全部命中)。
+///
+/// 抽成函数是为了让「文件夹页按匹配数隐藏空文件夹」与「单独文件页过滤」
+/// 用同一条规则,不会出现两处不一致。
+pub(crate) fn file_name_matches(file_name: &str, filter: &str) -> bool {
+    filter.is_empty() || file_name.to_lowercase().contains(filter)
+}
+
+/// 需要二次确认的危险操作。
+///
+/// 所有「移除」都必须经过它:选中的动作先落到 `RsouApp::pending_confirm`,
+/// 由 `ui_confirm_modal` 弹模态框,确认后才真执行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PendingConfirm {
+    /// 移除单个文档
+    RemoveDocument { id: i64, label: String },
+    /// 移除整个文件夹(连同其下全部文档的索引)
+    RemoveFolder { root: String, doc_count: usize },
+}
+
 /// 导入进度(界面展示用)。
 #[derive(Default)]
 pub(crate) struct ImportProgress {
@@ -109,10 +164,22 @@ pub(crate) struct PreviewMsg {
     pub text: Option<String>,
 }
 
-/// 文档列表 worker 回传的消息(文档列表 + 失败清单)。
+/// 一次文档列表读取的全部结果。
+///
+/// 一个结构体而不是元组:字段加到三个之后,元组位置靠数,很容易搞错顺序。
+pub(crate) struct DocsSnapshot {
+    /// 全部文档(单独文件页与旧调用方用)
+    pub documents: Vec<DocumentRow>,
+    /// 失败清单
+    pub failed: Vec<DocumentRow>,
+    /// 文件夹页用的分组
+    pub folder_groups: Vec<FolderGroup>,
+}
+
+/// 文档列表 worker 回传的消息(文档列表 + 失败清单 + 文件夹分组)。
 pub(crate) struct DocsMsg {
     pub generation: u64,
-    pub result: Result<(Vec<DocumentRow>, Vec<DocumentRow>), String>,
+    pub result: Result<DocsSnapshot, String>,
 }
 
 /// 预览高亮定位缓存:同一预览文本、同一窗口、同一组字面量时不重算 locate_literals。
@@ -197,6 +264,12 @@ pub struct RsouApp {
     docs_last_refresh: Option<std::time::Instant>,
     /// 文件名过滤(内存过滤缓存列表)
     doc_filter: String,
+    /// 资料库列表页签:文件夹 / 单独文件
+    library_tab: LibraryTab,
+    /// 来源文件夹分组缓存(文件夹页树形视图)
+    folder_groups: Vec<FolderGroup>,
+    /// 树形视图的折叠/选择状态(egui_ltreeview,跨帧保留)
+    library_tree_state: egui_ltreeview::TreeViewState<LibraryNode>,
     /// 「显示失败清单」抽屉开关
     show_failures: bool,
     /// 上一个页面(进资料库页时刷新文档列表用)
@@ -275,6 +348,8 @@ pub struct RsouApp {
     max_file_mb: u64,
     /// 已点击待处理的对话框请求(帧末统一处理)
     pending_dialog: Option<DialogRequest>,
+    /// 待二次确认的危险操作(选中后弹确认框;None = 没有)
+    pending_confirm: Option<PendingConfirm>,
     /// 内置文件对话框(Linux;其他平台用系统原生 rfd 对话框)
     #[cfg(target_os = "linux")]
     dialog: Option<ActiveDialog>,
@@ -309,6 +384,9 @@ impl RsouApp {
             docs_dirty: false,
             docs_last_refresh: None,
             doc_filter: String::new(),
+            library_tab: LibraryTab::default(),
+            folder_groups: Vec::new(),
+            library_tree_state: egui_ltreeview::TreeViewState::default(),
             show_failures: false,
             prev_page: Page::Library,
             import_progress: ImportProgress::default(),
@@ -348,6 +426,7 @@ impl RsouApp {
             settings_notice: None,
             max_file_mb: rsou_lib::repo::DEFAULT_MAX_FILE_MB,
             pending_dialog: None,
+            pending_confirm: None,
             #[cfg(target_os = "linux")]
             dialog: None,
             #[cfg(target_os = "linux")]

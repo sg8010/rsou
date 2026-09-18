@@ -20,7 +20,10 @@ use crate::tokenize;
 ///
 /// 版本 2 把全文索引从「每分块一行」改成「每文档一行」(`documents_fts`)。
 /// 索引语义变了(FTS 的 AND/OR/NOT 从分块级升到文档级),旧库无法就地沿用。
-pub const SCHEMA_VERSION: &str = "2";
+/// 版本 3 给 documents 加 `source_root`:记录文档是被哪个「已添加文件夹」导入的
+/// (NULL = 单独添加的文件)。旧的「文件夹 → 文档」归属关系没存过,无法补,
+/// 但加上列后新导入就能用了;旧库升上来时存量文档一律归到「单独文件」页。
+pub const SCHEMA_VERSION: &str = "3";
 
 /// 数据目录布局:`data_dir/index.sqlite3` + `data_dir/tmp/`。
 #[derive(Debug, Clone)]
@@ -131,25 +134,79 @@ fn configure(connection: Connection, mode: OpenMode) -> anyhow::Result<Connectio
 pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     if let Some(v) = stored_schema_version(connection)?
         && v != SCHEMA_VERSION
+        && !can_upgrade_from(&v)
     {
         bail!(
             "索引文件版本不兼容:期望 schema_version = {SCHEMA_VERSION},实际为 {v};请使用与索引版本匹配的程序版本,或删除旧索引后重建"
         );
     }
 
+    // 顺序不能换:旧库的 documents 还没有 source_root,而 SCHEMA_SQL 里已经有
+    // `CREATE INDEX ... ON documents(source_root)`——先建表/索引会因缺列直接报
+    // “no such column”。所以先把缺的列补上,再跑 SCHEMA_SQL(CREATE TABLE/INDEX
+    // 都是 IF NOT EXISTS,对新库和已升上来的旧库都幂等)。
+    add_missing_columns(connection)?;
     connection
         .execute_batch(SCHEMA_SQL)
         .context("创建索引库表结构失败")?;
 
     crate::normalize::normalize(connection)?;
 
-    if stored_schema_version(connection)?.is_none() {
+    if stored_schema_version(connection)?.as_deref() != Some(SCHEMA_VERSION) {
         connection
             .execute(
-                "INSERT INTO settings(key, value) VALUES ('schema_version', ?1)",
+                "INSERT INTO settings(key, value) VALUES ('schema_version', ?1) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [SCHEMA_VERSION],
             )
             .context("写入 schema_version 失败")?;
+    }
+    Ok(())
+}
+
+/// 能否从 `from` 就地升级到当前版本。
+///
+/// 只允许**纯追加列**的那一步:v2 → v3 只是给 `documents` 加了可空的
+/// `source_root`,不动任何已有数据,所以升级不丢索引、不需要重新导入。
+/// v1 → v2 改的是 FTS 表结构(每分块一行 → 每文档一行),语义变了、无法
+/// 就地沿用,因此继续拒绝并提示重建。
+fn can_upgrade_from(from: &str) -> bool {
+    from == "2"
+}
+
+/// 把当前 schema 里有、而旧库缺的列补上(CREATE TABLE IF NOT EXISTS 不会动已存在的表)。
+///
+/// 幂等:先查 `pragma_table_info`,缺才 `ALTER TABLE ADD COLUMN`。
+fn add_missing_columns(connection: &Connection) -> anyhow::Result<()> {
+    // (表, 列, 列定义)— 只列可空、无默认值的追加列,ALTER 对已有行写入 NULL。
+    const ADDED: &[(&str, &str, &str)] = &[("documents", "source_root", "TEXT")];
+    for (table, column, definition) in ADDED {
+        // 表还不存在(全新库):什么都不做,交给后面的 SCHEMA_SQL 建成带该列的表。
+        let table_exists: bool = connection
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("检查表 {table} 是否存在失败"))?;
+        if !table_exists {
+            continue;
+        }
+        let exists: bool = connection
+            .query_row(
+                "SELECT count(*) > 0 FROM pragma_table_info(?1) WHERE name = ?2",
+                rusqlite::params![table, column],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("检查 {table}.{column} 失败"))?;
+        if !exists {
+            connection
+                .execute_batch(&format!(
+                    "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                ))
+                .with_context(|| format!("给 {table} 添加列 {column} 失败"))?;
+            log::info!("已为存量索引补上 {table}.{column}");
+        }
     }
     Ok(())
 }
@@ -198,6 +255,9 @@ CREATE TABLE IF NOT EXISTS documents (
   text_length INTEGER NOT NULL DEFAULT 0,
   chunk_count INTEGER NOT NULL DEFAULT 0,
   indexed_at INTEGER,
+  -- 该文档是从哪个「已添加文件夹」导入的(规范化绝对路径);
+  -- NULL = 用「添加文件」单独加进来的。资料库页据此分两个页签。
+  source_root TEXT,
   created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 ) STRICT;
 
@@ -251,6 +311,8 @@ CREATE TABLE IF NOT EXISTS import_items (
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 
 CREATE INDEX IF NOT EXISTS idx_documents_canonical_path ON documents(canonical_path);
+-- 资料库页按 source_root 分页签/建树,加索引避免每次全表扫。
+CREATE INDEX IF NOT EXISTS idx_documents_source_root ON documents(source_root);
 CREATE INDEX IF NOT EXISTS idx_documents_parse_status ON documents(parse_status);
 CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
 CREATE INDEX IF NOT EXISTS idx_import_items_run_status ON import_items(run_id, status);
@@ -377,6 +439,101 @@ mod tests {
         assert_eq!(created, 0, "被拒绝的旧库不应被写入新表");
         drop(connection);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v2_database_upgrades_in_place_without_losing_data() {
+        // v2 的库(没有 source_root 列)应能就地升到 v3:加列、保留全部数据。
+        let path = temp_db("upgrade-v2");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            // 模拟 v2:删掉新索引与列,把版本号退回去,再写一行数据。
+            // 必须先 DROP INDEX:否则 ALTER ... DROP COLUMN 会因索引仍引用该列失败。
+            connection
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_documents_source_root; \
+                     ALTER TABLE documents DROP COLUMN source_root; \
+                     UPDATE settings SET value = '2' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO documents(path, canonical_path, file_name, ext, file_type, \
+                     file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at) \
+                     VALUES ('/d/a.txt', '/d/a.txt', 'a.txt', 'txt', 'text', 1, 1, 'h', 'parsed', 1, 1)",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // 重新打开 → 自动升级
+        let connection = open(&path, OpenMode::ReadWrite).unwrap();
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // 数据还在,新列存在且为 NULL(旧库无从知道归属)。
+        let (file_name, source_root): (String, Option<String>) = connection
+            .query_row("SELECT file_name, source_root FROM documents", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(file_name, "a.txt");
+        assert_eq!(source_root, None, "存量文档应归到「单独文件」");
+
+        // 索引也应被重建出来(升级不该动索引定义)。
+        let has_index: bool = connection
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type='index' AND name='idx_documents_source_root'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_index, "升级应补上新索引吗(execute_batch 会建)");
+        drop(connection);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn upgrade_is_idempotent() {
+        let path = temp_db("upgrade-twice");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            connection
+                .execute_batch(
+                    "DROP INDEX IF EXISTS idx_documents_source_root; \
+                     ALTER TABLE documents DROP COLUMN source_root; \
+                     UPDATE settings SET value = '2' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+        }
+        // 连开三次都不应报错(每次都会检查缺列)。
+        for _ in 0..3 {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('documents') WHERE name='source_root'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "source_root 应恰好存在一列");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v1_is_still_rejected_because_fts_semantics_changed() {
+        // v1 → v2 改的是 FTS 表结构,不能就地升:必须明确拒绝。
+        assert!(!can_upgrade_from("1"));
+        assert!(!can_upgrade_from("0"));
+        assert!(!can_upgrade_from("999"));
+        assert!(can_upgrade_from("2"));
     }
 
     #[test]

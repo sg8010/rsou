@@ -44,12 +44,15 @@ pub struct DocumentRow {
     pub text_length: i64,
     pub chunk_count: i64,
     pub indexed_at: Option<i64>,
+    /// 来自哪个「已添加文件夹」(规范化绝对路径);None = 单独添加的文件。
+    /// 资料库页据此把文档分到「文件夹」/「单独文件」两个页签。
+    pub source_root: Option<String>,
     pub updated_at: i64,
 }
 
 const DOCUMENT_COLS: &str = "id, path, file_name, title, ext, file_type, file_size, \
      file_mtime_ms, parse_status, parse_error_code, parse_error_message, \
-     text_length, chunk_count, indexed_at, updated_at";
+     text_length, chunk_count, indexed_at, source_root, updated_at";
 
 fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRow> {
     Ok(DocumentRow {
@@ -67,7 +70,8 @@ fn row_to_document(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRow> {
         text_length: row.get(11)?,
         chunk_count: row.get(12)?,
         indexed_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        source_root: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
@@ -83,6 +87,9 @@ pub struct FileMeta {
     pub file_type: FileType,
     pub file_size: u64,
     pub file_mtime_ms: i64,
+    /// 本次导入的「来源文件夹」(规范化绝对路径);None = 单独添加的文件。
+    /// 由导入流程注入(不是从文件本身读出来的),所以默认 None。
+    pub source_root: Option<String>,
 }
 
 impl FileMeta {
@@ -118,6 +125,7 @@ impl FileMeta {
             file_type,
             file_size: meta.len(),
             file_mtime_ms: mtime_ms,
+            source_root: None,
         }))
     }
 
@@ -158,6 +166,47 @@ pub fn find_document_by_path(
 /// 全部文档,新更新的在前。
 pub fn list_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRow>> {
     let sql = format!("SELECT {DOCUMENT_COLS} FROM documents ORDER BY updated_at DESC, id DESC");
+    let rows = conn
+        .prepare(&sql)?
+        .query_map([], row_to_document)?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 来自「添加文件夹」的文档,按来源文件夹分组(文件夹按路径排序)。
+///
+/// 资料库页用它建树:外层是文件夹,内层是该文件夹下的文档。只返回
+/// `source_root` 非空的行;单独添加的文件走 `list_documents` 那一侧。
+pub fn list_documents_by_source_root(
+    conn: &Connection,
+) -> anyhow::Result<Vec<(String, Vec<DocumentRow>)>> {
+    let sql = format!(
+        "SELECT {DOCUMENT_COLS} FROM documents WHERE source_root IS NOT NULL \
+         ORDER BY source_root ASC, file_name COLLATE NOCASE ASC"
+    );
+    let rows = conn
+        .prepare(&sql)?
+        .query_map([], |row| {
+            Ok((row_to_document(row)?, row.get::<_, String>(14)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    // 保序分组(SQL 已按 source_root 排序,同一个文件夹的行必然相邻)。
+    let mut grouped: Vec<(String, Vec<DocumentRow>)> = Vec::new();
+    for (document, root) in rows {
+        match grouped.last_mut() {
+            Some((last_root, docs)) if *last_root == root => docs.push(document),
+            _ => grouped.push((root, vec![document])),
+        }
+    }
+    Ok(grouped)
+}
+
+/// 单独添加的文件(没有来源文件夹)。
+pub fn list_standalone_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRow>> {
+    let sql = format!(
+        "SELECT {DOCUMENT_COLS} FROM documents WHERE source_root IS NULL \
+         ORDER BY updated_at DESC, id DESC"
+    );
     let rows = conn
         .prepare(&sql)?
         .query_map([], row_to_document)?
@@ -343,11 +392,14 @@ fn upsert_document(
     parser_version: &str,
     now_ms: i64,
 ) -> anyhow::Result<i64> {
+    // 注意:SQL 里不要再写 `--` 行注释——这是一个用 `\` 续行的单行字符串,
+    // 续行把换行吃掉,`--` 会把后面所有子句一起注释掉(实际踩过:报
+    // "incomplete input")。要注释就写在 Rust 这一侧。
     let id: i64 = conn.query_row(
         "INSERT INTO documents(path, canonical_path, file_name, title, ext, file_type, \
          file_size, file_mtime_ms, content_hash, parse_status, parser_name, parser_version, \
-         indexed_at, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'parsed', ?10, ?11, ?12, ?13, ?13) \
+         indexed_at, source_root, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'parsed', ?10, ?11, ?12, ?13, ?14, ?14) \
          ON CONFLICT(path) DO UPDATE SET \
            canonical_path = excluded.canonical_path, \
            file_name = excluded.file_name, \
@@ -359,6 +411,7 @@ fn upsert_document(
            content_hash = excluded.content_hash, \
            parser_name = excluded.parser_name, \
            parser_version = excluded.parser_version, \
+           source_root = excluded.source_root, \
            updated_at = excluded.updated_at \
          RETURNING id",
         params![
@@ -374,6 +427,7 @@ fn upsert_document(
             parser_name,
             parser_version,
             now_ms,
+            meta.source_root.as_deref(),
             now_ms,
         ],
         |row| row.get(0),
@@ -410,6 +464,30 @@ pub fn delete_document(conn: &mut Connection, id: i64) -> anyhow::Result<()> {
     }
     tx.commit().context("提交删除事务失败")?;
     Ok(())
+}
+
+/// 移除一个「已添加文件夹」及其**全部**归属文档(按 source_root 精确匹配)。
+/// 返回删除的文档数。
+///
+/// 只删库里的索引记录,不动磁盘上的文件——用户点「移除」表达的是「不再索引
+/// 这个文件夹」,不是「删我的文件」。文案上也必须说清这一点。
+pub fn delete_source_root(conn: &mut Connection, source_root: &str) -> anyhow::Result<usize> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("开启移除文件夹事务失败")?;
+    // FTS 先行(与 delete_document 同序),再删 documents 靠外键级联清
+    // chunks/contents。
+    tx.execute(
+        "DELETE FROM documents_fts WHERE rowid IN \
+         (SELECT id FROM documents WHERE source_root = ?1)",
+        params![source_root],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM documents WHERE source_root = ?1",
+        params![source_root],
+    )?;
+    tx.commit().context("提交移除文件夹事务失败")?;
+    Ok(deleted)
 }
 
 /// 文件已变更(mtime/size 不同)但内容哈希相同时,只更新元数据。
@@ -599,4 +677,117 @@ fn warnings_to_json(warnings: &[String]) -> String {
     }
     out.push(']');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::FileType;
+    use crate::text;
+
+    /// 造一篇文档并落库(source_root 由参数决定)。
+    fn save_doc(conn: &mut Connection, path: &str, source_root: Option<&str>) -> i64 {
+        let meta = FileMeta {
+            path: path.into(),
+            canonical_path: path.into(),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            ext: "txt".to_owned(),
+            file_type: FileType::Text,
+            file_size: 1,
+            file_mtime_ms: 1,
+            source_root: source_root.map(str::to_owned),
+        };
+        let plain = text::markdown_to_plain("合同正文");
+        let chunks = crate::chunk::chunk_document("标题", &plain);
+        let parsed = ParsedDocument {
+            title: "标题".to_owned(),
+            markdown: String::new(),
+            plain,
+            chunks,
+            warnings: Vec::new(),
+            parser_name: "t",
+            parser_version: "t",
+        };
+        save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
+    }
+
+    #[test]
+    fn source_root_groups_and_standalone_are_separated() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        save_doc(&mut conn, "/a/2.txt", Some("/a"));
+        save_doc(&mut conn, "/b/3.txt", Some("/b"));
+        save_doc(&mut conn, "/loose.txt", None);
+
+        let grouped = list_documents_by_source_root(&conn).unwrap();
+        assert_eq!(grouped.len(), 2, "应有两个来源文件夹");
+        assert_eq!(grouped[0].0, "/a");
+        assert_eq!(grouped[0].1.len(), 2);
+        assert_eq!(grouped[1].0, "/b");
+        assert_eq!(grouped[1].1.len(), 1);
+
+        let standalone = list_standalone_documents(&conn).unwrap();
+        assert_eq!(standalone.len(), 1);
+        assert_eq!(standalone[0].file_name, "loose.txt");
+        assert_eq!(standalone[0].source_root, None);
+    }
+
+    #[test]
+    fn delete_source_root_removes_only_that_folder() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        save_doc(&mut conn, "/a/2.txt", Some("/a"));
+        save_doc(&mut conn, "/b/3.txt", Some("/b"));
+        save_doc(&mut conn, "/loose.txt", None);
+
+        let removed = delete_source_root(&mut conn, "/a").unwrap();
+        assert_eq!(removed, 2);
+
+        // 只剩 /b 与单独文件。
+        assert_eq!(list_documents_by_source_root(&conn).unwrap().len(), 1);
+        assert_eq!(list_standalone_documents(&conn).unwrap().len(), 1);
+
+        // FTS 也不该留下被删文档的行(否则完整性检查会报孤儿)。
+        let report = crate::maintain::check_integrity(&conn, 100).unwrap();
+        assert!(report.is_consistent(), "{}", report.summary());
+    }
+
+    #[test]
+    fn delete_source_root_does_not_touch_similarly_named_folders() {
+        // 精确匹配:删 /a 不能把 /a-b 或 /ab 一起带走。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        save_doc(&mut conn, "/a-b/2.txt", Some("/a-b"));
+        save_doc(&mut conn, "/ab/3.txt", Some("/ab"));
+
+        assert_eq!(delete_source_root(&mut conn, "/a").unwrap(), 1);
+        let left = list_documents_by_source_root(&conn).unwrap();
+        assert_eq!(left.len(), 2, "只应删掉 /a");
+        assert!(left.iter().any(|(r, _)| r == "/a-b"));
+        assert!(left.iter().any(|(r, _)| r == "/ab"));
+    }
+
+    #[test]
+    fn delete_source_root_with_no_match_is_a_noop() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        assert_eq!(delete_source_root(&mut conn, "/nowhere").unwrap(), 0);
+        assert_eq!(list_documents_by_source_root(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reimport_updates_source_root_assignment() {
+        // 同一文件先从文件夹导入、再单独导入 → 归属应改判为「单独文件」。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        assert_eq!(list_documents_by_source_root(&conn).unwrap().len(), 1);
+
+        save_doc(&mut conn, "/a/1.txt", None);
+        assert_eq!(
+            list_documents_by_source_root(&conn).unwrap().len(),
+            0,
+            "应已改判为单独文件"
+        );
+        assert_eq!(list_standalone_documents(&conn).unwrap().len(), 1);
+    }
 }

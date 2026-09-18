@@ -173,10 +173,14 @@ impl RsouApp {
                 // 读取线程自己开只读连接;库不可用时把中文原因带回。
                 let result = store::open(&db_path, OpenMode::ReadOnly)
                     .and_then(|conn| {
-                        Ok((
-                            repo::list_documents(&conn)?,
-                            repo::list_failed_documents(&conn)?,
-                        ))
+                        Ok(DocsSnapshot {
+                            documents: repo::list_documents(&conn)?,
+                            failed: repo::list_failed_documents(&conn)?,
+                            folder_groups: repo::list_documents_by_source_root(&conn)?
+                                .into_iter()
+                                .map(|(root, documents)| FolderGroup { root, documents })
+                                .collect(),
+                        })
                     })
                     .map_err(|error| format!("{error:#}"));
                 if tx.send(DocsMsg { generation, result }).is_ok() {
@@ -197,6 +201,28 @@ impl RsouApp {
     /// 落地时按世代丢弃,再由补读拿最终状态。
     pub(crate) fn invalidate_documents_snapshot(&mut self) {
         self.docs_gen += 1;
+    }
+
+    /// 移除一个来源文件夹及其全部归属文档(确认框之后调用)。
+    pub(crate) fn delete_folder(&mut self, source_root: &str) {
+        let Some(conn) = self.db.as_mut() else {
+            return;
+        };
+        match repo::delete_source_root(conn, source_root) {
+            Ok(removed) => {
+                self.library_notice = Some(format!("已移除文件夹索引(共 {removed} 篇文档)"));
+                // 先从缓存里摘掉,避免后台读取落地前树里还显示已删项。
+                self.folder_groups.retain(|g| g.root != source_root);
+                self.documents
+                    .retain(|d| d.source_root.as_deref() != Some(source_root));
+                self.failed_documents
+                    .retain(|d| d.source_root.as_deref() != Some(source_root));
+                self.documents_version += 1;
+                self.invalidate_documents_snapshot();
+                self.request_documents_refresh();
+            }
+            Err(error) => self.library_notice = Some(format!("移除文件夹失败: {error:#}")),
+        }
     }
 
     /// 删除一篇文档并刷新缓存(用 GUI 连接做一次短写;导入中禁用由页面把关)。
@@ -467,11 +493,14 @@ impl RsouApp {
         let stale = generation != self.docs_gen;
         if !stale {
             match result {
-                Ok((documents, failed)) => {
+                Ok(snapshot) => {
                     // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
-                    let old = std::mem::replace(&mut self.documents, documents);
+                    let old = std::mem::replace(&mut self.documents, snapshot.documents);
                     drop_in_background(old);
-                    self.failed_documents = failed;
+                    let old_groups =
+                        std::mem::replace(&mut self.folder_groups, snapshot.folder_groups);
+                    drop_in_background(old_groups);
+                    self.failed_documents = snapshot.failed;
                     self.documents_version += 1;
                 }
                 Err(error) => {

@@ -500,6 +500,7 @@ mod tests {
             file_type,
             file_size: markdown.len() as u64,
             file_mtime_ms: 1_000,
+            source_root: None,
         };
         let plain = text::markdown_to_plain(markdown);
         let title = text::extract_title(&plain, &meta.stem());
@@ -546,6 +547,7 @@ mod tests {
             file_type,
             file_size: 0,
             file_mtime_ms: 1_000,
+            source_root: None,
         };
         let parsed = ParsedDocument {
             title: meta.stem(),
@@ -772,6 +774,7 @@ mod tests {
                 file_type: FileType::Word,
                 file_size: 0,
                 file_mtime_ms: 1_000,
+                source_root: None,
             };
             let plain = crate::text::markdown_to_plain(&format!("检索词正文 {tag}"));
             let chunks = chunk::chunk_document(&meta.stem(), &plain);
