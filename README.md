@@ -181,7 +181,7 @@ Linux 图形版需要 X11 和 OpenGL/EGL 运行库;不同设备的显卡驱动�
   的阅读顺序可能不理想
 - 扫描件 PDF 没有可提取文本,记为“需要 OCR”,本版本不支持 OCR
 - 内置文件对话框是单选,每次「添加文件」只能选一个(文件夹导入不受影响)
-- Windows 上表格的“更新时间”按 UTC 显示(本地时区尚未接入)
+- Windows 上表格的“更新时间”按固定 UTC+8 显示(不接系统时区检测)
 - 宽松模式内嵌约 5 MB 的 jieba 词典;不需要宽松模式时可用
   `cargo build --release --no-default-features` 去掉
 

@@ -1,8 +1,8 @@
 //! 界面小工具:本地时间格式化(不引 chrono)。
 
 /// Unix 毫秒 → `YYYY-MM-DD HH:MM`。
-/// Linux 走 libc::localtime_r(本地时区);其它平台先用 UTC 计算
-/// ——Windows 本地时区待接(需要 WinAPI GetTimeZoneInformation)。
+/// Linux 走 libc::localtime_r(本地时区);非 Linux 平台(Windows)按固定
+/// UTC+8 显示——目标用户都在国内,不接 WinAPI 时区检测。
 pub fn format_local_time(ms: i64) -> String {
     #[cfg(target_os = "linux")]
     {
@@ -10,7 +10,7 @@ pub fn format_local_time(ms: i64) -> String {
             return text;
         }
     }
-    civil_time(ms)
+    civil_time(ms + 8 * 3600 * 1000)
 }
 
 #[cfg(target_os = "linux")]
@@ -71,5 +71,17 @@ mod tests {
     fn civil_algorithm_matches_epoch() {
         assert_eq!(civil_time(0), "1970-01-01 00:00");
         assert_eq!(civil_time(1_735_689_600_000), "2025-01-01 00:00");
+    }
+
+    #[test]
+    fn utc8_offset_shifts_known_timestamp() {
+        // 非 Linux 分支:2025-01-01 00:00 UTC 应显示为 08:00。
+        let text = format_local_time(1_735_689_600_000);
+        if cfg!(target_os = "linux") {
+            // Linux 走本地时区,只校验形状。
+            assert_eq!(text.len(), 16);
+        } else {
+            assert_eq!(text, "2025-01-01 08:00");
+        }
     }
 }
