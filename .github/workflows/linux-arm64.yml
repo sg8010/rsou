@@ -45,10 +45,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test
-        run: cargo test --release -p rsou
+        run: |
+          cargo test --release -p rsou --lib
+          cargo test --release -p rsou --bin rsou
 
       - name: Build (release)
-        run: cargo build --release -p rsou
+        run: cargo build --release -p rsou --bin rsou
 
       - name: 打包 Debian 软件包
         run: |
