@@ -229,8 +229,12 @@ impl RsouApp {
 
     /// 文档列表表格(虚拟滚动;行操作收集后统一落地)。
     fn ui_documents_table(&mut self, ui: &mut egui::Ui) {
-        if self.documents.is_empty() && self.docs_loading {
-            Self::work_panel(ui, "列表", "文档列表", "", None, |ui| {
+        // 空态文案要看「整库空」还是「本页签空」——库里只有文件夹导入的文档时,
+        // 「单独文件」页是空的,但说「资料库为空」就错了。
+        let library_empty = self.documents.is_empty();
+        let standalone_empty = self.documents.iter().all(|d| d.source_root.is_some());
+        if library_empty && self.docs_loading {
+            Self::work_panel(ui, "列表", "单独文件", "", None, |ui| {
                 ui.label(
                     egui::RichText::new("正在读取文档列表…")
                         .size(15.0)
@@ -239,35 +243,33 @@ impl RsouApp {
             });
             return;
         }
-        if self.documents.is_empty()
-            && self.db.is_some()
+        if self.db.is_some()
             && !self.import_active
             && !self.docs_loading
+            && (library_empty || standalone_empty)
         {
-            Self::work_panel(ui, "列表", "文档列表", "", None, |ui| {
+            Self::work_panel(ui, "列表", "单独文件", "", None, |ui| {
                 ui.label(
-                    egui::RichText::new("资料库为空,点「添加文件」或「添加文件夹」开始导入。")
-                        .size(15.0)
-                        .color(Self::muted()),
+                    egui::RichText::new(if library_empty {
+                        "资料库为空,点「添加文件」或「添加文件夹」开始导入。"
+                    } else {
+                        "没有单独添加的文件。用「添加文件」直接加进来的文档会出现在这里。"
+                    })
+                    .size(15.0)
+                    .color(Self::muted()),
                 );
             });
             return;
         }
 
         // 过滤结果按 (过滤词, 列表换代号) 缓存,不每帧重建。
+        // 本表只服务「单独文件」页(「文件夹」页是另一棵树),所以键里不需要页签。
         let key = (
             self.doc_filter.trim().to_lowercase(),
             self.documents_version,
         );
         if self.filtered_key.as_ref() != Some(&key) {
-            let filter = &key.0;
-            self.filtered_docs = self
-                .documents
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| filter.is_empty() || d.file_name.to_lowercase().contains(filter))
-                .map(|(i, _)| i)
-                .collect();
+            self.filtered_docs = standalone_document_indices(&self.documents, &key.0);
             self.filtered_key = Some(key);
         }
         let documents = &self.documents;
@@ -278,7 +280,7 @@ impl RsouApp {
         Self::work_panel(
             ui,
             "列表",
-            "文档列表",
+            "单独文件",
             &format!("{} 篇", filtered.len()),
             None,
             |ui| {
@@ -975,6 +977,77 @@ mod tests {
             "",
             3,
         );
+    }
+
+    /// 造一行文档(只需 source_root 与文件名对这两个页签的选择有意义)。
+    fn row(id: i64, name: &str, source_root: Option<&str>) -> DocumentRow {
+        DocumentRow {
+            id,
+            path: format!("/{name}"),
+            file_name: name.to_owned(),
+            title: String::new(),
+            ext: "txt".to_owned(),
+            file_type: "text".to_owned(),
+            file_size: 1,
+            file_mtime_ms: 0,
+            parse_status: "parsed".to_owned(),
+            parse_error_code: None,
+            parse_error_message: None,
+            text_length: 1,
+            chunk_count: 1,
+            indexed_at: Some(0),
+            source_root: source_root.map(str::to_owned),
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn files_tab_lists_only_standalone_documents() {
+        // 回归测试:曾经「单独文件」页的数目对、但列表把文件夹的子文件也列了
+        // 出来(过滤时漏了 source_root 这一维)。
+        let docs = vec![
+            row(1, "文件夹里的.txt", Some("/a")),
+            row(2, "单独加的.txt", None),
+            row(3, "另一个文件夹里的.txt", Some("/b")),
+        ];
+
+        let files = standalone_document_indices(&docs, "");
+        assert_eq!(files, vec![1], "只应列出 source_root 为空的文档");
+        let names: Vec<&str> = files.iter().map(|i| docs[*i].file_name.as_str()).collect();
+        assert_eq!(names, ["单独加的.txt"]);
+
+        // 「文件夹」页不走这个函数(它是树,数据来自 folder_groups),所以
+        // 这里不测它——避免把「两个页签共用一条规则」的错觉固化进测试。
+    }
+
+    #[test]
+    fn files_tab_stays_correct_under_filter() {
+        let docs = vec![
+            row(1, "合同甲.txt", Some("/a")),
+            row(2, "合同乙.txt", None),
+            row(3, "合同丙.txt", None),
+            row(4, "无关.txt", None),
+        ];
+        // 过滤词与页签两个条件必须**同时**生效(与,不是或)。
+        let files = standalone_document_indices(&docs, "合同");
+        let names: Vec<&str> = files.iter().map(|i| docs[*i].file_name.as_str()).collect();
+        assert_eq!(names, ["合同乙.txt", "合同丙.txt"]);
+    }
+
+    #[test]
+    fn files_tab_is_empty_when_library_only_has_folders() {
+        let docs = vec![row(1, "a.txt", Some("/a")), row(2, "b.txt", Some("/a"))];
+        assert!(standalone_document_indices(&docs, "").is_empty());
+        assert_eq!(docs.iter().filter(|d| d.source_root.is_some()).count(), 2);
+    }
+
+    #[test]
+    fn visible_indices_are_not_affected_by_row_order() {
+        // 下标必须指回原数组,不是「筛完之后的顺序」。
+        let docs = vec![row(1, "x.txt", Some("/a")), row(2, "y.txt", None)];
+        let files = standalone_document_indices(&docs, "");
+        assert_eq!(files, vec![1]);
+        assert_eq!(docs[files[0]].file_name, "y.txt");
     }
 
     #[test]

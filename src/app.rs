@@ -120,6 +120,24 @@ pub(crate) enum LibraryNode {
     Document(i64),
 }
 
+/// 「单独文件」页该展示哪些文档——返回在 `documents` 里的下标。
+///
+/// 抽成纯函数是因为这条规则很容易写漏:`documents` 里同时含文件夹带来的文档,
+/// 本页必须**只**保留 `source_root` 为空的。漏掉这一条的表现是「数目对、
+/// 但列表把文件夹的子文件也列了出来」——数目由另一处算出,列表却来自这里,
+/// 所以表面上不容易发现。
+///
+/// 注意这个函数不管「文件夹」页:那一页是树,数据来自 `folder_groups`
+/// (已按 source_root 分组),不走下标过滤。
+pub(crate) fn standalone_document_indices(documents: &[DocumentRow], filter: &str) -> Vec<usize> {
+    documents
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.source_root.is_none() && file_name_matches(&d.file_name, filter))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// 文档文件名是否命中过滤词(空词 = 全部命中)。
 ///
 /// 抽成函数是为了让「文件夹页按匹配数隐藏空文件夹」与「单独文件页过滤」
