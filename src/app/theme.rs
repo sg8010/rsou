@@ -251,6 +251,65 @@ impl RsouApp {
         Self::card_frame(Self::surface(), Self::line(), 16).show(ui, add_contents);
     }
 
+    /// 带页签的工作面板:头行 + 页签栏 + 内容,**整体一张卡片**。
+    ///
+    /// 与 `work_panel` 的差别只在页签区。若把页签栏塞进 `work_panel` 的内容区,
+    /// 那层 18px 内边距会同时出现在页签上下,页签与内容之间就空出近四十像素——
+    /// 看着不像页签,倒像两块无关的卡片。这里页签栏用紧内边距(上 8 / 左右 18 /
+    /// 下 0),紧接一条全宽分隔线当“下划线”,再接内容区。
+    pub(crate) fn tabbed_work_panel(
+        ui: &mut egui::Ui,
+        index: &str,
+        title: &str,
+        hint: &str,
+        status: Option<&str>,
+        tab_bar: impl FnOnce(&mut egui::Ui),
+        add_contents: impl FnOnce(&mut egui::Ui),
+    ) {
+        Self::panel_frame().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(index)
+                        .size(13.0)
+                        .strong()
+                        .color(Self::blue()),
+                );
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(17.0)
+                        .strong()
+                        .color(Self::ink()),
+                );
+                ui.label(egui::RichText::new(hint).size(13.0).color(Self::muted()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(status) = status {
+                        Self::status_badge(ui, status);
+                    }
+                });
+            });
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: 18,
+                    right: 18,
+                    top: 8,
+                    bottom: 0,
+                })
+                .show(ui, tab_bar);
+            // 全宽分隔线:页签栏与内容之间的“下划线”。panel_frame 自身无内边距,
+            // 所以这里能真的顶到卡片两侧。
+            ui.separator();
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: 18,
+                    right: 18,
+                    top: 4,
+                    bottom: 18,
+                })
+                .show(ui, add_contents);
+        });
+    }
+
     /// 配置 egui 视觉样式:浅色工作区 + 深色流程侧栏。
     pub(crate) fn configure_ui_style(ctx: &egui::Context) {
         let mut visuals = egui::Visuals::light();
