@@ -2758,14 +2758,19 @@ dependencies = [
 name = "rsou"
 version = "0.1.0"
 dependencies = [
+ "anydoc",
  "anyhow",
  "eframe",
  "egui_extras",
+ "encoding_rs",
  "libc",
  "log",
+ "rayon",
  "rfd",
  "rusqlite",
  "rusqlite-ext",
+ "sha2",
+ "zip",
 ]
 
 [[package]]

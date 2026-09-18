@@ -1,0 +1,470 @@
+//! 导入流水线:扫描 → 并行解析 → 串行写库(无 GUI 依赖)。
+//!
+//! 线程模型(见 docs/plan.md §7.3):
+//! - `run_import` 在调用线程执行(GUI 把它放进 `std::thread`),自己开写连接;
+//! - 文件读取、解析、文本化、分块、哈希在 rayon 线程池并行;
+//! - 所有写库操作串行发生在调用线程,经 mpsc 通道消费 worker 结果。
+//!
+//! 取消:worker 在每个文件开工前检查 cancel 标志;单文件解析不可中断
+//! (anydoc 没有取消接口),置位后已开始的文件会跑完,未开始的直接不开工。
+
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+
+use anyhow::Context;
+use rayon::prelude::*;
+use sha2::Digest;
+
+use crate::chunk;
+use crate::parse::{self, ParseError};
+use crate::repo::{self, FileMeta, ParsedDocument};
+use crate::text;
+
+pub use crate::repo::ImportCounts;
+
+/// 导入参数。
+#[derive(Debug, Clone)]
+pub struct ImportOptions {
+    /// 单文件字节上限(默认 100 MiB)
+    pub max_file_bytes: u64,
+    /// true = 忽略 hash/mtime 跳过,全部重解析
+    pub force: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 100 * 1024 * 1024,
+            force: false,
+        }
+    }
+}
+
+/// 导入进度事件(写库线程逐条发给调用方)。
+pub enum ImportEvent {
+    /// 扫描完成,确定了文件总数
+    Scanned { total: usize },
+    /// 一个文件处理完毕
+    FileDone {
+        path: PathBuf,
+        outcome: FileOutcome,
+        counts: ImportCounts,
+    },
+    /// 全部结束(正常完成或被取消)
+    Finished {
+        run_id: i64,
+        counts: ImportCounts,
+        cancelled: bool,
+    },
+}
+
+/// 单文件处理结果。
+pub enum FileOutcome {
+    Ok { document_id: i64 },
+    Failed { code: String, message: String },
+    Skipped,
+}
+
+/// 递归展开输入路径为待处理文件清单。
+///
+/// - 文件直接收(扩展名不支持的丢弃,不计数);
+/// - 目录递归:跳过 `.` 开头的条目、`node_modules`、`$RECYCLE.BIN`、
+///   `System Volume Information`,不跟随符号链接;
+/// - 只收 `file_type_of` 支持的文件;按规范化路径去重、排序。
+pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    const SKIP_DIRS: &[&str] = &["node_modules", "$RECYCLE.BIN", "System Volume Information"];
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<PathBuf> = inputs.to_vec();
+
+    while let Some(path) = stack.pop() {
+        // symlink_metadata 不跟随符号链接:链向目录的 symlink 不被递归。
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.starts_with('.') || SKIP_DIRS.contains(&name));
+            if skip {
+                continue;
+            }
+            if let Ok(read) = std::fs::read_dir(&path) {
+                for entry in read.flatten() {
+                    let name = entry.file_name();
+                    if name.to_string_lossy().starts_with('.') {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                }
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        if parse::file_type_of(&path).is_none() {
+            continue;
+        }
+        // 规范化用于去重与入库;失败时退回绝对路径。
+        let normalized = std::fs::canonicalize(&path).unwrap_or_else(|_| absolute(&path));
+        if seen.insert(normalized.clone()) {
+            files.push(normalized);
+        }
+    }
+    files.sort();
+    files
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+/// 库里已有文档的跳过判定信息。
+struct Existing {
+    id: i64,
+    file_size: i64,
+    file_mtime_ms: i64,
+    content_hash: String,
+    parsed: bool,
+}
+
+/// worker 产出的单文件结果(内部消息;公开事件是 FileOutcome)。
+enum FileResult {
+    /// 按 mtime/size 或 hash 判定未变更;touch = 需要回写新的 size/mtime
+    Skipped {
+        meta: FileMeta,
+        document_id: i64,
+        touch: bool,
+    },
+    Done {
+        meta: FileMeta,
+        hash: String,
+        result: Result<ParsedDocument, ParseError>,
+    },
+}
+
+/// 执行一次导入。在调用线程同步运行;事件经 `on_event` 逐条回调。
+pub fn run_import(
+    db_path: &Path,
+    inputs: Vec<PathBuf>,
+    options: ImportOptions,
+    cancel: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(ImportEvent),
+) -> anyhow::Result<ImportCounts> {
+    let mut conn = crate::store::open(db_path, crate::store::OpenMode::ReadWrite)
+        .context("导入前打开索引库失败")?;
+
+    let files = scan_paths(&inputs);
+    on_event(ImportEvent::Scanned { total: files.len() });
+
+    let now = repo::now_ms();
+    let (kind, root) = classify_inputs(&inputs);
+    let run_id = repo::create_run(&conn, kind, root.as_deref(), files.len(), now)?;
+    // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
+    seed_items(&mut conn, run_id, &files, now)?;
+
+    // 跳过判定用的一次性快照(读已有记录,不逐个查库)。
+    let existing = load_existing(&conn)?;
+
+    let mut counts = ImportCounts {
+        total: files.len(),
+        ..ImportCounts::default()
+    };
+    let mut first_error: Option<anyhow::Error> = None;
+
+    let (tx, rx) = mpsc::channel::<FileResult>();
+    let options_ref = &options;
+    let cancel_ref = &cancel;
+    let existing_ref = &existing;
+    // 生产者线程跑 rayon 并行解析,消费(写库)留在调用线程:
+    // Receiver/回调/连接都不需要跨线程。
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            files.par_iter().for_each(|path| {
+                if cancel_ref.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = process_file(path, options_ref, existing_ref);
+                if tx.send(result).is_err() {
+                    // 消费者已退出(写库出错),直接收工。
+                    cancel_ref.store(true, Ordering::Relaxed);
+                }
+            });
+        });
+
+        // 调用线程做消费者:写库串行。
+        while let Ok(msg) = rx.recv() {
+            if first_error.is_some() {
+                continue;
+            }
+            let outcome = consume(&mut conn, run_id, msg, &mut counts);
+            match outcome {
+                Ok((path, outcome)) => {
+                    on_event(ImportEvent::FileDone {
+                        path,
+                        outcome,
+                        counts,
+                    });
+                }
+                Err(error) => {
+                    // 记首个写库错误,置 cancel 让 worker 收工,排空通道后统一返回。
+                    first_error = Some(error);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    let cancelled = cancel.load(Ordering::Relaxed) && first_error.is_none();
+    let now = repo::now_ms();
+    let (status, message) = if let Some(error) = &first_error {
+        ("failed", Some(format!("{error:#}")))
+    } else if cancelled {
+        ("cancelled", None)
+    } else {
+        ("done", None)
+    };
+    if let Err(error) = repo::finish_run(&conn, run_id, status, &counts, message.as_deref(), now) {
+        log::warn!("写入导入结束状态失败: {error:#}");
+    }
+    on_event(ImportEvent::Finished {
+        run_id,
+        counts,
+        cancelled,
+    });
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(counts),
+    }
+}
+
+fn classify_inputs(inputs: &[PathBuf]) -> (&'static str, Option<PathBuf>) {
+    if inputs.len() == 1 && inputs[0].is_dir() {
+        ("folder", Some(inputs[0].clone()))
+    } else {
+        ("files", None)
+    }
+}
+
+fn seed_items(
+    conn: &mut rusqlite::Connection,
+    run_id: i64,
+    files: &[PathBuf],
+    now: i64,
+) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+    for path in files {
+        repo::upsert_item(&tx, run_id, path, "pending", None, None, None, now)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 一次读出 `canonical_path → 已有记录` 的映射(worker 的跳过判定用)。
+fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, Existing>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status \
+         FROM documents",
+    )?;
+    let map = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                Existing {
+                    id: row.get(0)?,
+                    file_size: row.get(2)?,
+                    file_mtime_ms: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    parsed: row.get::<_, String>(5)? == "parsed",
+                },
+            ))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    Ok(map)
+}
+
+/// worker:读文件 → 算 hash → 解析 → 文本化 → 分块。
+/// 单文件解析不可中断(anydoc 无取消接口),只在文件之间检查 cancel。
+fn process_file(
+    path: &Path,
+    options: &ImportOptions,
+    existing: &HashMap<String, Existing>,
+) -> FileResult {
+    let meta = match FileMeta::of(path) {
+        Ok(Some(meta)) => meta,
+        Ok(None) => {
+            // 扫描与处理之间文件被改名/替换导致扩展名不再受支持。
+            return FileResult::Done {
+                meta: dummy_meta(path),
+                hash: String::new(),
+                result: Err(ParseError {
+                    code: parse::ParseErrorCode::Unsupported,
+                    message: "无法识别的格式,或该格式无法转换(例如纯图片 PDF)".to_owned(),
+                    detail: format!("扩展名不支持: {}", path.display()),
+                }),
+            };
+        }
+        Err(error) => {
+            return FileResult::Done {
+                meta: dummy_meta(path),
+                hash: String::new(),
+                result: Err(ParseError {
+                    code: parse::ParseErrorCode::Io,
+                    message: "无法读取文件(权限/占用/路径失效)".to_owned(),
+                    detail: format!("{error:#}"),
+                }),
+            };
+        }
+    };
+
+    let key = meta.canonical_path.to_string_lossy().into_owned();
+    let prior = existing.get(&key);
+    // 一级跳过:size 与 mtime 都未变,不读文件。
+    if !options.force
+        && let Some(prior) = prior
+        && prior.parsed
+        && prior.file_size == meta.file_size as i64
+        && prior.file_mtime_ms == meta.file_mtime_ms
+    {
+        return FileResult::Skipped {
+            meta,
+            document_id: prior.id,
+            touch: false,
+        };
+    }
+
+    let (parsed, bytes) = match parse::parse_file(path, options.max_file_bytes) {
+        Ok(pair) => pair,
+        Err(error) => {
+            return FileResult::Done {
+                meta,
+                hash: String::new(),
+                result: Err(error),
+            };
+        }
+    };
+    let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+
+    // 二级跳过:元数据变了但内容哈希相同 → 只更新 size/mtime。
+    if !options.force
+        && let Some(prior) = prior
+        && prior.parsed
+        && prior.content_hash == hash
+    {
+        return FileResult::Skipped {
+            meta,
+            document_id: prior.id,
+            touch: true,
+        };
+    }
+
+    let result = build_document(&meta, parsed);
+    FileResult::Done { meta, hash, result }
+}
+
+/// 元数据读取失败时的占位 FileMeta(只为把错误带回写库线程记 item)。
+fn dummy_meta(path: &Path) -> FileMeta {
+    FileMeta {
+        path: path.to_path_buf(),
+        canonical_path: path.to_path_buf(),
+        file_name: path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        ext: String::new(),
+        file_type: parse::FileType::Text,
+        file_size: 0,
+        file_mtime_ms: 0,
+    }
+}
+
+/// 解析产物 → ParsedDocument(markdown → plain → 标题 → 分块)。
+fn build_document(meta: &FileMeta, parsed: parse::Parsed) -> Result<ParsedDocument, ParseError> {
+    let plain = text::markdown_to_plain(&parsed.markdown);
+    let title = text::extract_title(&plain, &meta.stem());
+    let chunks = chunk::chunk_document(&title, &plain);
+    Ok(ParsedDocument {
+        title,
+        markdown: parsed.markdown,
+        plain,
+        chunks,
+        warnings: parsed.warnings,
+        parser_name: parsed.parser_name,
+        parser_version: parsed.parser_version,
+    })
+}
+
+/// 写库线程:把一条 worker 结果落库,转成对外事件。
+fn consume(
+    conn: &mut rusqlite::Connection,
+    run_id: i64,
+    msg: FileResult,
+    counts: &mut ImportCounts,
+) -> anyhow::Result<(PathBuf, FileOutcome)> {
+    let now = repo::now_ms();
+    let (path, outcome) = match msg {
+        FileResult::Skipped {
+            meta,
+            document_id,
+            touch,
+        } => {
+            if touch {
+                repo::touch_unchanged(conn, document_id, meta.file_size, meta.file_mtime_ms)?;
+            }
+            repo::upsert_item(
+                conn,
+                run_id,
+                &meta.path,
+                "skipped",
+                None,
+                None,
+                Some(document_id),
+                now,
+            )?;
+            counts.skipped += 1;
+            (meta.path.clone(), FileOutcome::Skipped)
+        }
+        FileResult::Done { meta, hash, result } => match result {
+            Ok(parsed) => {
+                let id = repo::save_parsed(conn, &meta, &hash, &parsed, now)?;
+                repo::upsert_item(conn, run_id, &meta.path, "ok", None, None, Some(id), now)?;
+                counts.ok += 1;
+                (meta.path.clone(), FileOutcome::Ok { document_id: id })
+            }
+            Err(error) => {
+                let id = repo::save_failed(conn, &meta, &hash, &error, now)?;
+                repo::upsert_item(
+                    conn,
+                    run_id,
+                    &meta.path,
+                    "failed",
+                    Some(error.code.as_str()),
+                    Some(&error.to_string()),
+                    Some(id),
+                    now,
+                )?;
+                counts.failed += 1;
+                (
+                    meta.path.clone(),
+                    FileOutcome::Failed {
+                        code: error.code.as_str().to_owned(),
+                        message: error.to_string(),
+                    },
+                )
+            }
+        },
+    };
+    counts.processed += 1;
+    Ok((path, outcome))
+}

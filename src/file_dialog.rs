@@ -54,11 +54,12 @@ mod palette {
     }
 }
 
-/// 对话框用途:选择文件(打开)/ 指定保存路径(保存)
+/// 对话框用途:选择文件(打开)/ 指定保存路径(保存)/ 选择文件夹
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Purpose {
     Open,
     Save,
+    PickFolder,
 }
 
 /// 文件类型过滤器(后缀为空 = 不过滤,即「所有文件」)
@@ -79,16 +80,12 @@ impl Filter {
 }
 
 /// 读取用过滤器:全部支持的文档格式 + 所有文件。
-/// 扩展名清单与 docs/plan.md §2 的能力边界保持一致(anydoc 全格式 + txt/md)。
+/// 扩展名清单取自 parse::supported_extensions(与导入扫描共用一份)。
 pub fn document_filters() -> Vec<Filter> {
     vec![
         Filter::new(
             "文档(全部支持格式)",
-            &[
-                "doc", "docx", "docm", "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm", "xls",
-                "xlsx", "xlsm", "xlsb", "odt", "ods", "odp", "rtf", "epub", "csv", "pdf", "txt",
-                "md",
-            ],
+            rsou_lib::parse::supported_extensions(),
         ),
         Filter::new("所有文件", &[]),
     ]
@@ -149,6 +146,19 @@ impl FileDialog {
     /// 选择文件。dir 为上次停留的目录(无效时退回主目录)
     pub fn open(title: &str, hint: &str, dir: Option<PathBuf>, filters: Vec<Filter>) -> Self {
         Self::new(Purpose::Open, title, hint, dir, String::new(), filters)
+    }
+
+    /// 选择文件夹(导入文件夹用):列表只显示目录,确认键选中当前/选中的目录。
+    /// 已知的简化:与文件选择一样只支持单选,多选文件夹暂不实现。
+    pub fn pick_folder(title: &str, hint: &str, dir: Option<PathBuf>) -> Self {
+        Self::new(
+            Purpose::PickFolder,
+            title,
+            hint,
+            dir,
+            String::new(),
+            vec![Filter::new("文件夹", &[])],
+        )
     }
 
     /// 保存文件。default_name 为文件名输入框的初值
@@ -301,6 +311,10 @@ impl FileDialog {
             self.file_name = name.to_owned();
             return DialogAction::None;
         }
+        if self.purpose == Purpose::PickFolder {
+            self.error = Some("请选择一个文件夹".to_owned());
+            return DialogAction::None;
+        }
         self.error = Some(format!("路径不存在: {}", path.display()));
         DialogAction::None
     }
@@ -312,6 +326,9 @@ impl FileDialog {
         self.error = None;
         match self.purpose {
             Purpose::Open => DialogAction::Picked(path),
+            // 文件夹选择模式不选文件(列表也不显示文件);走到这里说明用户
+            // 在路径框里输入了文件路径,只记住它,不确认。
+            Purpose::PickFolder => DialogAction::None,
             Purpose::Save => {
                 if let Some(parent) = path.parent()
                     && parent != self.dir
@@ -326,10 +343,18 @@ impl FileDialog {
         }
     }
 
-    /// 「打开 / 保存」按钮
+    /// 「打开 / 保存 / 选择此文件夹」按钮
     fn confirm(&mut self) -> DialogAction {
         if self.purpose == Purpose::Save {
             return self.confirm_save();
+        }
+        // 文件夹模式:选中了目录就选它,否则选当前所在目录。
+        if self.purpose == Purpose::PickFolder {
+            let target = match self.selected_entry() {
+                Some((path, true)) => path,
+                _ => self.dir.clone(),
+            };
+            return DialogAction::Picked(target);
         }
         match self.selected_entry() {
             Some((path, true)) => {
@@ -404,6 +429,10 @@ impl FileDialog {
             rows.push(PARENT_ROW);
         }
         rows.extend(filebrowser::filter_indices(&self.entries, &opts));
+        // 文件夹选择模式只显示目录(文件对选择没有意义)。
+        if self.purpose == Purpose::PickFolder {
+            rows.retain(|&i| i == PARENT_ROW || self.entries[i].is_dir);
+        }
         rows
     }
 
@@ -725,18 +754,30 @@ impl FileDialog {
         ui.add_space(6.0);
 
         ui.horizontal(|ui| {
-            let tip = match self.selected_entry() {
-                Some((path, false)) => format!(
-                    "已选择:{}",
-                    path.file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                ),
-                Some((_, true)) => "已选择文件夹,点「打开」进入".to_owned(),
-                None => {
-                    // 只统计目录项(「上一级」不算一项);有筛选时显示的是可见数量
-                    let shown = visible.iter().filter(|&&i| i != PARENT_ROW).count();
-                    format!("共 {shown} 个项目")
+            let tip = if self.purpose == Purpose::PickFolder {
+                match self.selected_entry() {
+                    Some((path, true)) => format!(
+                        "已选择:{}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                    _ => format!("将导入当前文件夹:{}", self.dir.display()),
+                }
+            } else {
+                match self.selected_entry() {
+                    Some((path, false)) => format!(
+                        "已选择:{}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default()
+                    ),
+                    Some((_, true)) => "已选择文件夹,点「打开」进入".to_owned(),
+                    None => {
+                        // 只统计目录项(「上一级」不算一项);有筛选时显示的是可见数量
+                        let shown = visible.iter().filter(|&&i| i != PARENT_ROW).count();
+                        format!("共 {shown} 个项目")
+                    }
                 }
             };
             ui.label(egui::RichText::new(tip).size(12.0).color(palette::soft()));
@@ -744,9 +785,10 @@ impl FileDialog {
                 let label = match (self.purpose, self.overwrite.is_some()) {
                     (Purpose::Save, true) => "覆盖保存",
                     (Purpose::Save, false) => "保存",
+                    (Purpose::PickFolder, _) => "选择此文件夹",
                     (Purpose::Open, _) => "打开",
                 };
-                let enabled = self.purpose == Purpose::Save || self.selected.is_some();
+                let enabled = self.purpose != Purpose::Open || self.selected.is_some();
                 let width = 96.0;
                 if primary_button(ui, label, width, enabled).clicked() {
                     confirm = true;
@@ -865,6 +907,10 @@ mod tests {
         );
         save.overwrite = Some(save.dir().join("检索结果.md"));
         render(&mut save, 3);
+
+        // 文件夹选择模式:只列目录,确认键可用
+        let mut folder = FileDialog::pick_folder("选择文件夹", "添加文件夹", None);
+        render(&mut folder, 3);
 
         // 空列表(筛选词匹配不到任何名字)
         let mut filtered = FileDialog::open("选择文档", "添加文件", None, document_filters());

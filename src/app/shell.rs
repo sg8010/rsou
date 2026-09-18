@@ -171,11 +171,12 @@ impl RsouApp {
                             .size(13.0)
                             .color(Self::amber()),
                     );
-                } else if let Some(count) = self.doc_count {
-                    Self::status_badge(ui, &format!("{count} 篇文档"));
-                }
-                if self.has_inflight() {
-                    Self::status_badge(ui, "任务进行中");
+                } else if self.import_active {
+                    // 导入中显示进度徽标
+                    let c = &self.import_progress.counts;
+                    Self::status_badge(ui, &format!("导入中 {}/{}", c.processed, c.total));
+                } else {
+                    Self::status_badge(ui, &format!("文档 {} 篇", self.documents.len()));
                 }
             });
         });

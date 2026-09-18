@@ -9,15 +9,22 @@
 mod page_library;
 mod page_search;
 mod page_settings;
+mod platform;
 mod shell;
 mod theme;
+mod util;
 mod workers;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
+use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
+use rsou_lib::import::ImportEvent;
+use rsou_lib::repo::{DocumentRow, ImportCounts};
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
 
@@ -71,6 +78,19 @@ impl Page {
 pub(crate) enum DialogRequest {
     /// 为资料库选择要导入的文档
     ImportFiles,
+    /// 为资料库选择一个文件夹,递归导入
+    ImportFolder,
+}
+
+/// 导入进度(界面展示用)。
+#[derive(Default)]
+pub(crate) struct ImportProgress {
+    pub counts: ImportCounts,
+    /// 最近处理完的文件
+    pub current_path: Option<PathBuf>,
+    /// 最近的失败(文件名 + 中文原因),最多留 20 条
+    pub recent_failures: VecDeque<(String, String)>,
+    pub cancelled: bool,
 }
 
 /// 正在显示的内置对话框(Linux)
@@ -83,7 +103,8 @@ pub(crate) struct ActiveDialog {
 pub struct RsouApp {
     /// 当前页面:主工作区一次只展示一个页面。
     page: Page,
-    /// 写连接(导入线程以后独占;GUI 只做建库与统计查询)。
+    /// 界面连接:启动时 ReadWrite 打开(保证空库能建表),之后承担读查询
+    /// 与零散小写(移除文档);导入写库走导入线程自己的连接,不共享这条。
     /// None = 打开失败,原因在 `db_error`。
     db: Option<Connection>,
     /// 索引库打开/建表失败的中文原因(不 panic,直接显示在页面上)
@@ -94,9 +115,27 @@ pub struct RsouApp {
     startup_log_path: Option<PathBuf>,
     /// 资料库页的操作提示(文件已选中等)
     library_notice: Option<String>,
-    /// 文档总数缓存(顶栏徽标;每帧刷新一次,空库代价可忽略)
-    doc_count: Option<i64>,
-    /// 是否有导入任务在后台进行(阶段 2 接入;侧栏状态点的语义就是「有在途任务」)
+    /// 文档列表缓存(资料库页表格;不每帧查库,按事件刷新)
+    documents: Vec<DocumentRow>,
+    /// 解析失败的文档(失败清单抽屉;与 documents 同一次刷新)
+    failed_documents: Vec<DocumentRow>,
+    /// 文件名过滤(内存过滤缓存列表)
+    doc_filter: String,
+    /// 「显示失败清单」抽屉开关
+    show_failures: bool,
+    /// 上一个页面(进资料库页时刷新文档列表用)
+    prev_page: Page,
+    /// 导入进度(进度卡与顶栏徽标)
+    import_progress: ImportProgress,
+    /// 导入线程事件通道(世代号随通道存,防上一轮残留接收端被误用)
+    import_rx: Option<(u64, Receiver<ImportEvent>)>,
+    /// 导入取消标志(GUI 置位,worker 在文件粒度上停)
+    import_cancel: Option<Arc<AtomicBool>>,
+    /// 导入世代号
+    import_gen: u64,
+    /// 还在运行的后台线程(join 在 Drop 时做)
+    workers: Vec<JoinHandle<()>>,
+    /// 是否有导入任务在后台进行(侧栏状态点的语义就是「有在途任务」)
     import_active: bool,
     /// 是否有检索任务在后台进行(阶段 3 接入)
     search_active: bool,
@@ -125,7 +164,16 @@ impl RsouApp {
             dirs: store::data_dirs(),
             startup_log_path: None,
             library_notice: None,
-            doc_count: None,
+            documents: Vec::new(),
+            failed_documents: Vec::new(),
+            doc_filter: String::new(),
+            show_failures: false,
+            prev_page: Page::Library,
+            import_progress: ImportProgress::default(),
+            import_rx: None,
+            import_cancel: None,
+            import_gen: 0,
+            workers: Vec::new(),
             import_active: false,
             search_active: false,
             maintenance_active: false,
@@ -151,6 +199,18 @@ impl RsouApp {
     /// 是否有任何在途后台任务(决定是否主动请求重绘)。
     fn has_inflight(&self) -> bool {
         self.import_active || self.search_active || self.maintenance_active
+    }
+}
+
+impl Drop for RsouApp {
+    fn drop(&mut self) {
+        // 有在途导入时先置取消再 join:关窗不等 worker 跑完长任务
+        if let Some(cancel) = &self.import_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -189,6 +249,11 @@ impl eframe::App for RsouApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_min_width(ui.available_width());
+                        // 进入资料库页时刷新文档列表缓存(不每帧查库)
+                        if self.page == Page::Library && self.prev_page != Page::Library {
+                            self.refresh_documents();
+                        }
+                        self.prev_page = self.page;
                         self.ui_workspace(ui);
                     });
             });
@@ -230,8 +295,7 @@ impl eframe::App for RsouApp {
 /// 引用进了线程,析构才真的发生在后台。线程创建失败时闭包在调用线程上析构,
 /// 等价于原地 drop。
 ///
-/// 阶段 2/3 的后台任务消息与大型结果清理都经它释放;本阶段暂无调用点。
-#[allow(dead_code)]
+/// 文档列表缓存换代时的旧列表经它释放。
 fn drop_in_background<T: Send + 'static>(value: T) {
     if let Err(error) = std::thread::Builder::new()
         .name("rsou-drop".to_owned())

@@ -77,8 +77,20 @@ egui_extras = "0.36"
 rusqlite = { version = "0.39", default-features = false, features = ["bundled"] }
 # FTS5 tokenizer 注册胶水(经 [patch] 指向 vendor/rusqlite-ext)。
 rusqlite-ext = "0.39"
+# 文档解析:wsou 的 @firecrawl/anydoc N-API 绑定背后就是这个 crate;纯 Rust。
+anydoc = "=0.2.4"
+# txt/md 自读时的 GB18030 回退解码(已在 anydoc 依赖树中)。
+encoding_rs = "0.8"
+# 导入去重的内容哈希。
+sha2 = "0.10"
+# 解析阶段的并行(写库仍在调用线程串行;已在 pdf-inspector 依赖树中)。
+rayon = "1"
 anyhow = "1"
 log = "0.4"
+
+[dev-dependencies]
+# 测试 fixture 用的最小 docx/pptx/xlsx/odt/epub 包都是手写的 zip。
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 # 信号处理器要直接用 write(2) 往日志 fd 里写"崩溃前最后一口气",只能用 libc。
 # 该 crate 本来就在依赖树里(winit/glutin 间接引入),不产生额外下载。
