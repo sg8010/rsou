@@ -24,7 +24,9 @@ use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
 use rsou_lib::import::ImportEvent;
+use rsou_lib::query::Scope;
 use rsou_lib::repo::{DocumentRow, ImportCounts};
+use rsou_lib::search::SearchResponse;
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
 
@@ -93,6 +95,19 @@ pub(crate) struct ImportProgress {
     pub cancelled: bool,
 }
 
+/// 检索 worker 回传的消息(带世代号,过期结果丢弃)。
+pub(crate) struct SearchMsg {
+    pub generation: u64,
+    pub result: Result<SearchResponse, String>,
+}
+
+/// 预览文本 worker 回传的消息。
+pub(crate) struct PreviewMsg {
+    pub generation: u64,
+    pub document_id: i64,
+    pub text: Option<String>,
+}
+
 /// 正在显示的内置对话框(Linux)
 #[cfg(target_os = "linux")]
 pub(crate) struct ActiveDialog {
@@ -137,8 +152,38 @@ pub struct RsouApp {
     workers: Vec<JoinHandle<()>>,
     /// 是否有导入任务在后台进行(侧栏状态点的语义就是「有在途任务」)
     import_active: bool,
-    /// 是否有检索任务在后台进行(阶段 3 接入)
+    /// 是否有检索任务在后台进行
     search_active: bool,
+    /// 检索输入框内容
+    search_query: String,
+    /// 检索范围(全部/标题/正文)
+    search_scope: Scope,
+    /// 精确模式开关(默认开;关 = jieba 宽松;feature 关闭时恒为精确)
+    search_exact: bool,
+    /// 文件类型过滤(file_type 取值集合;空 = 不限)
+    search_types: std::collections::BTreeSet<String>,
+    /// 目录前缀过滤(规范化路径前缀)
+    search_path_prefix: String,
+    /// 最近一次检索结果(新结果回来前保留展示)
+    search_result: Option<SearchResponse>,
+    /// 检索/语法错误文案(状态行显示,不弹窗)
+    search_error: Option<String>,
+    /// 检索结果通道(世代号随通道存)
+    search_rx: Option<(u64, Receiver<SearchMsg>)>,
+    /// 检索世代号
+    search_gen: u64,
+    /// 预览面板的文档 id
+    preview_doc_id: Option<i64>,
+    /// 预览文本(plain_text;大文档渲染时按命中窗口截断)
+    preview_text: Option<String>,
+    /// 预览文本通道
+    preview_rx: Option<(u64, Receiver<PreviewMsg>)>,
+    /// 预览世代号
+    preview_gen: u64,
+    /// 预览正在加载中
+    preview_loading: bool,
+    /// 点片段后待滚动的 plain_text 字节偏移(渲染一次后清除)
+    pending_scroll: Option<usize>,
     /// 是否有索引维护任务在后台进行(阶段 4 接入)
     maintenance_active: bool,
     /// 已点击待处理的对话框请求(帧末统一处理)
@@ -176,6 +221,21 @@ impl RsouApp {
             workers: Vec::new(),
             import_active: false,
             search_active: false,
+            search_query: String::new(),
+            search_scope: Scope::All,
+            search_exact: true,
+            search_types: std::collections::BTreeSet::new(),
+            search_path_prefix: String::new(),
+            search_result: None,
+            search_error: None,
+            search_rx: None,
+            search_gen: 0,
+            preview_doc_id: None,
+            preview_text: None,
+            preview_rx: None,
+            preview_gen: 0,
+            preview_loading: false,
+            pending_scroll: None,
             maintenance_active: false,
             pending_dialog: None,
             #[cfg(target_os = "linux")]

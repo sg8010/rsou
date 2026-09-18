@@ -174,6 +174,28 @@ pub fn list_failed_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRo
     Ok(rows)
 }
 
+/// 按 id 批量取文档(检索结果回填元数据用);分批避免占位符过多。
+pub fn get_documents_by_ids(
+    conn: &Connection,
+    ids: &[i64],
+) -> anyhow::Result<std::collections::HashMap<i64, DocumentRow>> {
+    let mut map = std::collections::HashMap::with_capacity(ids.len());
+    for batch in ids.chunks(500) {
+        let marks = std::iter::repeat_n("?", batch.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT {DOCUMENT_COLS} FROM documents WHERE id IN ({marks})");
+        let rows = conn
+            .prepare(&sql)?
+            .query_map(rusqlite::params_from_iter(batch.iter()), row_to_document)?
+            .collect::<Result<Vec<_>, _>>()?;
+        for row in rows {
+            map.insert(row.id, row);
+        }
+    }
+    Ok(map)
+}
+
 /// 文档纯文本(预览/片段切片用);文档不存在或没有内容时返回 None。
 pub fn get_plain_text(conn: &Connection, document_id: i64) -> anyhow::Result<Option<String>> {
     let text = conn

@@ -24,6 +24,11 @@ members = [
     "spikes/scale",
 ]
 
+# jieba 查询分词只服务「宽松模式」:关闭 feature 时宽松退化为精确(不报错)。
+[features]
+default = ["jieba"]
+jieba = ["dep:jieba-rs"]
+
 [package.metadata.deb]
 maintainer = "sg8010 <sg8011@outlook.com>"
 copyright = "sg8010"
@@ -85,6 +90,8 @@ encoding_rs = "0.8"
 sha2 = "0.10"
 # 解析阶段的并行(写库仍在调用线程串行;已在 pdf-inspector 依赖树中)。
 rayon = "1"
+# 查询宽松模式的中文分词;default-dict 把词典编译期嵌进二进制。
+jieba-rs = { version = "0.11", default-features = false, features = ["default-dict"], optional = true }
 anyhow = "1"
 log = "0.4"
 

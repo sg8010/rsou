@@ -8,6 +8,7 @@ use std::sync::mpsc;
 
 use rsou_lib::import::{self, FileOutcome, ImportOptions};
 use rsou_lib::repo;
+use rsou_lib::search::{self, Filters, SearchRequest};
 
 use super::*;
 
@@ -138,10 +139,171 @@ impl RsouApp {
         }
     }
 
+    /// 发起一次检索(空查询不触发;检索线程每次新建、只读连接)。
+    /// 不检查 GUI 连接:worker 自己开只读连接,库不可用时错误走状态行。
+    pub(crate) fn start_search(&mut self, ctx: &egui::Context) {
+        let query = self.search_query.trim().to_owned();
+        if query.is_empty() {
+            return;
+        }
+        self.search_active = true;
+        self.search_error = None;
+        self.search_gen += 1;
+        let generation = self.search_gen;
+        let (tx, rx) = mpsc::channel::<SearchMsg>();
+        self.search_rx = Some((generation, rx));
+
+        let db_path = self.dirs.db_path.clone();
+        let ctx = ctx.clone();
+        // 无 jieba feature 时宽松模式退化为精确(库层已保证,这里固定精确保持一致)。
+        let request = SearchRequest {
+            query,
+            scope: self.search_scope,
+            loose: !self.search_exact,
+            filters: Filters {
+                file_types: self.search_types.iter().cloned().collect(),
+                mtime_from_ms: None,
+                mtime_to_ms: None,
+                path_prefix: {
+                    let prefix = self.search_path_prefix.trim();
+                    if prefix.is_empty() {
+                        None
+                    } else {
+                        Some(prefix.to_owned())
+                    }
+                },
+            },
+            max_documents: 100,
+        };
+        let spawned = std::thread::Builder::new()
+            .name("rsou-search".to_owned())
+            .spawn(move || {
+                // 检索线程自己开只读连接;库不存在时把中文原因带回状态行。
+                let result = store::open(&db_path, OpenMode::ReadOnly)
+                    .and_then(|conn| search::search(&conn, &request))
+                    .map_err(|error| format!("{error:#}"));
+                if tx.send(SearchMsg { generation, result }).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        match spawned {
+            Ok(handle) => self.workers.push(handle),
+            Err(error) => {
+                self.search_active = false;
+                self.search_rx = None;
+                self.search_error = Some(format!("无法启动检索线程: {error}"));
+            }
+        }
+    }
+
+    /// 加载预览文本(同一 worker 模式:线程读库,UI 线程只收消息)。
+    pub(crate) fn start_preview(&mut self, document_id: i64) {
+        self.preview_loading = true;
+        self.preview_gen += 1;
+        let generation = self.preview_gen;
+        let (tx, rx) = mpsc::channel::<PreviewMsg>();
+        self.preview_rx = Some((generation, rx));
+
+        let db_path = self.dirs.db_path.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rsou-preview".to_owned())
+            .spawn(move || {
+                let text = store::open(&db_path, OpenMode::ReadOnly)
+                    .ok()
+                    .and_then(|conn| {
+                        search::plain_text_for_preview(&conn, document_id)
+                            .ok()
+                            .flatten()
+                    });
+                let _ = tx.send(PreviewMsg {
+                    generation,
+                    document_id,
+                    text,
+                });
+            });
+        match spawned {
+            Ok(handle) => self.workers.push(handle),
+            Err(error) => {
+                self.preview_loading = false;
+                self.preview_rx = None;
+                self.search_error = Some(format!("无法启动预览线程: {error}"));
+            }
+        }
+    }
+
+    /// 点击片段:切到该文档预览并记录滚动目标(plain_text 字节偏移)。
+    pub(crate) fn focus_preview(&mut self, document_id: i64, byte_offset: usize) {
+        self.pending_scroll = Some(byte_offset);
+        if self.preview_doc_id != Some(document_id) || self.preview_text.is_none() {
+            self.preview_doc_id = Some(document_id);
+            let old = self.preview_text.take();
+            if let Some(old) = old {
+                drop_in_background(old);
+            }
+            self.start_preview(document_id);
+        }
+    }
+
     /// 每帧非阻塞地收取后台任务消息;回收已结束的 worker 线程。
     pub(crate) fn poll_workers(&mut self) {
         self.poll_import();
+        self.poll_search();
+        self.poll_preview();
         self.workers.retain(|worker| !worker.is_finished());
+    }
+
+    /// 消费检索结果;世代号不匹配(新查询已发出)时丢弃过期消息。
+    fn poll_search(&mut self) {
+        if let Some((generation, rx)) = &self.search_rx
+            && *generation == self.search_gen
+        {
+            let mut msg = None;
+            while let Ok(event) = rx.try_recv() {
+                msg = Some(event);
+            }
+            if let Some(SearchMsg { generation, result }) = msg
+                && generation == self.search_gen
+            {
+                self.search_active = false;
+                self.search_rx = None;
+                match result {
+                    Ok(response) => {
+                        self.search_error = None;
+                        if let Some(old) = self.search_result.replace(response) {
+                            drop_in_background(old);
+                        }
+                    }
+                    Err(error) => self.search_error = Some(error),
+                }
+            }
+        }
+    }
+
+    /// 消费预览文本;同样按世代号丢过期消息。
+    fn poll_preview(&mut self) {
+        if let Some((generation, rx)) = &self.preview_rx
+            && *generation == self.preview_gen
+        {
+            let mut msg = None;
+            while let Ok(event) = rx.try_recv() {
+                msg = Some(event);
+            }
+            if let Some(PreviewMsg {
+                generation,
+                document_id,
+                text,
+            }) = msg
+                && generation == self.preview_gen
+            {
+                self.preview_loading = false;
+                self.preview_rx = None;
+                if self.preview_doc_id == Some(document_id)
+                    && let Some(old) = text.and_then(|t| self.preview_text.replace(t))
+                {
+                    drop_in_background(old);
+                }
+            }
+        }
     }
 
     /// 消费导入事件:更新进度、按节奏刷新文档列表。

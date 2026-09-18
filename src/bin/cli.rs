@@ -11,9 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rsou_lib::import::{self, FileOutcome, ImportEvent, ImportOptions};
-use rsou_lib::parse;
+use rsou_lib::query::Scope;
+use rsou_lib::search::{self, Filters, SearchRequest, Span};
 use rsou_lib::store::{self, OpenMode};
-use rsou_lib::{chunk, text};
+use rsou_lib::{chunk, parse, text};
 
 const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
 
@@ -24,14 +25,23 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   import <路径...>      导入文件或目录(目录递归);--force 全部重解析
   parse <文件>          解析单个文件,把 Markdown 打到 stdout
   text <文件>           解析单个文件,打印 plain_text 与分块边界摘要
+  search <查询>         全文检索,片段用【】标出高亮段
 
 选项:
   --db PATH   索引库路径,缺省用应用数据目录下的 index.sqlite3
-  --force     import:忽略 hash/mtime 跳过,全部重解析";
+  --force     import:忽略 hash/mtime 跳过,全部重解析
+  --loose     search:宽松模式(jieba 切词;无该 feature 时等同精确)
+  --scope S   search:检索范围 all|title|content(缺省 all)
+  --type T    search:限定类型,逗号分隔(如 word,pdf 或扩展名)
+  --limit N   search:最多返回 N 篇文档(缺省 100)";
 
 fn main() -> ExitCode {
     let mut db_path: Option<PathBuf> = None;
     let mut force = false;
+    let mut loose = false;
+    let mut scope_arg: Option<String> = None;
+    let mut type_arg: Option<String> = None;
+    let mut limit_arg: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -44,6 +54,28 @@ fn main() -> ExitCode {
                 }
             },
             "--force" => force = true,
+            "--loose" => loose = true,
+            "--scope" => match args.next() {
+                Some(value) => scope_arg = Some(value),
+                None => {
+                    eprintln!("--scope 需要 all|title|content\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--type" => match args.next() {
+                Some(value) => type_arg = Some(value),
+                None => {
+                    eprintln!("--type 需要类型列表,如 word,pdf\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
+            "--limit" => match args.next() {
+                Some(value) => limit_arg = Some(value),
+                None => {
+                    eprintln!("--limit 需要一个数字\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            },
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
@@ -85,6 +117,13 @@ fn main() -> ExitCode {
             Some(path) => cmd_text(path),
             None => {
                 eprintln!("text 需要一个文件路径\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        },
+        "search" => match positional.get(1) {
+            Some(query) => cmd_search(&db_path, query, loose, scope_arg, type_arg, limit_arg),
+            None => {
+                eprintln!("search 需要一个查询词\n{USAGE}");
                 return ExitCode::from(2);
             }
         },
@@ -250,4 +289,99 @@ fn cmd_text(path: &Path) -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
+}
+
+/// search:只读连接跑 search::search,每篇打印标题/路径/命中数与【】高亮片段。
+fn cmd_search(
+    db_path: &Path,
+    query: &str,
+    loose: bool,
+    scope_arg: Option<String>,
+    type_arg: Option<String>,
+    limit_arg: Option<String>,
+) -> anyhow::Result<()> {
+    let scope = match scope_arg.as_deref() {
+        None | Some("all") => Scope::All,
+        Some("title") => Scope::Title,
+        Some("content") => Scope::Content,
+        Some(other) => anyhow::bail!("未知的检索范围: {other}(可用 all|title|content)"),
+    };
+    let file_types = type_arg
+        .map(|arg| {
+            arg.split(',')
+                .map(|token| {
+                    file_type_of_token(token.trim())
+                        .ok_or_else(|| anyhow::anyhow!("未知的文件类型: {}", token.trim()))
+                })
+                .collect::<anyhow::Result<Vec<String>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let max_documents = limit_arg
+        .map(|arg| {
+            arg.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("--limit 需要一个正整数: {arg}"))
+        })
+        .transpose()?
+        .unwrap_or(100);
+
+    let conn = store::open(db_path, OpenMode::ReadOnly)?;
+    let response = search::search(
+        &conn,
+        &SearchRequest {
+            query: query.to_owned(),
+            scope,
+            loose,
+            filters: Filters {
+                file_types,
+                ..Filters::default()
+            },
+            max_documents,
+        },
+    )?;
+    for doc_hit in &response.documents {
+        println!(
+            "{} | {} | 命中 {} 处",
+            doc_hit.document.file_name, doc_hit.document.path, doc_hit.total_hits
+        );
+        for hit in &doc_hit.hits {
+            if !hit.context_header.is_empty() {
+                println!("  〔{}〕", hit.context_header);
+            }
+            println!("  {}", mark_snippet(&hit.content, &hit.highlights));
+        }
+    }
+    println!(
+        "命中 {} 篇 · {} 处 · 耗时 {:.0} ms",
+        response.total_documents, response.total_hits, response.elapsed_ms
+    );
+    Ok(())
+}
+
+/// 类型过滤 token:file_type 名(word/pdf/…)或扩展名(docx/txt/…)。
+fn file_type_of_token(token: &str) -> Option<String> {
+    const NAMES: [&str; 6] = ["word", "excel", "ppt", "pdf", "text", "epub"];
+    if NAMES.contains(&token) {
+        return Some(token.to_owned());
+    }
+    let probe = format!("f.{token}");
+    parse::file_type_of(Path::new(&probe)).map(|ft| ft.as_str().to_owned())
+}
+
+/// 把高亮区间包上【】输出(终端里没有底色可用)。
+fn mark_snippet(content: &str, spans: &[Span]) -> String {
+    let mut out = String::with_capacity(content.len() + spans.len() * 4);
+    let mut pos = 0usize;
+    for span in spans {
+        if span.start < pos || span.end > content.len() {
+            continue;
+        }
+        out.push_str(&content[pos..span.start]);
+        out.push('【');
+        out.push_str(&content[span.start..span.end]);
+        out.push('】');
+        pos = span.end;
+    }
+    out.push_str(&content[pos..]);
+    out
 }
