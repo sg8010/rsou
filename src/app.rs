@@ -31,7 +31,7 @@ use rsou_lib::repo::{DocumentRow, ImportCounts};
 use rsou_lib::search::{SearchResponse, Span};
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
-use shell::{SIDEBAR_MARGIN, TOPBAR_MARGIN};
+use shell::SIDEBAR_MARGIN;
 
 #[cfg(target_os = "linux")]
 use crate::file_dialog::{self, DialogAction, FileDialog};
@@ -492,16 +492,6 @@ impl Drop for RsouApp {
 
 impl eframe::App for RsouApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 顶栏先布局:占据整窗宽(含侧栏上方),左侧栏从顶栏下沿开始。
-        egui::Panel::top("topbar")
-            .exact_size(Self::TOPBAR_HEIGHT)
-            .frame(
-                egui::Frame::new()
-                    .fill(Self::surface())
-                    .inner_margin(TOPBAR_MARGIN),
-            )
-            .show(ui, |ui| self.ui_topbar(ui));
-
         egui::Panel::left("rsou_sidebar")
             .exact_size(Self::SIDEBAR_WIDTH)
             .resizable(false)

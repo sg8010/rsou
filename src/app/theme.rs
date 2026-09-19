@@ -167,7 +167,6 @@ impl RsouApp {
     pub(crate) const TABLE_ROW_HEIGHT: f32 = 34.0;
     pub(crate) const NAV_ITEM_HEIGHT: f32 = 44.0;
     pub(crate) const SIDEBAR_WIDTH: f32 = 196.0;
-    pub(crate) const TOPBAR_HEIGHT: f32 = 44.0;
 
     // ---------- 框架:页面 Header / 卡片 / 分隔线 ----------
 

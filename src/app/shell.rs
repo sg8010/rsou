@@ -1,4 +1,4 @@
-//! 外壳:侧栏、顶栏与主工作区骨架。
+//! 外壳:侧栏与主工作区骨架。
 
 use super::theme::Icon;
 use super::*;
@@ -11,16 +11,8 @@ pub(crate) const SIDEBAR_MARGIN: egui::Margin = egui::Margin {
     bottom: 14,
 };
 
-/// 顶栏内边距(左/右;上下为 0,内容在 44px 里垂直居中)。
-pub(crate) const TOPBAR_MARGIN: egui::Margin = egui::Margin {
-    left: 24,
-    right: 24,
-    top: 0,
-    bottom: 0,
-};
-
 impl RsouApp {
-    // ---------- 侧栏与顶栏 ----------
+    // ---------- 侧栏 ----------
 
     pub(crate) fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
         ui.set_min_width(ui.available_width());
@@ -135,81 +127,6 @@ impl RsouApp {
         if response.clicked() {
             self.page = page;
         }
-    }
-
-    /// 顶栏左侧的品牌方块(蓝色小方块 + 白色放大镜,呼应「检索」)。
-    pub(crate) fn brand_mark(ui: &mut egui::Ui) {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, CornerRadius::same(5), Self::accent());
-        let mark = Stroke::new(1.5, Color32::WHITE);
-        let lens = egui::pos2(rect.left() + 9.0, rect.top() + 9.0);
-        painter.circle_stroke(lens, 4.0, mark);
-        painter.line_segment(
-            [
-                egui::pos2(lens.x + 3.0, lens.y + 3.0),
-                egui::pos2(rect.right() - 5.0, rect.bottom() - 5.0),
-            ],
-            mark,
-        );
-    }
-
-    /// 顶栏:品牌块 + 面包屑;右侧状态徽标(索引不可用 / 导入中 / 文档数)。
-    pub(crate) fn ui_topbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            Self::brand_mark(ui);
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("rsou")
-                    .size(13.0)
-                    .color(Self::text_primary()),
-            );
-            ui.label(
-                egui::RichText::new("/")
-                    .size(13.0)
-                    .color(Self::text_muted()),
-            );
-            ui.label(
-                egui::RichText::new(self.page.title())
-                    .size(13.0)
-                    .color(Self::text_secondary()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(error) = &self.db_error {
-                    Self::status_badge(
-                        ui,
-                        Some(Icon::Warn),
-                        &format!("索引不可用: {error}"),
-                        Self::warning_soft(),
-                        Self::warning(),
-                    );
-                } else if self.import_active {
-                    let c = &self.import_progress.counts;
-                    Self::status_badge(
-                        ui,
-                        Some(Icon::Loader),
-                        &format!("导入中 {}/{}", c.processed, c.total),
-                        Self::accent_soft(),
-                        Self::accent(),
-                    );
-                } else {
-                    Self::status_badge(
-                        ui,
-                        Some(Icon::Doc),
-                        &format!("文档 {} 篇", self.documents.len()),
-                        Self::accent_soft(),
-                        Self::accent(),
-                    );
-                }
-            });
-        });
-        // 顶栏底部分隔线(通栏整宽)。
-        let panel = ui.max_rect() + TOPBAR_MARGIN;
-        ui.painter().with_clip_rect(panel).hline(
-            panel.x_range(),
-            panel.bottom() - 0.5,
-            Stroke::new(1.0, Self::border()),
-        );
     }
 
     /// 主工作区:各页面自己渲染页头(标题/说明/右侧操作)。
