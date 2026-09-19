@@ -565,13 +565,14 @@ impl RsouApp {
                             let root_owned = root.clone();
                             let doc_count = documents.len();
                             let matched = *matched;
-                            // 文件夹行的三个操作:定位 / 重解析 / 移除。
+                            // 文件夹行的四个操作:打开 / 定位 / 重解析 / 移除。
                             // 挂在 label_ui 上(行内右侧),与文档行一致;
                             // 点按钮不会触发树的选中/展开(已验证)。
                             let folder_slot: std::rc::Rc<
                                 std::cell::RefCell<Option<RowAction>>,
                             > = std::rc::Rc::new(std::cell::RefCell::new(None));
                             let folder_slot_in = folder_slot.clone();
+                            let root_for_open = root.clone();
                             let root_for_reimport = root.clone();
                             let root_for_reveal = root.clone();
                             let root_for_remove = root.clone();
@@ -583,12 +584,18 @@ impl RsouApp {
                                     .default_open(false)
                                     .label_ui(move |ui| {
                                         ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!(
-                                                    "{root_owned}  ({matched}/{doc_count})"
-                                                ))
-                                                .size(13.0)
-                                                .color(RsouApp::text_primary()),
+                                            // selectable(false):Label 默认可选中
+                                            // (带 click_and_drag),会挡住树的整行
+                                            // 点击——点文字不选中,点空白才选中。
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(format!(
+                                                        "{root_owned}  ({matched}/{doc_count})"
+                                                    ))
+                                                    .size(13.0)
+                                                    .color(RsouApp::text_primary()),
+                                                )
+                                                .selectable(false),
                                             );
                                             // 右侧三个操作。宽度有限的窗口里
                                             // 会挤,但树本身可横向滚动。
@@ -634,6 +641,12 @@ impl RsouApp {
                                                                 root_for_reveal.clone(),
                                                             ));
                                                     }
+                                                    if RsouApp::link_button(ui, "打开").clicked() {
+                                                        *folder_slot_in.borrow_mut() =
+                                                            Some(RowAction::Open(PathBuf::from(
+                                                                &root_for_open,
+                                                            )));
+                                                    }
                                                 },
                                             );
                                         });
@@ -648,6 +661,7 @@ impl RsouApp {
                                     node_count += 1;
                                     let id = document.id;
                                     let name = document.file_name.clone();
+                                    let path = document.path.clone();
                                     let status_ok = document.parse_status == "parsed";
                                     let busy_here = busy;
                                     // label_ui 的闭包按值捕获,而闭包结束后还要读结果,
@@ -668,16 +682,22 @@ impl RsouApp {
                                                     } else {
                                                         RsouApp::danger()
                                                     };
-                                                    ui.label(
-                                                        egui::RichText::new(&name)
-                                                            .size(13.0)
-                                                            .color(color),
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            egui::RichText::new(&name)
+                                                                .size(13.0)
+                                                                .color(color),
+                                                        )
+                                                        .selectable(false),
                                                     );
                                                     if !status_ok {
-                                                        ui.label(
-                                                            egui::RichText::new("失败")
-                                                                .size(11.0)
-                                                                .color(RsouApp::danger()),
+                                                        ui.add(
+                                                            egui::Label::new(
+                                                                egui::RichText::new("失败")
+                                                                    .size(11.0)
+                                                                    .color(RsouApp::danger()),
+                                                            )
+                                                            .selectable(false),
                                                         );
                                                     }
                                                     ui.with_layout(
@@ -701,6 +721,24 @@ impl RsouApp {
                                                                     RowAction::AskRemoveDocument(
                                                                         id,
                                                                         name.clone(),
+                                                                    ),
+                                                                );
+                                                            }
+                                                            if RsouApp::link_button(ui, "定位")
+                                                                .clicked()
+                                                            {
+                                                                *local_in.borrow_mut() = Some(
+                                                                    RowAction::Reveal(
+                                                                        PathBuf::from(&path),
+                                                                    ),
+                                                                );
+                                                            }
+                                                            if RsouApp::link_button(ui, "打开")
+                                                                .clicked()
+                                                            {
+                                                                *local_in.borrow_mut() = Some(
+                                                                    RowAction::Open(
+                                                                        PathBuf::from(&path),
                                                                     ),
                                                                 );
                                                             }
@@ -880,7 +918,10 @@ mod tests {
                                     let open =
                                         builder.node(NodeBuilder::dir(id).label_ui(move |ui| {
                                             ui.horizontal(|ui| {
-                                                ui.label(format!("{root} ({count})"));
+                                                ui.add(
+                                                    egui::Label::new(format!("{root} ({count})"))
+                                                        .selectable(false),
+                                                );
                                                 ui.with_layout(
                                                     egui::Layout::right_to_left(
                                                         egui::Align::Center,
