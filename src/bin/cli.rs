@@ -39,7 +39,7 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   --loose     search:宽松模式(jieba 切词;无该 feature 时等同精确)
   --scope S   search:检索范围 all|title|content(缺省 all)
   --type T    search:限定类型,逗号分隔(如 word,pdf 或扩展名)
-  --limit N   search:最多返回 N 篇文档(缺省 100)
+  --limit N   search:最多返回 N 篇文档(缺省 100,仅复核前 200 个候选)
   --yes       clear:确认清空(不可恢复)";
 
 fn main() -> ExitCode {
@@ -397,7 +397,7 @@ fn cmd_search(
         response.total_hits,
         response.elapsed_ms,
         if truncated {
-            "(已按 --limit 截断)"
+            "(仅展示部分 FTS 命中文档)"
         } else {
             ""
         }

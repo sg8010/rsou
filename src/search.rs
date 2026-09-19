@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use anyhow::Context;
-use rusqlite::{Connection, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, params_from_iter};
 
 use crate::query::{self, CompiledQuery, Scope};
 use crate::repo::{self, DocumentRow};
@@ -38,7 +38,7 @@ pub struct SearchRequest {
     /// true = 宽松模式(jieba 切词);无 jieba feature 时退化为精确
     pub loose: bool,
     pub filters: Filters,
-    /// 返回文档数上限(总命中文档数仍记真实值)
+    /// 返回文档数上限;最多从前 200 个 FTS 候选中精确复核,默认展示 100 篇。
     pub max_documents: usize,
     /// 每篇最多返回几个展示片段(`chunks` 中命中块 + 相邻块,按命中位置取前 N)
     pub max_fragments_per_document: usize,
@@ -62,6 +62,9 @@ impl Default for SearchRequest {
 /// 「命中 N 处」现在指「N 个展示片段」,而不是 FTS 行数。不设上限的话,
 /// 一篇长文档可能命中几百个块,右侧预览的「上一批/下一批」就失去意义了。
 pub const DEFAULT_MAX_FRAGMENTS: usize = 20;
+
+/// 每次最多读取正文并精确复核的 FTS 候选数,不继续补页。
+const MAX_CANDIDATES: usize = 200;
 
 /// 字节区间(content 内 / 列文本内)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +113,7 @@ pub struct SearchResponse {
     /// 已展示文档的命中片段总数;文档被 `max_documents` 截断时是下界
     /// (完整总数需要为每篇都切片段,不值得)
     pub total_hits: usize,
-    /// 命中文档总数(不受 `max_documents` 截断)
+    /// FTS 命中文档总数(含结构化过滤,不受候选/展示上限影响,可能含少量假阳性)。
     pub total_documents: usize,
     pub elapsed_ms: f64,
     /// 编译产物(literals 供预览定位)
@@ -349,8 +352,8 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
     without_title.to_owned()
 }
 
-/// 执行检索:编译查询 → MATCH(文档级)→ 取回正文 → 在原文上定位字面量
-/// → 按展示分块切片段 → 回填元数据。
+/// 执行检索:编译查询 → FTS 计数与相关度前 200 个候选 → 按 ID 读取正文
+/// → 定位并精确复核 → 按展示分块切片段。
 ///
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
@@ -402,67 +405,71 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     }
     where_sql.push_str(&filter_sql);
 
-    // 候选集:MATCH 的正例 + 结构化过滤。按 bm25 升序、rowid 次升序,稳定。
+    // 总数只统计 FTS 候选,接受逐字 tokenizer 的少量标点假阳性。
+    // 与候选查询共用 JOIN、WHERE 和参数,保证结构化过滤口径一致。
+    let from_sql = "FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid";
+    let total_documents: usize = conn
+        .query_row(
+            &format!("SELECT COUNT(*) {from_sql} {where_sql}"),
+            params_from_iter(params.iter()),
+            |row| row.get::<_, i64>(0),
+        )
+        .context("统计检索命中文档失败")? as usize;
+
+    // 隐藏 rank 让 FTS5 按相关度输出有限候选;此阶段不返回标题/正文。
+    // 不增加 rowid 次排序,避免 SQLite 为多列排序建立临时排序表。
     let candidate_sql = format!(
-        "SELECT documents_fts.rowid, documents_fts.title, documents_fts.content, \
-         bm25(documents_fts, 5.0, 1.0) AS rank \
-         FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid \
-         {where_sql} ORDER BY rank ASC, documents_fts.rowid ASC"
+        "SELECT documents_fts.rowid, documents_fts.rank \
+         {from_sql} {where_sql} AND rank MATCH 'bm25(5.0, 1.0)' \
+         ORDER BY rank LIMIT {MAX_CANDIDATES}"
     );
+    let candidates = conn
+        .prepare(&candidate_sql)
+        .context("准备检索语句失败")?
+        .query_map(params_from_iter(params.iter()), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })
+        .context("执行检索失败")?
+        .collect::<Result<Vec<_>, _>>()
+        .context("读取检索候选失败")?;
+    let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    let mut meta = repo::get_documents_by_ids(conn, &ids).context("读取文档元数据失败")?;
+    let mut content_stmt =
+        conn.prepare("SELECT plain_text FROM document_contents WHERE document_id = ?1")?;
 
-    // 逐字索引的 MATCH 只是**候选**:标点不产生词元,所以短语 `"文档"` 也会
-    // 命中 `文、档`。必须再把每篇的正文/标题取回来做一次真实子串定位,才能
-    // 得到准确的命中集合——「命中篇数」与「返回的卡片」因此出自同一个集合。
-    //
-    // 这里做全量扫描而不是 LIMIT:把 LIMIT 放在前面会让计数变成「前 N 篇里
-    // 有几篇」,和界面上的「命中 N 篇」对不上(那正是改动前的缺陷)。
-    // 实测 2 万篇 × 5 千字(282 MB 正文)全量扫描 + 定位约 350 ms,
-    // 是一次可接受的本地检索延迟。
     let literals = &compiled.literals;
-    let mut matched: Vec<(i64, String, String, f64)> = Vec::new();
-    {
-        let mut stmt = conn.prepare(&candidate_sql).context("准备检索语句失败")?;
-        let mut rows = stmt
-            .query(params_from_iter(params.iter()))
-            .context("执行检索失败")?;
-        while let Some(row) = rows.next().context("读取检索结果失败")? {
-            let id: i64 = row.get(0)?;
-            let title: String = row.get(1)?;
-            let content: String = row.get(2)?;
-            let rank: f64 = row.get(3)?;
-            // 标题或正文里真实含任一查询字面量,才算命中。
-            if locate_literals(&content, literals).is_empty()
-                && locate_literals(&title, literals).is_empty()
-            {
-                continue;
-            }
-            matched.push((id, title, content, rank));
+    let mut documents = Vec::with_capacity(candidates.len().min(request.max_documents));
+    for (id, rank) in candidates {
+        if documents.len() >= request.max_documents {
+            break;
         }
-    }
-
-    let total_documents = matched.len();
-    let kept = matched.split_off(total_documents.min(request.max_documents));
-    drop(kept);
-    let kept_ids: Vec<i64> = matched.iter().map(|(id, _, _, _)| *id).collect();
-    let meta = repo::get_documents_by_ids(conn, &kept_ids).context("读取文档元数据失败")?;
-
-    let mut documents = Vec::with_capacity(matched.len());
-    for (id, title, content, rank) in matched {
-        let Some(document) = meta.get(&id) else {
-            // 行还在 FTS 里但 documents 已被并发删掉——跳过。
+        let Some(document) = meta.remove(&id) else {
+            // 候选取回后文档已被删除——跳过。
             continue;
         };
-        let title_highlights = locate_literals(&title, literals);
+        let Some(content) = content_stmt
+            .query_row([id], |row| row.get::<_, String>(0))
+            .optional()
+            .context("读取候选文档正文失败")?
+        else {
+            continue;
+        };
+        // 定位结果直接复用于精确复核与片段生成,不重复调用定位函数。
+        let content_highlights = locate_literals(&content, literals);
+        let title_highlights = locate_literals(&document.title, literals);
+        if content_highlights.is_empty() && title_highlights.is_empty() {
+            continue;
+        }
         let hits = group_into_fragments(
             &content,
-            &locate_literals(&content, literals),
+            &content_highlights,
             &chunk_ranges(conn, id).unwrap_or_default(),
             &document.title,
             request.max_fragments_per_document,
         );
         let total_for_doc = hits.len();
         documents.push(DocumentHit {
-            document: document.clone(),
+            document,
             title_highlights,
             hits,
             total_hits: total_for_doc,
@@ -585,7 +592,8 @@ mod tests {
         save_doc(&mut conn, "/d/连写.txt", FileType::Text, "文档");
         let response = search(&conn, &request("文档")).unwrap();
         let paths = hit_paths(&response);
-        assert_eq!(response.total_documents, 3, "{paths:?}");
+        assert_eq!(response.total_documents, 4, "FTS 总数包含标点假阳性");
+        assert_eq!(paths.len(), 3, "{paths:?}");
         // 二次过滤现在由 locate_literals 承担:「文、档」不产生任何片段,
         // 于是整篇被丢掉(与分块实现的结论一致)。
         assert!(!paths.iter().any(|p| p.contains("顿号")));
