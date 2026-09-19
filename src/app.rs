@@ -30,6 +30,7 @@ use rsou_lib::repo::{DocumentRow, ImportCounts};
 use rsou_lib::search::{SearchResponse, Span};
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
+use shell::{SIDEBAR_MARGIN, TOPBAR_MARGIN};
 
 #[cfg(target_os = "linux")]
 use crate::file_dialog::{self, DialogAction, FileDialog};
@@ -51,16 +52,8 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Self::Library => "资料库",
-            Self::Search => "检索",
+            Self::Search => "搜索",
             Self::Settings => "设置",
-        }
-    }
-
-    fn hint(self) -> &'static str {
-        match self {
-            Self::Library => "导入并管理要检索的文档",
-            Self::Search => "在已索引文档中全文查找",
-            Self::Settings => "数据目录、索引维护与关于",
         }
     }
 
@@ -288,6 +281,9 @@ pub struct RsouApp {
     folder_groups: Vec<FolderGroup>,
     /// 树形视图的折叠/选择状态(egui_ltreeview,跨帧保留)
     library_tree_state: egui_ltreeview::TreeViewState<LibraryNode>,
+    /// 过滤期间被自动展开的文件夹节点;过滤清空后收回为关,
+    /// 只记「原本没开」的节点,不覆盖用户手动展开的状态
+    filter_auto_opened: Vec<LibraryNode>,
     /// 「显示失败清单」抽屉开关
     show_failures: bool,
     /// 上一个页面(进资料库页时刷新文档列表用)
@@ -405,6 +401,7 @@ impl RsouApp {
             library_tab: LibraryTab::default(),
             folder_groups: Vec::new(),
             library_tree_state: egui_ltreeview::TreeViewState::default(),
+            filter_auto_opened: Vec::new(),
             show_failures: false,
             prev_page: Page::Library,
             import_progress: ImportProgress::default(),
@@ -483,32 +480,40 @@ impl Drop for RsouApp {
 
 impl eframe::App for RsouApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::left("rsou_sidebar")
-            .exact_size(224.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::new()
-                    .fill(Self::navy())
-                    .inner_margin(egui::Margin::symmetric(16, 25)),
-            )
-            .show(ui, |ui| self.ui_sidebar(ui));
-
+        // 顶栏先布局:占据整窗宽(含侧栏上方),左侧栏从顶栏下沿开始。
         egui::Panel::top("topbar")
-            .exact_size(66.0)
+            .exact_size(Self::TOPBAR_HEIGHT)
             .frame(
                 egui::Frame::new()
-                    .fill(Self::white())
-                    .stroke(Stroke::new(1.0, Self::line()))
-                    .inner_margin(egui::Margin::symmetric(35, 0)),
+                    .fill(Self::surface())
+                    .inner_margin(TOPBAR_MARGIN),
             )
             .show(ui, |ui| self.ui_topbar(ui));
 
+        egui::Panel::left("rsou_sidebar")
+            .exact_size(Self::SIDEBAR_WIDTH)
+            .resizable(false)
+            .frame(
+                egui::Frame::new()
+                    .fill(Self::surface())
+                    .inner_margin(SIDEBAR_MARGIN),
+            )
+            .show(ui, |ui| {
+                self.ui_sidebar(ui);
+                Self::paint_sidebar_border(ui);
+            });
+
         egui::CentralPanel::default()
-            // 在导航栏与主工作区之间保留独立的浅色留白，避免内容贴边。
+            // 页面工作区:浅灰底,左右 24 / 上 22 / 下 24 的统一页边距。
             .frame(
                 egui::Frame::new()
                     .fill(Self::canvas())
-                    .inner_margin(egui::Margin::symmetric(16, 0)),
+                    .inner_margin(egui::Margin {
+                        left: 24,
+                        right: 24,
+                        top: 22,
+                        bottom: 24,
+                    }),
             )
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()

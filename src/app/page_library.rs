@@ -6,6 +6,7 @@ use egui_extras::{Column, TableBuilder};
 use egui_ltreeview::{Action as TreeAction, NodeBuilder, TreeView};
 use rsou_lib::filebrowser;
 
+use super::theme::Icon;
 use super::*;
 
 /// 行内操作意图(表格/树闭包结束后再落地,避免借用冲突)。
@@ -26,113 +27,114 @@ enum RowAction {
 
 impl RsouApp {
     pub(crate) fn ui_page_library(&mut self, ui: &mut egui::Ui) {
-        if let Some(error) = self.db_error.clone() {
-            Self::work_panel(ui, "索引", "索引库不可用", "", None, |ui| {
-                ui.label(
-                    egui::RichText::new(format!("无法打开索引库,导入与检索不可用:\n{error}"))
-                        .color(Self::amber()),
-                );
-            });
-            ui.add_space(13.0);
-        }
-
-        // ---------- 顶部操作行 ----------
+        // ---------- 页头:标题 + 说明 + 右侧导入操作 ----------
         let mut want_files = false;
         let mut want_folder = false;
         let db_ready = self.db.is_some();
         // 维护(重建/清空)进行中时导入也禁用,两条写路径互斥。
         let importing = self.import_active || self.maintenance_active;
-        Self::work_panel(
-            ui,
-            "文档",
-            "导入文档",
-            "支持 Word/Excel/PPT/PDF/文本/电子书",
-            None,
-            |ui| {
-                ui.horizontal(|ui| {
-                    if Self::primary_button(ui, "添加文件", 96.0, db_ready && !importing).clicked()
-                    {
-                        want_files = true;
-                    }
-                    ui.add_enabled_ui(db_ready && !importing, |ui| {
-                        if Self::secondary_button(ui, "添加文件夹", 110.0).clicked() {
-                            want_folder = true;
-                        }
-                    });
-                    ui.add_space(14.0);
-                });
-                if let Some(notice) = &self.library_notice {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new(notice).size(13.0).color(Self::teal()));
-                }
-            },
-        );
+        Self::page_header_actions(ui, self.page.title(), self.page.description(), |ui| {
+            // right_to_left:先加的在最右。
+            if Self::primary_button(
+                ui,
+                Some(Icon::DocPlus),
+                "添加文件",
+                104.0,
+                db_ready && !importing,
+            )
+            .clicked()
+            {
+                want_files = true;
+            }
+            if Self::secondary_button(
+                ui,
+                Some(Icon::FolderPlus),
+                "添加文件夹",
+                118.0,
+                db_ready && !importing,
+            )
+            .clicked()
+            {
+                want_folder = true;
+            }
+        });
         if want_files {
             self.pending_dialog = Some(DialogRequest::ImportFiles);
         }
         if want_folder {
             self.pending_dialog = Some(DialogRequest::ImportFolder);
         }
-        ui.add_space(13.0);
+        if let Some(error) = self.db_error.clone() {
+            ui.add_space(8.0);
+            Self::warn_banner(ui, &format!("无法打开索引库,导入与检索不可用: {error}"));
+        }
+        if let Some(notice) = self.library_notice.clone() {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(notice)
+                    .size(13.0)
+                    .color(Self::warning()),
+            );
+        }
+        ui.add_space(Self::HEADER_TO_CONTENT);
 
-        // ---------- 导入进度卡 ----------
+        // ---------- 导入进度卡(仅导入中出现) ----------
         if self.import_active {
             let mut cancel = false;
-            Self::work_panel(
-                ui,
-                "进度",
-                "正在导入",
-                "解析在后台线程并行,写库串行",
-                None,
-                |ui| {
-                    let c = &self.import_progress.counts;
-                    let fraction = if c.total == 0 {
-                        0.0
-                    } else {
-                        c.processed as f32 / c.total as f32
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_width((ui.available_width() - 120.0).max(80.0))
-                            .text(format!("已处理 {}/{}", c.processed, c.total)),
+            Self::card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    Self::card_title(ui, "正在导入");
+                    ui.label(
+                        egui::RichText::new("解析在后台线程并行,写库串行")
+                            .size(12.0)
+                            .color(Self::text_muted()),
                     );
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "成功 {} · 失败 {} · 跳过 {}",
-                                c.ok, c.failed, c.skipped
-                            ))
-                            .size(13.0)
-                            .color(Self::muted()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if Self::secondary_button(ui, "取消", 72.0).clicked() {
-                                cancel = true;
-                            }
-                        });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if Self::small_secondary_button(ui, None, "取消", 72.0, true).clicked() {
+                            cancel = true;
+                        }
                     });
-                    if let Some(path) = &self.import_progress.current_path {
-                        ui.add_space(4.0);
-                        ui.label(
+                });
+                ui.add_space(10.0);
+                let c = &self.import_progress.counts;
+                let fraction = if c.total == 0 {
+                    0.0
+                } else {
+                    c.processed as f32 / c.total as f32
+                };
+                Self::progress_bar(ui, fraction, ui.available_width());
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "已处理 {}/{} · 成功 {} · 失败 {} · 跳过 {}",
+                        c.processed, c.total, c.ok, c.failed, c.skipped
+                    ))
+                    .size(13.0)
+                    .color(Self::text_secondary()),
+                );
+                if let Some(path) = &self.import_progress.current_path {
+                    ui.add_space(4.0);
+                    ui.add(
+                        egui::Label::new(
                             egui::RichText::new(format!("最近: {}", path.display()))
                                 .size(12.0)
-                                .color(Self::soft()),
-                        );
-                    }
-                    for (name, message) in self.import_progress.recent_failures.iter().rev().take(5)
-                    {
-                        ui.label(
-                            egui::RichText::new(format!("{name}: {message}"))
-                                .size(12.0)
-                                .color(Self::amber()),
-                        );
-                    }
-                },
-            );
+                                .color(Self::text_muted()),
+                        )
+                        .truncate(),
+                    );
+                }
+                for (name, message) in self.import_progress.recent_failures.iter().rev().take(5) {
+                    ui.label(
+                        egui::RichText::new(format!("{name}: {message}"))
+                            .size(12.0)
+                            .color(Self::warning()),
+                    );
+                }
+            });
             if cancel {
                 self.cancel_import();
             }
-            ui.add_space(13.0);
+            ui.add_space(Self::SECTION_GAP);
         }
 
         // ---------- 已加入索引的清单(页签栏 + 内容,同一张卡片)----------
@@ -140,10 +142,10 @@ impl RsouApp {
         // 页签与内容必须在一张卡片里:拆成两张卡片时,两张卡各自还有 18px
         // 内边距加上卡片间距,页签与内容之间就空出近四十像素。
         self.ui_library_tabbed(ui);
-        ui.add_space(13.0);
 
         // ---------- 失败清单抽屉 ----------
         if self.show_failures {
+            ui.add_space(Self::SECTION_GAP);
             self.ui_failures_drawer(ui);
         }
 
@@ -186,19 +188,25 @@ impl RsouApp {
                 egui::RichText::new(title)
                     .size(16.0)
                     .strong()
-                    .color(Self::ink()),
+                    .color(Self::text_primary()),
             );
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(body).size(13.0).color(Self::muted()));
-            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(body)
+                    .size(13.0)
+                    .color(Self::text_secondary()),
+            );
+            ui.add_space(16.0);
             ui.horizontal(|ui| {
-                // 默认焦点在「取消」上:回车不会误删。
-                if Self::secondary_button(ui, "取消", 80.0).clicked() {
-                    cancel = true;
-                }
-                if Self::primary_button(ui, &confirm_label, 150.0, !busy).clicked() {
-                    confirm = true;
-                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if Self::danger_button(ui, &confirm_label, 130.0, !busy).clicked() {
+                        confirm = true;
+                    }
+                    // 默认焦点在「取消」上:回车不会误删。
+                    if Self::secondary_button(ui, None, "取消", 80.0, true).clicked() {
+                        cancel = true;
+                    }
+                });
             });
             // Esc 等同取消(Modal 自带遮罩,点遮罩不关,避免误触)。
             if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -217,18 +225,14 @@ impl RsouApp {
         }
     }
 
-    /// 文档列表表格(虚拟滚动;行操作收集后统一落地)。
-    fn ui_documents_table(&mut self, ui: &mut egui::Ui) {
+    /// 文档列表表格(虚拟滚动;行操作收集后统一落地)。`filter` 为文件名过滤词。
+    fn ui_documents_table(&mut self, ui: &mut egui::Ui, filter: &str) {
         // 空态文案要看「整库空」还是「本页签空」——库里只有文件夹导入的文档时,
         // 「单独文件」页是空的,但说「资料库为空」就错了。
         let library_empty = self.documents.is_empty();
         let standalone_empty = self.documents.iter().all(|d| d.source_root.is_some());
         if library_empty && self.docs_loading {
-            ui.label(
-                egui::RichText::new("正在读取文档列表…")
-                    .size(15.0)
-                    .color(Self::muted()),
-            );
+            Self::empty_note(ui, "正在读取文档列表…");
             return;
         }
         if self.db.is_some()
@@ -236,24 +240,20 @@ impl RsouApp {
             && !self.docs_loading
             && (library_empty || standalone_empty)
         {
-            ui.label(
-                egui::RichText::new(if library_empty {
+            Self::empty_note(
+                ui,
+                if library_empty {
                     "资料库为空,点「添加文件」或「添加文件夹」开始导入。"
                 } else {
                     "没有单独添加的文件。用「添加文件」直接加进来的文档会出现在这里。"
-                })
-                .size(15.0)
-                .color(Self::muted()),
+                },
             );
             return;
         }
 
         // 过滤结果按 (过滤词, 列表换代号) 缓存,不每帧重建。
         // 本表只服务「单独文件」页(「文件夹」页是另一棵树),所以键里不需要页签。
-        let key = (
-            self.doc_filter.trim().to_lowercase(),
-            self.documents_version,
-        );
+        let key = (filter.trim().to_lowercase(), self.documents_version);
         if self.filtered_key.as_ref() != Some(&key) {
             self.filtered_docs = standalone_document_indices(&self.documents, &key.0);
             self.filtered_key = Some(key);
@@ -278,7 +278,7 @@ impl RsouApp {
             .column(Column::exact(80.0))
             .column(Column::exact(104.0))
             .column(Column::exact(196.0))
-            .header(26.0, |mut header| {
+            .header(Self::TABLE_HEADER_HEIGHT, |mut header| {
                 for title in [
                     "文件名",
                     "类型",
@@ -294,20 +294,23 @@ impl RsouApp {
                             egui::RichText::new(title)
                                 .size(12.0)
                                 .strong()
-                                .color(Self::muted()),
+                                .color(Self::text_muted()),
                         );
                     });
                 }
             })
             .body(|body| {
-                body.rows(26.0, filtered.len(), |mut row| {
+                body.rows(Self::TABLE_ROW_HEIGHT, filtered.len(), |mut row| {
                     let doc = &documents[filtered[row.index()]];
                     // 文件名:截断显示,hover 看完整路径
                     row.col(|ui| {
-                        ui.label(
-                            egui::RichText::new(&doc.file_name)
-                                .size(13.0)
-                                .color(Self::ink()),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&doc.file_name)
+                                    .size(13.0)
+                                    .color(Self::text_primary()),
+                            )
+                            .truncate(),
                         )
                         .on_hover_text(&doc.path);
                     });
@@ -315,7 +318,7 @@ impl RsouApp {
                         ui.label(
                             egui::RichText::new(&doc.ext)
                                 .size(12.0)
-                                .color(Self::muted()),
+                                .color(Self::text_secondary()),
                         );
                     });
                     row.col(|ui| {
@@ -324,7 +327,7 @@ impl RsouApp {
                                 doc.file_size.max(0) as u64
                             ))
                             .size(12.0)
-                            .color(Self::muted()),
+                            .color(Self::text_secondary()),
                         );
                     });
                     row.col(|ui| {
@@ -333,23 +336,28 @@ impl RsouApp {
                                 doc.text_length.max(0) as u64
                             ))
                             .size(12.0)
-                            .color(Self::muted()),
+                            .color(Self::text_secondary()),
                         );
                     });
                     row.col(|ui| {
                         ui.label(
                             egui::RichText::new(doc.chunk_count.to_string())
                                 .size(12.0)
-                                .color(Self::muted()),
+                                .color(Self::text_secondary()),
                         );
                     });
-                    // 状态徽标:已索引=teal;失败=amber,hover 显示中文原因
+                    // 状态:已索引=绿;失败=红,hover 显示中文原因
                     row.col(|ui| {
                         if doc.parse_status == "parsed" {
-                            ui.label(egui::RichText::new("已索引").size(12.0).color(Self::teal()));
+                            ui.label(
+                                egui::RichText::new("已索引")
+                                    .size(12.0)
+                                    .color(Self::success()),
+                            );
                         } else {
-                            let label = ui
-                                .label(egui::RichText::new("失败").size(12.0).color(Self::amber()));
+                            let label = ui.label(
+                                egui::RichText::new("失败").size(12.0).color(Self::danger()),
+                            );
                             if let Some(message) = &doc.parse_error_message {
                                 label.on_hover_text(message);
                             }
@@ -359,21 +367,30 @@ impl RsouApp {
                         ui.label(
                             egui::RichText::new(util::format_local_time(doc.updated_at))
                                 .size(12.0)
-                                .color(Self::muted()),
+                                .color(Self::text_secondary()),
                         );
                     });
                     row.col(|ui| {
                         ui.horizontal(|ui| {
-                            if link_button(ui, "打开") {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            if Self::link_button(ui, "打开").clicked() {
                                 action = Some(RowAction::Open(PathBuf::from(&doc.path)));
                             }
-                            if link_button(ui, "所在目录") {
+                            if Self::link_button(ui, "所在目录").clicked() {
                                 action = Some(RowAction::Reveal(PathBuf::from(&doc.path)));
                             }
-                            if ui.add_enabled(!busy, link("重解析")).clicked() {
+                            if ui
+                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重解析"))
+                                .inner
+                                .clicked()
+                            {
                                 action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
                             }
-                            if ui.add_enabled(!busy, link("移除")).clicked() {
+                            if ui
+                                .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
+                                .inner
+                                .clicked()
+                            {
                                 action = Some(RowAction::AskRemoveDocument(
                                     doc.id,
                                     doc.file_name.clone(),
@@ -395,86 +412,86 @@ impl RsouApp {
             .iter()
             .filter(|d| d.source_root.is_none())
             .count();
-        // 页签栏右侧显示当前页的规模;顺带把过滤与失败清单开关放在这一行——
-        // 它们作用于下面的列表,放在导入卡片里既不相关、切页签时也很跳。
+        // 页签栏右侧放过滤与失败清单开关:它们作用于下面的列表,
+        // 放在导入卡片里既不相关、切页签时也很跳。
         let hint = match self.library_tab {
             LibraryTab::Folders => format!("{folders} 个来源文件夹"),
             LibraryTab::Files => format!("{files} 篇单独添加"),
         };
-        // 先渲染页面内容需要的可变借用在闭包里发生,所以这里拆成两步:
-        // 先画页签栏(只读 self 的少量字段),再由 tabbed_work_panel 的内容闭包
-        // 调用页面渲染函数。
+        // 两个闭包(页签栏 / 内容)不能同时借 self。
+        // 过滤词在页签栏输入、内容区同帧就要读到:用 RefCell 让两个闭包共享
+        // 同一份文本;渲染结束后写回 self.doc_filter。
         let mut switch_to: Option<LibraryTab> = None;
         let current = self.library_tab;
-        // 两个闭包(页签栏 / 内容)都要可变访问 self,不能同时借。
-        // 页签栏只碰这三个字段,先取出来用,最后写回。
-        let mut doc_filter = std::mem::take(&mut self.doc_filter);
+        let doc_filter = std::cell::RefCell::new(std::mem::take(&mut self.doc_filter));
         let mut show_failures = self.show_failures;
-        Self::tabbed_work_panel(
+        Self::tabbed_card(
             ui,
-            "清单",
-            "已加入索引",
-            &hint,
-            None,
             |ui| {
-                ui.horizontal(|ui| {
-                    // 用自绘按钮而不是 egui 的 SelectableLabel:后者在本地主题
-                    // (全零圆角 + 自定色板)下选中态几乎看不出来。
-                    if tab_button(
+                ui.horizontal_wrapped(|ui| {
+                    if Self::tab_button(
                         ui,
                         &format!("已添加文件夹({folders})"),
                         current == LibraryTab::Folders,
                     ) {
                         switch_to = Some(LibraryTab::Folders);
                     }
-                    if tab_button(
+                    if Self::tab_button(
                         ui,
                         &format!("单独文件({files})"),
                         current == LibraryTab::Files,
                     ) {
                         switch_to = Some(LibraryTab::Files);
                     }
-                    // 过滤与失败清单开关靠右:它们作用于当前页签的列表。
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(hint)
+                            .size(12.0)
+                            .color(Self::text_muted()),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.checkbox(&mut show_failures, "显示失败清单");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut doc_filter)
-                                .desired_width(180.0)
-                                .hint_text("按文件名过滤"),
+                        Self::accent_checkbox(ui, &mut show_failures, "显示失败清单");
+                        Self::clearable_input(
+                            ui,
+                            &mut *doc_filter.borrow_mut(),
+                            160.0,
+                            "按文件名过滤",
                         );
                     });
                 });
             },
-            |ui| match current {
-                LibraryTab::Folders => self.ui_folder_tree(ui),
-                LibraryTab::Files => self.ui_documents_table(ui),
+            |ui| {
+                let filter = doc_filter.borrow();
+                match current {
+                    LibraryTab::Folders => self.ui_folder_tree(ui, &filter),
+                    LibraryTab::Files => self.ui_documents_table(ui, &filter),
+                }
             },
         );
-        self.doc_filter = doc_filter;
+        self.doc_filter = doc_filter.into_inner();
         self.show_failures = show_failures;
         if let Some(tab) = switch_to {
             self.library_tab = tab;
         }
     }
 
-    /// 文件夹页:树形展示「来源文件夹 → 文档」,文件夹可展开。
-    fn ui_folder_tree(&mut self, ui: &mut egui::Ui) {
+    /// 文件夹页:树形展示「来源文件夹 → 文档」,文件夹可展开。`filter` 为文件名过滤词。
+    fn ui_folder_tree(&mut self, ui: &mut egui::Ui, filter: &str) {
         if self.folder_groups.is_empty() {
             let loading = self.docs_loading;
-            ui.label(
-                egui::RichText::new(if loading {
+            Self::empty_note(
+                ui,
+                if loading {
                     "正在读取列表…"
                 } else {
                     "还没有添加过文件夹。点上方「添加文件夹」,导入后可在这里展开查看。"
-                })
-                .size(15.0)
-                .color(Self::muted()),
+                },
             );
             return;
         }
 
         let busy = self.import_active || self.maintenance_active;
-        let filter = self.doc_filter.trim().to_lowercase();
+        let filter = filter.trim().to_lowercase();
         // 先在闭包外把要用的东西取出来:闭包里要同时 &mut self(folder_expanded)
         // 与读 folder_groups,不能同时借。
         let groups: Vec<(String, Vec<DocumentRow>, usize)> = self
@@ -491,56 +508,72 @@ impl RsouApp {
             .filter(|(_, _, matched)| filter.is_empty() || *matched > 0)
             .collect();
 
+        // 过滤时自动展开有命中的文件夹,过滤清空后再收回为关。
+        // 只接管「原本没开」的节点(is_open != Some(true))并记下 id:
+        // 用户手动展开的不动不记;过滤中用户又关上的(已在名单里)不再强制开。
+        if !filter.is_empty() {
+            for (root, _, _) in &visible {
+                let id = LibraryNode::Folder(root.clone());
+                if self.filter_auto_opened.contains(&id)
+                    || self.library_tree_state.is_open(&id) == Some(true)
+                {
+                    continue;
+                }
+                self.library_tree_state.set_openness(id.clone(), true);
+                self.filter_auto_opened.push(id);
+            }
+        } else {
+            for id in self.filter_auto_opened.drain(..) {
+                self.library_tree_state.set_openness(id, false);
+            }
+        }
+
         let mut action: Option<RowAction> = None;
         let mut node_count = 0usize;
         if visible.is_empty() {
-            ui.label(
-                egui::RichText::new("没有匹配的文件名。")
-                    .size(14.0)
-                    .color(Self::muted()),
-            );
+            Self::empty_note(ui, "没有匹配的文件名。");
             return;
         }
         egui::ScrollArea::vertical()
-                .id_salt("rsou_folder_tree")
-                .max_height(360.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let state = &mut self.library_tree_state;
-                    let (_, tree_actions) = TreeView::new(ui.id().with("rsou-folder-tree"))
-                        .allow_multi_selection(false)
-                        .allow_drag_and_drop(false)
-                        .show_state(ui, state, |builder| {
-                            for (root, documents, matched) in &visible {
-                                let folder_id = LibraryNode::Folder(root.clone());
-                                // 目录节点:label 用闭包以便挂行内按钮。
-                                let root_owned = root.clone();
-                                let doc_count = documents.len();
-                                let matched = *matched;
-                                // 文件夹行的三个操作:定位 / 重解析 / 移除。
-                                // 挂在 label_ui 上(行内右侧),与文档行一致;
-                                // 点按钮不会触发树的选中/展开(已验证)。
-                                let folder_slot: std::rc::Rc<
-                                    std::cell::RefCell<Option<RowAction>>,
-                                > = std::rc::Rc::new(std::cell::RefCell::new(None));
-                                let folder_slot_in = folder_slot.clone();
-                                let root_for_reimport = root.clone();
-                                let root_for_reveal = root.clone();
-                                let root_for_remove = root.clone();
-                                let busy_here = busy;
-                                // 默认收起:文件多时一屏全是子项,反而看不出有哪几个
-                                // 文件夹。用户展开过后由树自带的跨帧状态记住。
-                                if builder.node(
-                                    NodeBuilder::dir(folder_id)
-                                        .default_open(false)
-                                        .label_ui(move |ui| {
+            .id_salt("rsou_folder_tree")
+            .max_height(360.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let state = &mut self.library_tree_state;
+                let (_, tree_actions) = TreeView::new(ui.id().with("rsou-folder-tree"))
+                    .allow_multi_selection(false)
+                    .allow_drag_and_drop(false)
+                    .show_state(ui, state, |builder| {
+                        for (root, documents, matched) in &visible {
+                            let folder_id = LibraryNode::Folder(root.clone());
+                            // 目录节点:label 用闭包以便挂行内按钮。
+                            let root_owned = root.clone();
+                            let doc_count = documents.len();
+                            let matched = *matched;
+                            // 文件夹行的三个操作:定位 / 重解析 / 移除。
+                            // 挂在 label_ui 上(行内右侧),与文档行一致;
+                            // 点按钮不会触发树的选中/展开(已验证)。
+                            let folder_slot: std::rc::Rc<
+                                std::cell::RefCell<Option<RowAction>>,
+                            > = std::rc::Rc::new(std::cell::RefCell::new(None));
+                            let folder_slot_in = folder_slot.clone();
+                            let root_for_reimport = root.clone();
+                            let root_for_reveal = root.clone();
+                            let root_for_remove = root.clone();
+                            let busy_here = busy;
+                            // 默认收起:文件多时一屏全是子项,反而看不出有哪几个
+                            // 文件夹。用户展开过后由树自带的跨帧状态记住。
+                            if builder.node(
+                                NodeBuilder::dir(folder_id)
+                                    .default_open(false)
+                                    .label_ui(move |ui| {
                                         ui.horizontal(|ui| {
                                             ui.label(
                                                 egui::RichText::new(format!(
                                                     "{root_owned}  ({matched}/{doc_count})"
                                                 ))
                                                 .size(13.0)
-                                                .color(RsouApp::ink()),
+                                                .color(RsouApp::text_primary()),
                                             );
                                             // 右侧三个操作。宽度有限的窗口里
                                             // 会挤,但树本身可横向滚动。
@@ -550,7 +583,10 @@ impl RsouApp {
                                                 ),
                                                 |ui| {
                                                     if ui
-                                                        .add_enabled(!busy_here, link("移除"))
+                                                        .add_enabled_ui(!busy_here, |ui| {
+                                                            RsouApp::danger_link_button(ui, "移除")
+                                                        })
+                                                        .inner
                                                         .on_hover_text(
                                                             "从索引移除该文件夹及其下全部文档(不动磁盘文件)",
                                                         )
@@ -563,10 +599,10 @@ impl RsouApp {
                                                             ));
                                                     }
                                                     if ui
-                                                        .add_enabled(
-                                                            !busy_here,
-                                                            link("重解析"),
-                                                        )
+                                                        .add_enabled_ui(!busy_here, |ui| {
+                                                            RsouApp::link_button(ui, "重解析")
+                                                        })
+                                                        .inner
                                                         .on_hover_text(
                                                             "强制重新解析该文件夹下的全部文档",
                                                         )
@@ -577,7 +613,7 @@ impl RsouApp {
                                                                 root_for_reimport.clone(),
                                                             ));
                                                     }
-                                                    if link_button(ui, "定位") {
+                                                    if RsouApp::link_button(ui, "定位").clicked() {
                                                         *folder_slot_in.borrow_mut() =
                                                             Some(RowAction::RevealFolder(
                                                                 root_for_reveal.clone(),
@@ -587,102 +623,109 @@ impl RsouApp {
                                             );
                                         });
                                     }),
-                                ) {
-                                    for document in documents {
-                                        // 过滤词下只展示命中的文档。
-                                        if !file_name_matches(&document.file_name, &filter) {
-                                            continue;
-                                        }
-                                        node_count += 1;
-                                        let id = document.id;
-                                        let name = document.file_name.clone();
-                                        let status_ok = document.parse_status == "parsed";
-                                        let busy_here = busy;
-                                        // label_ui 的闭包按值捕获,而闭包结束后还要读结果,
-                                        // 所以用 Rc<RefCell> 共享槽位。
-                                        let local: std::rc::Rc<std::cell::RefCell<Option<RowAction>>> =
-                                            std::rc::Rc::new(std::cell::RefCell::new(None));
-                                        let local_in = local.clone();
-                                        builder.node(
-                                            NodeBuilder::leaf(LibraryNode::Document(id))
-                                                .label_ui(move |ui| {
-                                                    // 行内:文件名 + 状态 + 按钮。
-                                                    // 按钮放在行的右侧;点按钮不会
-                                                    // 触发树的选择/展开(已验证)。
-                                                    ui.horizontal(|ui| {
-                                                        let color = if status_ok {
-                                                            RsouApp::ink()
-                                                        } else {
-                                                            RsouApp::amber()
-                                                        };
-                                                        ui.label(
-                                                            egui::RichText::new(&name)
-                                                                .size(13.0)
-                                                                .color(color),
-                                                        );
-                                                        if !status_ok {
-                                                            ui.label(
-                                                                egui::RichText::new("失败")
-                                                                    .size(11.0)
-                                                                    .color(RsouApp::amber()),
-                                                            );
-                                                        }
-                                                        ui.with_layout(
-                                                            egui::Layout::right_to_left(
-                                                                egui::Align::Center,
-                                                            ),
-                                                            |ui| {
-                                                                if ui
-                                                                    .add_enabled(
-                                                                        !busy_here,
-                                                                        link("移除"),
-                                                                    )
-                                                                    .clicked()
-                                                                {
-                                                                    *local_in.borrow_mut() = Some(
-                                                                        RowAction::AskRemoveDocument(
-                                                                            id,
-                                                                            name.clone(),
-                                                                        ),
-                                                                    );
-                                                                }
-                                                            },
-                                                        );
-                                                    });
-                                                }),
-                                        );
-                                        if let Some(a) = local.borrow_mut().take() {
-                                            action = Some(a);
-                                        }
+                            ) {
+                                for document in documents {
+                                    // 过滤词下只展示命中的文档。
+                                    if !file_name_matches(&document.file_name, &filter) {
+                                        continue;
                                     }
-                                    if let Some(a) = folder_slot.borrow_mut().take() {
+                                    node_count += 1;
+                                    let id = document.id;
+                                    let name = document.file_name.clone();
+                                    let status_ok = document.parse_status == "parsed";
+                                    let busy_here = busy;
+                                    // label_ui 的闭包按值捕获,而闭包结束后还要读结果,
+                                    // 所以用 Rc<RefCell> 共享槽位。
+                                    let local: std::rc::Rc<
+                                        std::cell::RefCell<Option<RowAction>>,
+                                    > = std::rc::Rc::new(std::cell::RefCell::new(None));
+                                    let local_in = local.clone();
+                                    builder.node(
+                                        NodeBuilder::leaf(LibraryNode::Document(id)).label_ui(
+                                            move |ui| {
+                                                // 行内:文件名 + 状态 + 按钮。
+                                                // 按钮放在行的右侧;点按钮不会
+                                                // 触发树的选择/展开(已验证)。
+                                                ui.horizontal(|ui| {
+                                                    let color = if status_ok {
+                                                        RsouApp::text_primary()
+                                                    } else {
+                                                        RsouApp::danger()
+                                                    };
+                                                    ui.label(
+                                                        egui::RichText::new(&name)
+                                                            .size(13.0)
+                                                            .color(color),
+                                                    );
+                                                    if !status_ok {
+                                                        ui.label(
+                                                            egui::RichText::new("失败")
+                                                                .size(11.0)
+                                                                .color(RsouApp::danger()),
+                                                        );
+                                                    }
+                                                    ui.with_layout(
+                                                        egui::Layout::right_to_left(
+                                                            egui::Align::Center,
+                                                        ),
+                                                        |ui| {
+                                                            if ui
+                                                                .add_enabled_ui(
+                                                                    !busy_here,
+                                                                    |ui| {
+                                                                        RsouApp::danger_link_button(
+                                                                            ui, "移除",
+                                                                        )
+                                                                    },
+                                                                )
+                                                                .inner
+                                                                .clicked()
+                                                            {
+                                                                *local_in.borrow_mut() = Some(
+                                                                    RowAction::AskRemoveDocument(
+                                                                        id,
+                                                                        name.clone(),
+                                                                    ),
+                                                                );
+                                                            }
+                                                        },
+                                                    );
+                                                });
+                                            },
+                                        ),
+                                    );
+                                    if let Some(a) = local.borrow_mut().take() {
                                         action = Some(a);
                                     }
-                                    builder.close_dir();
-                                } else if let Some(a) = folder_slot.borrow_mut().take() {
-                                    // 折叠状态下点按钮:label_ui 仍会渲染,
-                                    // 这里同样要取出动作。
+                                }
+                                if let Some(a) = folder_slot.borrow_mut().take() {
                                     action = Some(a);
                                 }
+                                builder.close_dir();
+                            } else if let Some(a) = folder_slot.borrow_mut().take() {
+                                // 折叠状态下点按钮:label_ui 仍会渲染,
+                                // 这里同样要取出动作。
+                                action = Some(a);
                             }
-                        });
-                    // 树自带的 Action:双击/回车激活 = 打开文件。
-                    for tree_action in tree_actions {
-                        if let TreeAction::Activate(activate) = tree_action {
-                            for node in activate.selected {
-                                if let LibraryNode::Document(id) = node
-                                    && let Some(document) = self
-                                        .folder_groups
-                                        .iter()
-                                        .flat_map(|g| g.documents.iter())
-                                        .find(|d| d.id == id)
-                                {
-                                    action = Some(RowAction::Open(PathBuf::from(&document.path)));
-                                }
+                        }
+                    });
+                // 树自带的 Action:双击/回车激活 = 打开文件。
+                for tree_action in tree_actions {
+                    if let TreeAction::Activate(activate) = tree_action {
+                        for node in activate.selected {
+                            if let LibraryNode::Document(id) = node
+                                && let Some(document) = self
+                                    .folder_groups
+                                    .iter()
+                                    .flat_map(|g| g.documents.iter())
+                                    .find(|d| d.id == id)
+                            {
+                                action = Some(RowAction::Open(PathBuf::from(&document.path)));
                             }
                         }
                     }
-                });
+                }
+            });
         let _ = node_count;
         self.apply_row_action(ui, action);
     }
@@ -724,82 +767,62 @@ impl RsouApp {
     fn ui_failures_drawer(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<RowAction> = None;
         let busy = self.import_active || self.maintenance_active;
-        Self::work_panel(
-            ui,
-            "失败",
-            "失败清单",
-            &format!("{} 个文件", self.failed_documents.len()),
-            None,
-            |ui| {
-                if self.failed_documents.is_empty() {
-                    ui.label(
-                        egui::RichText::new("没有失败的文档。")
-                            .size(14.0)
-                            .color(Self::muted()),
-                    );
-                    return;
-                }
-                for doc in &self.failed_documents {
-                    ui.horizontal(|ui| {
-                        ui.label(
+        Self::card(ui, |ui| {
+            ui.horizontal(|ui| {
+                Self::card_title(ui, "失败清单");
+                ui.label(
+                    egui::RichText::new(format!("{} 个文件", self.failed_documents.len()))
+                        .size(12.0)
+                        .color(Self::text_muted()),
+                );
+            });
+            Self::thin_divider(ui);
+            if self.failed_documents.is_empty() {
+                Self::empty_note(ui, "没有失败的文档。");
+                return;
+            }
+            for doc in &self.failed_documents {
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::Label::new(
                             egui::RichText::new(&doc.file_name)
                                 .size(13.0)
                                 .strong()
-                                .color(Self::ink()),
+                                .color(Self::text_primary()),
                         )
-                        .on_hover_text(&doc.path);
-                        ui.label(
-                            egui::RichText::new(
-                                doc.parse_error_message.as_deref().unwrap_or("解析失败"),
-                            )
-                            .size(12.0)
-                            .color(Self::amber()),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(!busy, link("移除")).clicked() {
-                                action = Some(RowAction::AskRemoveDocument(
-                                    doc.id,
-                                    doc.file_name.clone(),
-                                ));
-                            }
-                            if ui.add_enabled(!busy, link("重试")).clicked() {
-                                action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
-                            }
-                        });
+                        .truncate(),
+                    )
+                    .on_hover_text(&doc.path);
+                    ui.label(
+                        egui::RichText::new(
+                            doc.parse_error_message.as_deref().unwrap_or("解析失败"),
+                        )
+                        .size(12.0)
+                        .color(Self::warning()),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
+                            .inner
+                            .clicked()
+                        {
+                            action =
+                                Some(RowAction::AskRemoveDocument(doc.id, doc.file_name.clone()));
+                        }
+                        if ui
+                            .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重试"))
+                            .inner
+                            .clicked()
+                        {
+                            action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
+                        }
                     });
-                    ui.add_space(2.0);
-                }
-            },
-        );
+                });
+                ui.add_space(4.0);
+            }
+        });
         self.apply_row_action(ui, action);
     }
-}
-
-/// 行内文字按钮(不强调)。
-fn link(text: &str) -> egui::Button<'_> {
-    egui::Button::new(egui::RichText::new(text).size(12.0).color(RsouApp::blue())).frame(false)
-}
-
-fn link_button(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add(link(text)).clicked()
-}
-
-/// 页签按钮:选中态用蓝底白字,未选中是素面。
-///
-/// 不用 `SelectableLabel`:本地主题把圆角与描边都置零,选中态几乎看不出来。
-fn tab_button(ui: &mut egui::Ui, text: &str, selected: bool) -> bool {
-    let (fill, text_color) = if selected {
-        (RsouApp::blue(), Color32::WHITE)
-    } else {
-        (RsouApp::surface(), RsouApp::muted())
-    };
-    ui.add(
-        egui::Button::new(egui::RichText::new(text).size(13.0).color(text_color))
-            .fill(fill)
-            .stroke(egui::Stroke::new(1.0, RsouApp::line()))
-            .min_size(egui::vec2(0.0, 28.0)),
-    )
-    .clicked()
 }
 
 #[cfg(test)]
@@ -844,15 +867,16 @@ mod tests {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if link_button(ui, "移除") {
+                                                    if RsouApp::link_button(ui, "移除").clicked()
+                                                    {
                                                         *slot_in.borrow_mut() =
                                                             Some(RowAction::AskRemoveFolder(
                                                                 root.clone(),
                                                                 count,
                                                             ));
                                                     }
-                                                    let _ = link_button(ui, "重解析");
-                                                    let _ = link_button(ui, "定位");
+                                                    let _ = RsouApp::link_button(ui, "重解析");
+                                                    let _ = RsouApp::link_button(ui, "定位");
                                                 },
                                             );
                                         });
@@ -866,7 +890,9 @@ mod tests {
                                                 .label_ui(move |ui| {
                                                     ui.horizontal(|ui| {
                                                         ui.label(name.clone());
-                                                        if link_button(ui, "移除") {
+                                                        if RsouApp::link_button(ui, "移除")
+                                                            .clicked()
+                                                        {
                                                             // 与生产代码同构:写槽位。
                                                         }
                                                     });
@@ -1085,12 +1111,8 @@ mod tests {
         for _ in 0..3 {
             let mut out = ctx.run_ui(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    crate::app::RsouApp::tabbed_work_panel(
+                    crate::app::RsouApp::tabbed_card(
                         ui,
-                        "清单",
-                        "已加入索引",
-                        "1 个来源文件夹",
-                        None,
                         |ui| {
                             ui.horizontal(|ui| {
                                 let r = ui.add(egui::Button::new("已添加文件夹(1)"));
@@ -1110,7 +1132,7 @@ mod tests {
             out.textures_delta.clear();
         }
         let gap = content_top.get() - tab_bottom.get();
-        // 页签栏下内边距(0)+ 分隔线 + 内容上内边距(4)≈ 十几像素。
+        // 全宽分隔线(1px)+ 内容上内边距(14px)≈ 15px。
         // 旧的两卡片结构是 ~40。阈值取 24:足够宽松地容忍样式微调,
         // 又能把「又变回两张卡片」这种回归挡住。
         assert!(
@@ -1121,22 +1143,18 @@ mod tests {
 
     #[test]
     fn tabbed_panel_renders_without_panic() {
-        // tabbed_work_panel 是新增的布局代码(页签栏 + 全宽分隔线 + 内容),
+        // tabbed_card 是自绘布局代码(页签栏 + 全宽分隔线 + 内容),
         // 负尺寸矩形/内边距算错都会 panic。空跑几帧兜底。
         let ctx = egui::Context::default();
         for _ in 0..3 {
             let mut out = ctx.run_ui(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    crate::app::RsouApp::tabbed_work_panel(
+                    crate::app::RsouApp::tabbed_card(
                         ui,
-                        "清单",
-                        "已加入索引",
-                        "1 个来源文件夹",
-                        None,
                         |ui| {
                             ui.horizontal(|ui| {
-                                let _ = tab_button(ui, "已添加文件夹(1)", true);
-                                let _ = tab_button(ui, "单独文件(0)", false);
+                                let _ = RsouApp::tab_button(ui, "已添加文件夹(1)", true);
+                                let _ = RsouApp::tab_button(ui, "单独文件(0)", false);
                             });
                         },
                         |ui| {
