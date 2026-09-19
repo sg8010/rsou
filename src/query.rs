@@ -1,7 +1,7 @@
 //! 检索查询语法:词法 + 递归下降 → FTS5 MATCH 表达式。
 //!
-//! 语法逐条照搬 wsou `src/core/search/query-parser.ts`,去掉 NEAR 与同义词
-//! 展开(本应用没有同义词表;宽松模式的分词替代 `cut` 回调):
+//! 语法逐条照搬 wsou `src/core/search/query-parser.ts`,去掉 NEAR(宽松模式的
+//! 分词与用户同义词组替代了它的 `cut` 回调与同义词展开):
 //! - 空白分隔;`( ) : , -` 单字符 token;`'`/`"` 引号短语(未闭合/空短语报错);
 //! - 单词在 `\s():,'"-` 处结束;纯数字是 number;AND/OR/NOT 大小写不敏感;
 //! - `title:`/`content:` 字段前缀(未知字段报错);相邻条件隐式 AND;
@@ -9,9 +9,11 @@
 //! - 词/短语里出现 `*` 或 `"` 报错;超过 MAX_QUERY_CHARS 报错。
 //!
 //! 编译产物与 ts 有一处刻意差异:单词项不再无条件套括号(`("x")`→`"x"`),
-//! 只有宽松模式切出多段时才写成 `("s1" AND "s2")`,产物更可读且语义等价。
+//! 只有切出多段或命中同义词组时才写成 `(…)`,产物更可读且语义等价。
 
 use std::collections::HashSet;
+
+use crate::dict;
 
 /// 默认检索字段(查询里显式 `title:`/`content:` 总是优先)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -347,19 +349,11 @@ fn quote(value: &str) -> Result<String, QueryError> {
     Ok(format!("\"{}\"", value.replace('"', "\"\"")))
 }
 
-/// 宽松模式的中文分词:jieba(编译期词典);无 jieba feature 时退化为整词。
+/// 宽松模式的中文分词:jieba 内置词典 + 用户词典(见 [`crate::dict`]);
+/// 无 jieba feature 时退化为整词。
 #[cfg(feature = "jieba")]
 pub fn cut_loose(term: &str) -> Vec<String> {
-    use std::sync::OnceLock;
-    static JIEBA: OnceLock<jieba_rs::Jieba> = OnceLock::new();
-    JIEBA
-        .get_or_init(jieba_rs::Jieba::new)
-        .cut(term, false)
-        .into_iter()
-        .map(|token| token.word)
-        .filter(|part| !part.trim().is_empty())
-        .map(str::to_owned)
-        .collect()
+    dict::cut_loose(term)
 }
 
 /// 无 jieba feature:宽松模式退化为精确模式(不报错)。
@@ -368,11 +362,92 @@ pub fn cut_loose(term: &str) -> Vec<String> {
     vec![term.to_owned()]
 }
 
+/// 把一个词项切成若干片段、再各自扩展成同义变体组的策略。
+#[derive(Clone, Copy)]
+struct TermCut {
+    /// 精确 = 整词一段;宽松 = jieba 切段
+    cut: fn(&str) -> Vec<String>,
+    /// 正向展开同义词;[`Self::excluding`] 将排除侧设为 [`identity`]
+    expand: fn(&str) -> Vec<String>,
+}
+
+/// 恒等:精确模式的切分,以及排除侧的同义词扩展。
+fn identity(term: &str) -> Vec<String> {
+    vec![term.to_owned()]
+}
+
+impl TermCut {
+    /// 排除侧策略:切词照旧,同义词不展开。
+    ///
+    /// 正向漏召回只是少几条结果,负向误杀却更难察觉,所以宁可保守。
+    fn excluding(self) -> Self {
+        Self {
+            expand: identity,
+            ..self
+        }
+    }
+}
+
+/// 编译期累积的字面量与配额。
+#[derive(Default)]
+struct Accumulator {
+    /// 全部正向条件的字面量:短语取原文,词在宽松模式下是切出的各段与同义变体;
+    /// 去重并保持出现顺序
+    literals: Vec<String>,
+    seen: HashSet<String>,
+    /// 同义词**额外**展开出的变体数(用户自己写进查询的词不占配额)
+    extra: usize,
+}
+
+impl Accumulator {
+    fn push_literal(&mut self, value: &str) {
+        if self.seen.insert(value.to_owned()) {
+            self.literals.push(value.to_owned());
+        }
+    }
+
+    /// 把词项扩展成同义变体组并计入配额;不在词典里时是只含自身的单元素组。
+    fn variants_of(&mut self, text: &str, term_cut: TermCut) -> Result<Vec<String>, QueryError> {
+        let mut variants = (term_cut.expand)(text);
+        if variants.is_empty() {
+            variants.push(text.to_owned());
+        }
+        self.extra += variants.len() - 1;
+        if self.extra > dict::MAX_EXTRA_VARIANTS {
+            return syntax("同义词展开后条件过多,请精简词典");
+        }
+        Ok(variants)
+    }
+}
+
+/// 把一组变体编译成不带字段前缀的 FTS5 条件:单个直接引用,多个用 OR 括起。
+fn compile_variants(variants: &[String]) -> Result<String, QueryError> {
+    if variants.len() == 1 {
+        return quote(&variants[0]);
+    }
+    let mut quoted = Vec::with_capacity(variants.len());
+    for variant in variants {
+        quoted.push(quote(variant)?);
+    }
+    Ok(format!("({})", quoted.join(" OR ")))
+}
+
 /// 把查询编译成 FTS5 MATCH 表达式。
 ///
 /// `loose = true` 时单词项经 `cut_loose` 切段,各段 AND 连接;`loose = false`
-/// 时整词作为一个短语。`literals` 收集全部正向条件的字面量(去重、保序)。
+/// 时整词作为一个短语。正向条件的字面量收集进 [`CompiledQuery::literals`]
+/// (去重、保序);排除侧既不展开同义词也不收集字面量。
 pub fn compile(input: &str, scope: Scope, loose: bool) -> Result<CompiledQuery, QueryError> {
+    compile_with(input, scope, loose, dict::expand)
+}
+
+/// 同 [`compile`],但同义词扩展由调用方提供(单测用独立词典,不碰全局状态)。
+fn compile_with(
+    input: &str,
+    scope: Scope,
+    loose: bool,
+    expand: fn(&str) -> Vec<String>,
+) -> Result<CompiledQuery, QueryError> {
     if input.chars().count() > MAX_QUERY_CHARS {
         return syntax("查询过长");
     }
@@ -388,50 +463,24 @@ pub fn compile(input: &str, scope: Scope, loose: bool) -> Result<CompiledQuery, 
         Scope::Title => Some(Field::Title),
         Scope::Content => Some(Field::Content),
     };
-    let cut: fn(&str) -> Vec<String> = if loose {
-        cut_loose
-    } else {
-        |term| vec![term.to_owned()]
-    };
-    let mut literals: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut positive = false;
+    let cut: fn(&str) -> Vec<String> = if loose { cut_loose } else { identity };
+    let term_cut = TermCut { cut, expand };
+    let mut accumulator = Accumulator::default();
 
-    let match_expr = compile_node(
-        &ast,
-        None,
-        default_field,
-        cut,
-        true,
-        &mut literals,
-        &mut seen,
-        &mut positive,
-    )?;
-    if !positive {
-        return syntax("查询必须包含至少一个正向条件");
-    }
+    let match_expr = compile_node(&ast, None, default_field, term_cut, true, &mut accumulator)?;
     Ok(CompiledQuery {
         match_expr,
-        literals,
+        literals: accumulator.literals,
     })
 }
 
-fn push_literal(literals: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
-    if seen.insert(value.to_owned()) {
-        literals.push(value.to_owned());
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
 fn compile_node(
     node: &Node,
     inherited: Option<Field>,
     default_field: Option<Field>,
-    cut: fn(&str) -> Vec<String>,
+    term_cut: TermCut,
     positive_ctx: bool,
-    literals: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    positive: &mut bool,
+    accumulator: &mut Accumulator,
 ) -> Result<String, QueryError> {
     match node {
         Node::Not(child) => Ok(format!(
@@ -440,11 +489,9 @@ fn compile_node(
                 child,
                 inherited,
                 default_field,
-                cut,
+                term_cut.excluding(),
                 false,
-                literals,
-                seen,
-                positive
+                accumulator
             )?
         )),
         Node::And(left, right) | Node::Or(left, right) => {
@@ -457,26 +504,24 @@ fn compile_node(
                     right,
                     inherited,
                     default_field,
-                    cut,
+                    term_cut,
                     positive_ctx,
-                    literals,
-                    seen,
-                    positive,
+                    accumulator,
                 )?;
-                let excluded = compile_exclusion(left, inherited, default_field, cut)?;
+                let excluded = compile_exclusion(left, inherited, default_field, term_cut)?;
                 return Ok(format!("({right_expr} NOT {excluded})"));
             }
             let left_expr = compile_node(
                 left,
                 inherited,
                 default_field,
-                cut,
+                term_cut,
                 positive_ctx,
-                literals,
-                seen,
-                positive,
+                accumulator,
             )?;
             // `x AND NOT y` → `(x NOT y)`。
+            //
+            // 这条分支不走 `compile_exclusion`,所以要自己把排除侧策略换掉。
             if let Node::Not(child) = right.as_ref()
                 && matches!(node, Node::And(..))
             {
@@ -484,11 +529,9 @@ fn compile_node(
                     child,
                     inherited,
                     default_field,
-                    cut,
+                    term_cut.excluding(),
                     false,
-                    literals,
-                    seen,
-                    positive,
+                    accumulator,
                 )?;
                 return Ok(format!("({left_expr} NOT {right_expr})"));
             }
@@ -496,11 +539,9 @@ fn compile_node(
                 right,
                 inherited,
                 default_field,
-                cut,
+                term_cut,
                 positive_ctx,
-                literals,
-                seen,
-                positive,
+                accumulator,
             )?;
             let op = if matches!(node, Node::Or(..)) {
                 "OR"
@@ -510,39 +551,42 @@ fn compile_node(
             Ok(format!("({left_expr} {op} {right_expr})"))
         }
         Node::Phrase { text, field } => {
-            *positive = true;
             let field = field.or(inherited).or(default_field);
+            // 短语也查一次同义词表:组里写的若是整条短语,它同样能带出变体。
+            let variants = accumulator.variants_of(text, term_cut)?;
             if positive_ctx {
-                push_literal(literals, seen, text);
+                for variant in &variants {
+                    accumulator.push_literal(variant);
+                }
             }
             Ok(format!(
                 "{}{}",
                 field.map(Field::prefix).unwrap_or(""),
-                quote(text)?
+                compile_variants(&variants)?
             ))
         }
         Node::Term { text, field } => {
-            *positive = true;
             let field = field.or(inherited).or(default_field);
-            let mut pieces = cut(text);
+            let mut pieces = (term_cut.cut)(text);
             pieces.retain(|part| !part.is_empty());
             if pieces.is_empty() {
                 return syntax("普通词无法分词");
             }
-            if positive_ctx {
-                for piece in &pieces {
-                    push_literal(literals, seen, piece);
-                }
-            }
-            let mut quoted = Vec::with_capacity(pieces.len());
+            // 段内是「同义词 OR」,段间是 AND:多段时整体仍要套一层括号。
+            let mut parts = Vec::with_capacity(pieces.len());
             for piece in &pieces {
-                quoted.push(quote(piece)?);
+                let variants = accumulator.variants_of(piece, term_cut)?;
+                if positive_ctx {
+                    for variant in &variants {
+                        accumulator.push_literal(variant);
+                    }
+                }
+                parts.push(compile_variants(&variants)?);
             }
-            let body = quoted.join(" AND ");
-            let body = if pieces.len() == 1 {
-                body
+            let body = if parts.len() == 1 {
+                parts.pop().expect("刚判过长度为 1")
             } else {
-                format!("({body})")
+                format!("({})", parts.join(" AND "))
             };
             Ok(format!(
                 "{}{}",
@@ -554,14 +598,18 @@ fn compile_node(
 }
 
 /// 排除侧(AND NOT 的右侧)编译:内部不再区分正负,按原样结构展开。
+///
+/// 同义词在排除侧**不展开**(换成 [`TermCut::excluding`]),宽松模式的 jieba
+/// 切词保持原样。
 fn compile_exclusion(
     node: &Node,
     inherited: Option<Field>,
     default_field: Option<Field>,
-    cut: fn(&str) -> Vec<String>,
+    term_cut: TermCut,
 ) -> Result<String, QueryError> {
+    let term_cut = term_cut.excluding();
     match node {
-        Node::Not(child) => compile_exclusion(child, inherited, default_field, cut),
+        Node::Not(child) => compile_exclusion(child, inherited, default_field, term_cut),
         Node::And(left, right) | Node::Or(left, right) => {
             let op = if matches!(node, Node::Or(..)) {
                 "OR"
@@ -570,23 +618,20 @@ fn compile_exclusion(
             };
             Ok(format!(
                 "({} {op} {})",
-                compile_exclusion(left, inherited, default_field, cut)?,
-                compile_exclusion(right, inherited, default_field, cut)?
+                compile_exclusion(left, inherited, default_field, term_cut)?,
+                compile_exclusion(right, inherited, default_field, term_cut)?
             ))
         }
         leaf => {
-            let mut literals = Vec::new();
-            let mut seen = HashSet::new();
-            let mut positive = false;
+            // 排除侧不收集字面量,这里的累积器只是 `compile_node` 需要的载体。
+            let mut accumulator = Accumulator::default();
             compile_node(
                 leaf,
                 inherited,
                 default_field,
-                cut,
+                term_cut,
                 false,
-                &mut literals,
-                &mut seen,
-                &mut positive,
+                &mut accumulator,
             )
         }
     }
@@ -709,5 +754,104 @@ mod tests {
         // 精确模式不切段。
         let exact = compile("文档管理系统", Scope::All, false).unwrap();
         assert_eq!(exact.match_expr, "\"文档管理系统\"");
+    }
+
+    // ---------- 同义词展开 ----------
+    //
+    // 用 `compile_with` 注入固定词典,不碰 `dict` 的全局状态——测试并行跑,
+    // 往全局表里写会让别处的期望值随机失败。
+
+    /// 测试词典:`fn` 指针不能捕获上下文,所以放在静态表里。
+    static TEST_GROUPS: &[&[&str]] = &[&["电脑", "计算机", "PC"], &["文档", "文件"]];
+
+    fn test_expand(term: &str) -> Vec<String> {
+        for group in TEST_GROUPS {
+            if group.iter().any(|member| member.eq_ignore_ascii_case(term)) {
+                return group.iter().map(|member| (*member).to_owned()).collect();
+            }
+        }
+        vec![term.to_owned()]
+    }
+
+    #[test]
+    fn synonyms_expand_terms_into_or_groups() {
+        let query = compile_with("电脑", Scope::All, false, test_expand).unwrap();
+        assert_eq!(query.match_expr, "(\"电脑\" OR \"计算机\" OR \"PC\")");
+        // 扁平 OR:每个变体都是二次过滤认可的字面量。
+        assert_eq!(query.literals, ["电脑", "计算机", "PC"]);
+    }
+
+    #[test]
+    fn synonyms_apply_in_exact_mode_and_leave_plain_terms_alone() {
+        // 精确模式同样展开:同义词与切词粒度无关。
+        assert_eq!(
+            compile_with("文件", Scope::All, false, test_expand)
+                .unwrap()
+                .match_expr,
+            "(\"文档\" OR \"文件\")"
+        );
+        // 不在词典里的词项保持改动前的产物形态,不多套括号。
+        let plain = compile_with("合同", Scope::All, false, test_expand).unwrap();
+        assert_eq!(plain.match_expr, "\"合同\"");
+        assert_eq!(plain.literals, ["合同"]);
+    }
+
+    #[test]
+    fn quoted_phrases_expand_too() {
+        assert_eq!(
+            compile_with("\"文档\"", Scope::All, false, test_expand)
+                .unwrap()
+                .match_expr,
+            "(\"文档\" OR \"文件\")"
+        );
+        // 整条短语不在任何组里时原样保留。
+        assert_eq!(
+            compile_with("\"文档 管理\"", Scope::All, false, test_expand)
+                .unwrap()
+                .match_expr,
+            "\"文档 管理\""
+        );
+    }
+
+    #[test]
+    fn exclusions_do_not_expand_synonyms() {
+        let query = compile_with("文档 -电脑", Scope::All, false, test_expand).unwrap();
+        // 排除侧只排字面「电脑」,不排「计算机」/「PC」。
+        assert_eq!(query.match_expr, "((\"文档\" OR \"文件\") NOT \"电脑\")");
+        assert_eq!(query.literals, ["文档", "文件"]);
+    }
+
+    #[test]
+    fn synonym_expansion_is_capped() {
+        let input = std::iter::repeat_n("电脑", 40)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error = compile_with(&input, Scope::All, false, test_expand).unwrap_err();
+        assert!(error.0.contains("同义词展开后条件过多"), "{error}");
+        assert!(compile_with("电脑 合同", Scope::All, false, test_expand).is_ok());
+    }
+
+    /// 展开出来的 OR 组要能被真正的 FTS5 接受(尤其带字段前缀的形态)。
+    #[test]
+    fn expanded_groups_run_against_fts5() {
+        let conn = crate::store::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO documents_fts(rowid, title, content) VALUES \
+             (1, '计算机采购', '正文'), (2, '电脑采购', '正文'), (3, '无关', '正文')",
+            [],
+        )
+        .unwrap();
+        for scope in [Scope::All, Scope::Title] {
+            let query = compile_with("电脑", scope, false, test_expand).unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
+                    [&query.match_expr],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|error| panic!("{:?} 的产物被 FTS5 拒绝: {error}", scope));
+            // 组里的「计算机」也命中,所以两篇都在。
+            assert_eq!(count, 2, "scope={scope:?} expr={}", query.match_expr);
+        }
     }
 }

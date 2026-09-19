@@ -4,6 +4,7 @@
 //! `store::open` 打开索引库,保证自定义 FTS5 tokenizer 的注册只有一个入口。
 
 pub mod chunk;
+pub mod dict;
 pub mod filebrowser;
 pub mod import;
 pub mod maintain;

@@ -23,6 +23,7 @@ use std::sync::mpsc::Receiver;
 use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
+use rsou_lib::dict::DictReport;
 use rsou_lib::import::ImportEvent;
 use rsou_lib::maintain::IndexStats;
 use rsou_lib::query::Scope;
@@ -360,6 +361,13 @@ pub struct RsouApp {
     settings_notice: Option<String>,
     /// 单文件体积上限(MB;settings.max_file_mb,设置页 DragValue)
     max_file_mb: u64,
+    /// 最近一次用户词典加载结果(启动时与设置页「重新加载」时更新)
+    dict_report: DictReport,
+    /// 词典卡片的两个「快速添加」输入框(用户词 / 同义词组)
+    dict_user_word_input: String,
+    dict_synonym_input: String,
+    /// 词典卡片的操作提示(与数据位置卡片的提示分开显示)
+    dict_notice: Option<String>,
     /// 已点击待处理的对话框请求(帧末统一处理)
     pending_dialog: Option<DialogRequest>,
     /// 待二次确认的危险操作(选中后弹确认框;None = 没有)
@@ -440,6 +448,10 @@ impl RsouApp {
             confirm_clear: false,
             settings_notice: None,
             max_file_mb: rsou_lib::repo::DEFAULT_MAX_FILE_MB,
+            dict_report: DictReport::default(),
+            dict_user_word_input: String::new(),
+            dict_synonym_input: String::new(),
+            dict_notice: None,
             pending_dialog: None,
             pending_confirm: None,
             #[cfg(target_os = "linux")]

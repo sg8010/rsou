@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use rsou_lib::dict;
 use rsou_lib::import::{self, FileOutcome, ImportEvent, ImportOptions};
 use rsou_lib::maintain;
 use rsou_lib::query::Scope;
@@ -310,6 +311,20 @@ fn cmd_text(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// 加载词典并报告格式问题。
+///
+/// 数据目录按库文件所在目录反推:`--db` 未指定时那本就是应用数据目录,
+/// 指定时词典跟在库旁边,与界面里把两个文件放在 `data_dir` 的约定一致。
+fn load_dict(db_path: &Path) {
+    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let report = dict::load(dir);
+    for file in [&report.user_words, &report.synonyms] {
+        for problem in &file.problems {
+            eprintln!("警告: 词典 {} {}", file.path.display(), problem);
+        }
+    }
+}
+
 /// search:只读连接跑 search::search,每篇打印标题/路径/命中数与【】高亮片段。
 fn cmd_search(
     db_path: &Path,
@@ -345,6 +360,8 @@ fn cmd_search(
         .unwrap_or(100);
 
     let conn = store::open(db_path, OpenMode::ReadOnly)?;
+    // 词典与 GUI 共用一套加载路径:不加载的话同一个查询在两边会给出不同结果。
+    load_dict(db_path);
     let response = search::search(
         &conn,
         &SearchRequest {

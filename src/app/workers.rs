@@ -7,6 +7,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use rsou_lib::dict;
 use rsou_lib::import::{self, FileOutcome, ImportOptions};
 use rsou_lib::maintain;
 use rsou_lib::repo;
@@ -29,8 +30,9 @@ impl RsouApp {
         app
     }
 
-    /// 读 settings 里的用户配置(当前只有单文件体积上限)。
+    /// 读 settings 里的用户配置,并加载数据目录下的用户词典。
     fn load_settings(&mut self) {
+        self.reload_dict();
         let Some(conn) = &self.db else { return };
         self.max_file_mb = repo::get_setting(conn, "max_file_mb")
             .ok()
@@ -38,6 +40,20 @@ impl RsouApp {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|mb| (1..=repo::MAX_FILE_MB_LIMIT).contains(mb))
             .unwrap_or(repo::DEFAULT_MAX_FILE_MB);
+    }
+
+    /// 加载 / 重新加载用户词典(启动与设置页「重新加载」都走这里)。
+    ///
+    /// 词典只在查询期生效,重载后不需要重建索引;但**当前展示的检索结果是旧
+    /// 词典算出来的**,调用方要自己重跑检索。
+    pub(crate) fn reload_dict(&mut self) {
+        let report = dict::load(&self.dirs.data_dir);
+        for file in [&report.user_words, &report.synonyms] {
+            for problem in &file.problems {
+                log::warn!("用户词典 {} {}", file.path.display(), problem);
+            }
+        }
+        self.dict_report = report;
     }
 
     /// 设置页 DragValue 变更时持久化(GUI 连接的零散小写)。
