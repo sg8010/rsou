@@ -161,6 +161,7 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
             )
             .context("写入 schema_version 失败")?;
     }
+    crate::repo::prune_import_history(connection, crate::repo::now_ms())?;
     Ok(())
 }
 
@@ -310,12 +311,14 @@ CREATE TABLE IF NOT EXISTS import_items (
 
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
 
-CREATE INDEX IF NOT EXISTS idx_documents_canonical_path ON documents(canonical_path);
+-- 同版本存量库也清除闲置或被 UNIQUE 前缀覆盖的索引。
+DROP INDEX IF EXISTS idx_documents_canonical_path;
+DROP INDEX IF EXISTS idx_chunks_document_id;
+DROP INDEX IF EXISTS idx_import_items_run_status;
+
 -- 资料库页按 source_root 分页签/建树,加索引避免每次全表扫。
 CREATE INDEX IF NOT EXISTS idx_documents_source_root ON documents(source_root);
 CREATE INDEX IF NOT EXISTS idx_documents_parse_status ON documents(parse_status);
-CREATE INDEX IF NOT EXISTS idx_chunks_document_id ON chunks(document_id);
-CREATE INDEX IF NOT EXISTS idx_import_items_run_status ON import_items(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_import_items_document_id ON import_items(document_id);
 ";
 
@@ -385,6 +388,99 @@ mod tests {
                 )
                 .unwrap();
             assert!(exists, "应创建 idx_import_items_document_id 索引");
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    fn assert_required_indexes_only(connection: &Connection) {
+        let mut statement = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_%' ORDER BY name")
+            .unwrap();
+        let names: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            names,
+            [
+                "idx_documents_parse_status",
+                "idx_documents_source_root",
+                "idx_import_items_document_id"
+            ]
+        );
+    }
+
+    #[test]
+    fn new_database_omits_unused_indexes() {
+        assert_required_indexes_only(&open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn existing_v3_database_drops_unused_indexes_without_losing_data() {
+        let path = temp_db("drop-unused-indexes");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE INDEX idx_documents_canonical_path ON documents(canonical_path);
+                     CREATE INDEX idx_chunks_document_id ON chunks(document_id);
+                     CREATE INDEX idx_import_items_run_status ON import_items(run_id, status);
+                     INSERT INTO documents(id, path, canonical_path, file_name, ext, file_type,
+                         file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at)
+                         VALUES (1, '/a.txt', '/a.txt', 'a.txt', 'txt', 'text', 1, 1, 'h', 'parsed', 1, 1);
+                     INSERT INTO document_contents(document_id, markdown, plain_text)
+                         VALUES (1, '# 正文', '正文');
+                     INSERT INTO chunks(document_id, chunk_index, start_offset, end_offset)
+                         VALUES (1, 0, 0, 6);
+                     INSERT INTO documents_fts(rowid, title, content) VALUES (1, 'a', '正文');
+                     INSERT INTO import_runs(id, kind, status, started_at) VALUES (1, 'files', 'running', 1);
+                     INSERT INTO import_items(run_id, path, status, document_id, updated_at)
+                         VALUES (1, '/a.txt', 'ok', 1, 1);",
+                )
+                .unwrap();
+        }
+        // 只读打开不能修改旧库的索引。
+        {
+            let connection = open(&path, OpenMode::ReadOnly).unwrap();
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name IN
+                     ('idx_documents_canonical_path', 'idx_chunks_document_id', 'idx_import_items_run_status')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 3);
+        }
+        // 同版本读写打开即清理,后续重复打开仍幂等。
+        for _ in 0..2 {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            assert_required_indexes_only(&connection);
+            assert_eq!(
+                stored_schema_version(&connection).unwrap().as_deref(),
+                Some("3")
+            );
+            let markdown: String = connection
+                .query_row(
+                    "SELECT markdown FROM document_contents WHERE document_id = 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markdown, "# 正文");
+            let count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM documents d JOIN chunks c ON c.document_id = d.id
+                     JOIN import_items i ON i.document_id = d.id JOIN import_runs r ON r.id = i.run_id
+                     WHERE d.id IN (SELECT rowid FROM documents_fts WHERE documents_fts MATCH '正文')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(connection.execute("INSERT INTO chunks(document_id, chunk_index, start_offset, end_offset) VALUES (1, 0, 0, 6)", []).is_err());
+            assert!(connection.execute("INSERT INTO import_items(run_id, path, status, updated_at) VALUES (1, '/a.txt', 'ok', 1)", []).is_err());
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

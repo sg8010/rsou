@@ -506,6 +506,25 @@ pub fn touch_unchanged(
 
 // ---------- import_runs / import_items ----------
 
+/// 已结束的导入历史保留 90 天,任务明细随任务级联删除。
+pub const IMPORT_HISTORY_RETENTION_DAYS: i64 = 90;
+
+/// 读写打开数据库时清理过期导入历史,不影响文档、正文或全文索引。
+///
+/// 以结束时间计算期限;旧记录缺少结束时间时回退到开始时间。
+/// 正在运行的任务不清理,避免破坏另一个连接正在写入的任务。
+/// 恰好到达 90 天边界的记录仍保留,超过边界才删除。
+pub fn prune_import_history(conn: &Connection, now_ms: i64) -> anyhow::Result<usize> {
+    let cutoff = now_ms.saturating_sub(IMPORT_HISTORY_RETENTION_DAYS * 86_400_000);
+    conn.execute(
+        "DELETE FROM import_runs \
+         WHERE status IN ('done', 'failed', 'cancelled') \
+         AND COALESCE(finished_at, started_at) < ?1",
+        [cutoff],
+    )
+    .context("清理超过 90 天的导入历史失败")
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ImportCounts {
     pub total: usize,
@@ -709,6 +728,79 @@ mod tests {
             parser_version: "t",
         };
         save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
+    }
+
+    #[test]
+    fn history_retention_uses_finish_time_and_preserves_documents() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let document_id = save_doc(&mut conn, "/a/retained.txt", None);
+        let now = 200 * 86_400_000;
+        let cutoff = now - 90 * 86_400_000;
+        // 状态、开始时间、结束时间、是否过期。覆盖毫秒边界与旧记录缺失时间。
+        let cases = [
+            ("done", 1, Some(cutoff - 1), true),
+            ("failed", 1, Some(cutoff - 1), true),
+            ("cancelled", 1, Some(cutoff - 1), true),
+            ("done", 1, Some(cutoff), false),
+            ("failed", 1, Some(cutoff + 1), false),
+            ("cancelled", 1, Some(now), false),
+            ("running", 1, None, false),
+            ("done", cutoff - 1, None, true),
+            ("done", cutoff, None, false),
+        ];
+        let mut retained = Vec::new();
+        for (status, started, finished, expired) in cases {
+            let run = create_run(&conn, "files", None, 1, started).unwrap();
+            conn.execute(
+                "UPDATE import_runs SET status = ?2, finished_at = ?3 WHERE id = ?1",
+                params![run, status, finished],
+            )
+            .unwrap();
+            upsert_item(
+                &conn,
+                run,
+                Path::new("/a/retained.txt"),
+                "ok",
+                None,
+                None,
+                Some(document_id),
+                started,
+            )
+            .unwrap();
+            if !expired {
+                retained.push(run);
+            }
+        }
+
+        assert_eq!(prune_import_history(&conn, now).unwrap(), 4);
+        for sql in [
+            "SELECT id FROM import_runs ORDER BY id",
+            "SELECT run_id FROM import_items ORDER BY run_id",
+        ] {
+            let actual = conn
+                .prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, retained);
+        }
+        assert_eq!(prune_import_history(&conn, now).unwrap(), 0);
+        assert_eq!(list_documents(&conn).unwrap().len(), 1);
+        assert_eq!(
+            get_plain_text(&conn, document_id).unwrap().unwrap(),
+            "合同正文"
+        );
+        assert_eq!(stats(&conn).unwrap().chunks, 1);
+        let fts_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"合同\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hits, 1);
     }
 
     #[test]
