@@ -356,6 +356,21 @@ impl RsouApp {
         }
     }
 
+    /// 清空预览窗格(文档/文本/导航/缓存);世代+1,在途的预览响应按过期丢弃。
+    fn clear_preview(&mut self) {
+        self.preview_doc_id = None;
+        self.preview_hit_index = 0;
+        self.preview_anchor = 0;
+        self.pending_scroll = None;
+        self.preview_spans_cache = None;
+        self.preview_gen += 1;
+        self.preview_rx = None;
+        self.preview_loading = false;
+        if let Some(old) = self.preview_text.take() {
+            drop_in_background(old);
+        }
+    }
+
     /// 启动一次索引维护(检查/重建/优化/清空共用一条 rsou-maintain 通道;
     /// 已在维护或导入中则忽略,GUI 一次只跑一个)。
     pub(crate) fn start_maintain(&mut self, ctx: &egui::Context, kind: MaintainKind) {
@@ -532,6 +547,14 @@ impl RsouApp {
                 match result {
                     Ok(response) => {
                         self.search_error = None;
+                        // 预览属于结果集:选中的文档不在新结果里就整体清掉,
+                        // 否则上一次搜索的预览文本会挂在空结果旁边。
+                        let still_hit = self.preview_doc_id.is_some_and(|id| {
+                            response.documents.iter().any(|d| d.document.id == id)
+                        });
+                        if !still_hit {
+                            self.clear_preview();
+                        }
                         if let Some(old) = self.search_result.replace(response) {
                             drop_in_background(old);
                         }
@@ -709,5 +732,112 @@ impl RsouApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsou_lib::query::CompiledQuery;
+    use rsou_lib::search::DocumentHit;
+
+    fn doc(id: i64) -> DocumentHit {
+        DocumentHit {
+            document: DocumentRow {
+                id,
+                path: format!("/doc{id}.txt"),
+                file_name: format!("doc{id}.txt"),
+                title: String::new(),
+                ext: "txt".to_owned(),
+                file_type: "text".to_owned(),
+                file_size: 1,
+                file_mtime_ms: 0,
+                parse_status: "parsed".to_owned(),
+                parse_error_code: None,
+                parse_error_message: None,
+                text_length: 1,
+                chunk_count: 1,
+                indexed_at: None,
+                source_root: None,
+                updated_at: 0,
+            },
+            title_highlights: Vec::new(),
+            hits: Vec::new(),
+            total_hits: 0,
+            best_rank: 0.0,
+        }
+    }
+
+    fn response(ids: &[i64]) -> SearchResponse {
+        SearchResponse {
+            documents: ids.iter().map(|&id| doc(id)).collect(),
+            total_hits: 0,
+            total_documents: ids.len(),
+            elapsed_ms: 0.0,
+            compiled: CompiledQuery {
+                match_expr: String::new(),
+                literals: Vec::new(),
+            },
+        }
+    }
+
+    /// 以检索线程相同的方式把一条结果送进通道并消费。
+    fn push_result(app: &mut RsouApp, result: SearchResponse) {
+        app.search_gen += 1;
+        let (tx, rx) = mpsc::channel::<SearchMsg>();
+        app.search_rx = Some((app.search_gen, rx));
+        app.search_active = true;
+        tx.send(SearchMsg {
+            generation: app.search_gen,
+            result: Ok(result),
+        })
+        .unwrap();
+        app.poll_search();
+    }
+
+    #[test]
+    fn result_without_previewed_doc_clears_preview() {
+        // 回归:第二次搜索无命中时,预览窗格还显示着上次选中的文档。
+        // poll_search 只替换 search_result,从不动 preview_text。
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        push_result(&mut app, response(&[1, 2]));
+        app.preview_doc_id = Some(1);
+        app.preview_text = Some("第一篇的原文".to_owned());
+        app.preview_hit_index = 1;
+        app.preview_anchor = 5;
+        app.pending_scroll = Some(5);
+        app.preview_spans_cache = Some(PreviewSpanCache {
+            preview_gen: 0,
+            base: 0,
+            window_len: 1,
+            literals: Vec::new(),
+            spans: Vec::new(),
+        });
+        push_result(&mut app, response(&[]));
+        assert!(
+            app.preview_doc_id.is_none(),
+            "预览不应停留在已不在结果集的文档"
+        );
+        assert!(app.preview_text.is_none());
+        assert_eq!(app.preview_hit_index, 0);
+        assert_eq!(app.preview_anchor, 0);
+        assert!(app.pending_scroll.is_none());
+        assert!(app.preview_spans_cache.is_none());
+    }
+
+    #[test]
+    fn result_keeping_previewed_doc_keeps_preview() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        push_result(&mut app, response(&[1, 2]));
+        app.preview_doc_id = Some(2);
+        app.preview_text = Some("原文".to_owned());
+        let old_gen = app.preview_gen;
+        // 新结果集仍含该文档:预览保留(高亮随新结果重算)。
+        push_result(&mut app, response(&[2, 3]));
+        assert_eq!(app.preview_doc_id, Some(2));
+        assert_eq!(app.preview_text.as_deref(), Some("原文"));
+        assert_eq!(app.preview_gen, old_gen);
     }
 }

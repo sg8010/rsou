@@ -141,7 +141,12 @@ impl RsouApp {
         //
         // 页签与内容必须在一张卡片里:拆成两张卡片时,两张卡各自还有 18px
         // 内边距加上卡片间距,页签与内容之间就空出近四十像素。
-        self.ui_library_tabbed(ui);
+        //
+        // 文档空间里的视口底边:页面起点 + 视口高。工作区包在外层
+        // ScrollArea 里,列表想撑满剩余高度必须用这个锚点——直接量
+        // clip_rect.bottom()-cursor.top 会随滚动位置变,越滚列表越高。
+        let viewport_bottom = ui.cursor().top() + ui.clip_rect().height();
+        self.ui_library_tabbed(ui, viewport_bottom);
 
         // ---------- 失败清单抽屉 ----------
         if self.show_failures {
@@ -225,8 +230,13 @@ impl RsouApp {
         }
     }
 
+    /// 列表滚动区高度:撑满到视口底边(再留卡片底部内边距),下限 360。
+    fn list_fill_height(ui: &egui::Ui, fill_bottom: f32) -> f32 {
+        (fill_bottom - ui.cursor().top() - Self::CARD_PADDING as f32).max(360.0)
+    }
+
     /// 文档列表表格(虚拟滚动;行操作收集后统一落地)。`filter` 为文件名过滤词。
-    fn ui_documents_table(&mut self, ui: &mut egui::Ui, filter: &str) {
+    fn ui_documents_table(&mut self, ui: &mut egui::Ui, filter: &str, fill_bottom: f32) {
         // 空态文案要看「整库空」还是「本页签空」——库里只有文件夹导入的文档时,
         // 「单独文件」页是空的,但说「资料库为空」就错了。
         let library_empty = self.documents.is_empty();
@@ -263,12 +273,15 @@ impl RsouApp {
 
         let mut action: Option<RowAction> = None;
         let busy = self.import_active || self.maintenance_active;
+        let scroll_height = Self::list_fill_height(ui, fill_bottom);
         TableBuilder::new(ui)
             .id_salt("rsou_documents_table")
             .striped(true)
             .vscroll(true)
-            .min_scrolled_height(360.0)
-            .max_scroll_height(360.0)
+            // auto_shrink(false) 时高度 = min(可用高度, max_scroll_height);
+            // 外层是滚动区,可用高度无限,所以滚动区恒为 scroll_height。
+            .auto_shrink([false, false])
+            .max_scroll_height(scroll_height)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::remainder().at_least(160.0).clip(true))
             .column(Column::exact(56.0))
@@ -405,7 +418,9 @@ impl RsouApp {
     }
 
     /// 页签切换:「已添加文件夹」/「单独文件」。
-    fn ui_library_tabbed(&mut self, ui: &mut egui::Ui) {
+    /// `fill_bottom` 为文档空间里的视口底边(ui_page_library 在页面顶部算出),
+    /// 列表内容据此撑满工作区剩余高度。
+    fn ui_library_tabbed(&mut self, ui: &mut egui::Ui, fill_bottom: f32) {
         let folders = self.folder_groups.len();
         let files = self
             .documents
@@ -463,8 +478,8 @@ impl RsouApp {
             |ui| {
                 let filter = doc_filter.borrow();
                 match current {
-                    LibraryTab::Folders => self.ui_folder_tree(ui, &filter),
-                    LibraryTab::Files => self.ui_documents_table(ui, &filter),
+                    LibraryTab::Folders => self.ui_folder_tree(ui, &filter, fill_bottom),
+                    LibraryTab::Files => self.ui_documents_table(ui, &filter, fill_bottom),
                 }
             },
         );
@@ -476,7 +491,7 @@ impl RsouApp {
     }
 
     /// 文件夹页:树形展示「来源文件夹 → 文档」,文件夹可展开。`filter` 为文件名过滤词。
-    fn ui_folder_tree(&mut self, ui: &mut egui::Ui, filter: &str) {
+    fn ui_folder_tree(&mut self, ui: &mut egui::Ui, filter: &str, fill_bottom: f32) {
         if self.folder_groups.is_empty() {
             let loading = self.docs_loading;
             Self::empty_note(
@@ -536,7 +551,7 @@ impl RsouApp {
         }
         egui::ScrollArea::vertical()
             .id_salt("rsou_folder_tree")
-            .max_height(360.0)
+            .max_height(Self::list_fill_height(ui, fill_bottom))
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let state = &mut self.library_tree_state;
@@ -563,7 +578,7 @@ impl RsouApp {
                             let busy_here = busy;
                             // 默认收起:文件多时一屏全是子项,反而看不出有哪几个
                             // 文件夹。用户展开过后由树自带的跨帧状态记住。
-                            if builder.node(
+                            let folder_open = builder.node(
                                 NodeBuilder::dir(folder_id)
                                     .default_open(false)
                                     .label_ui(move |ui| {
@@ -623,7 +638,8 @@ impl RsouApp {
                                             );
                                         });
                                     }),
-                            ) {
+                            );
+                            if folder_open {
                                 for document in documents {
                                     // 过滤词下只展示命中的文档。
                                     if !file_name_matches(&document.file_name, &filter) {
@@ -698,15 +714,15 @@ impl RsouApp {
                                         action = Some(a);
                                     }
                                 }
-                                if let Some(a) = folder_slot.borrow_mut().take() {
-                                    action = Some(a);
-                                }
-                                builder.close_dir();
-                            } else if let Some(a) = folder_slot.borrow_mut().take() {
-                                // 折叠状态下点按钮:label_ui 仍会渲染,
-                                // 这里同样要取出动作。
+                            }
+                            // 折叠时目录行本身仍渲染(label_ui 会执行),
+                            // 行内按钮动作照常取出。
+                            if let Some(a) = folder_slot.borrow_mut().take() {
                                 action = Some(a);
                             }
+                            // dir 节点入栈即成为后续节点的父级:无论开合都要
+                            // close_dir,否则下一个文件夹会被嵌进它底下。
+                            builder.close_dir();
                         }
                     });
                 // 树自带的 Action:双击/回车激活 = 打开文件。
@@ -861,26 +877,31 @@ mod tests {
                                     let slot_in = slot.clone();
                                     let root = group.root.clone();
                                     let count = group.documents.len();
-                                    if builder.node(NodeBuilder::dir(id).label_ui(move |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(format!("{root} ({count})"));
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    if RsouApp::link_button(ui, "移除").clicked()
-                                                    {
-                                                        *slot_in.borrow_mut() =
-                                                            Some(RowAction::AskRemoveFolder(
-                                                                root.clone(),
-                                                                count,
-                                                            ));
-                                                    }
-                                                    let _ = RsouApp::link_button(ui, "重解析");
-                                                    let _ = RsouApp::link_button(ui, "定位");
-                                                },
-                                            );
-                                        });
-                                    })) {
+                                    let open =
+                                        builder.node(NodeBuilder::dir(id).label_ui(move |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label(format!("{root} ({count})"));
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        if RsouApp::link_button(ui, "移除")
+                                                            .clicked()
+                                                        {
+                                                            *slot_in.borrow_mut() =
+                                                                Some(RowAction::AskRemoveFolder(
+                                                                    root.clone(),
+                                                                    count,
+                                                                ));
+                                                        }
+                                                        let _ = RsouApp::link_button(ui, "重解析");
+                                                        let _ = RsouApp::link_button(ui, "定位");
+                                                    },
+                                                );
+                                            });
+                                        }));
+                                    if open {
                                         for document in docs {
                                             let name = document.file_name.clone();
                                             builder.node(
@@ -899,8 +920,8 @@ mod tests {
                                                 }),
                                             );
                                         }
-                                        builder.close_dir();
                                     }
+                                    builder.close_dir();
                                 }
                             });
                     });
@@ -1075,13 +1096,12 @@ mod tests {
                     let (_, _) =
                         TreeView::new(ui.id().with("t")).show_state(ui, &mut state, |builder| {
                             for g in &groups {
-                                if builder.node(
+                                builder.node(
                                     NodeBuilder::dir(LibraryNode::Folder(g.root.clone()))
                                         .default_open(false)
                                         .label(g.root.clone()),
-                                ) {
-                                    builder.close_dir();
-                                }
+                                );
+                                builder.close_dir();
                             }
                         });
                 });
@@ -1097,6 +1117,40 @@ mod tests {
                 g.root
             );
         }
+    }
+
+    #[test]
+    fn sibling_folders_stay_at_root_when_previous_is_collapsed() {
+        // 回归:dir 节点入栈即成为后续节点的父级,折叠时也必须 close_dir。
+        // 曾经的写法只在展开分支里 close_dir,第二个文件夹被嵌进第一个
+        // 折叠的文件夹底下——界面上直接消失,展开前一个后才在末尾出现。
+        let ctx = egui::Context::default();
+        let mut state = egui_ltreeview::TreeViewState::<LibraryNode>::default();
+        let groups = vec![group("/a", &["1.txt"]), group("/b", &["2.txt"])];
+        let parents = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let parents_in = parents.clone();
+        let mut out = ctx.run_ui(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                TreeView::new(ui.id().with("t")).show_state(ui, &mut state, |builder| {
+                    for g in &groups {
+                        // 记录加入每个根文件夹时的父级:并列关系应为 None。
+                        parents_in.borrow_mut().push(builder.parent_id().cloned());
+                        builder.node(
+                            NodeBuilder::dir(LibraryNode::Folder(g.root.clone()))
+                                .default_open(false)
+                                .label(g.root.clone()),
+                        );
+                        builder.close_dir();
+                    }
+                });
+            });
+        });
+        out.textures_delta.clear();
+        assert_eq!(
+            *parents.borrow(),
+            vec![None, None],
+            "两个文件夹应保持根级并列,不应互相嵌套"
+        );
     }
 
     #[test]

@@ -108,12 +108,12 @@ impl RsouApp {
         let db_ready = self.db.is_some();
         let can_search = db_ready && !self.search_query.trim().is_empty();
         Self::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                // 不使用 `desired_width(f32::INFINITY)`:它会把输入框抢满整行,
-                // 让按钮只剩下贴在窗口边缘的一小条。按钮先占位,输入框使用剩余宽度。
-                let button_width = 96.0;
-                let input_width =
-                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(160.0);
+            // 第一行:搜索输入 + 搜索按钮 + 精确/宽松开关 + 范围 + 时间。
+            ui.horizontal_wrapped(|ui| {
+                // 输入框不再抢满整行:给同行其余控件预留估算宽度后取剩余,
+                // 并封顶避免过宽;窄窗口下收缩,放不下时行内控件自动换行。
+                let reserved = 500.0;
+                let input_width = (ui.available_width() - reserved).clamp(180.0, 340.0);
                 let response = Self::clearable_input(
                     ui,
                     &mut self.search_query,
@@ -124,17 +124,17 @@ impl RsouApp {
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     want_search = true;
                 }
-                if Self::primary_button(ui, Some(Icon::Search), "搜索", button_width, can_search)
-                    .clicked()
+                if Self::primary_button(ui, Some(Icon::Search), "搜索", 96.0, can_search).clicked()
                 {
                     want_search = true;
                 }
-            });
-            ui.add_space(10.0);
-            ui.horizontal_wrapped(|ui| {
+                ui.add_space(8.0);
                 // 无 jieba feature 时宽松模式退化为精确,开关不显示。
                 #[cfg(feature = "jieba")]
-                Self::accent_checkbox(ui, &mut self.search_exact, "精确");
+                {
+                    Self::mode_switch(ui, &mut self.search_exact, "精确", "宽松");
+                    ui.add_space(8.0);
+                }
                 ui.label(
                     egui::RichText::new("范围:")
                         .size(13.0)
@@ -147,30 +147,7 @@ impl RsouApp {
                             ui.selectable_value(&mut self.search_scope, scope, scope_label(scope));
                         }
                     });
-                ui.label(
-                    egui::RichText::new("类型:")
-                        .size(13.0)
-                        .color(Self::text_secondary()),
-                );
-                for file_type in FILE_TYPES {
-                    let mut checked = self.search_types.contains(file_type.as_str());
-                    if Self::accent_checkbox(ui, &mut checked, file_type.label()).changed() {
-                        if checked {
-                            self.search_types.insert(file_type.as_str().to_owned());
-                        } else {
-                            self.search_types.remove(file_type.as_str());
-                        }
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.label(
-                    egui::RichText::new("目录:")
-                        .size(13.0)
-                        .color(Self::text_secondary()),
-                );
-                Self::clearable_input(ui, &mut self.search_path_prefix, 220.0, "路径前缀");
+                ui.add_space(8.0);
                 ui.label(
                     egui::RichText::new("时间:")
                         .size(13.0)
@@ -188,7 +165,7 @@ impl RsouApp {
                         }
                     });
                 if self.search_active {
-                    ui.add_space(4.0);
+                    ui.add_space(8.0);
                     Self::status_badge(
                         ui,
                         Some(Icon::Loader),
@@ -196,6 +173,32 @@ impl RsouApp {
                         Self::accent_soft(),
                         Self::accent(),
                     );
+                }
+            });
+            ui.add_space(10.0);
+            // 第二行:目录 + 搜索文件类型。
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("目录:")
+                        .size(13.0)
+                        .color(Self::text_secondary()),
+                );
+                Self::clearable_input(ui, &mut self.search_path_prefix, 220.0, "路径前缀");
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("搜索文件类型:")
+                        .size(13.0)
+                        .color(Self::text_secondary()),
+                );
+                for file_type in FILE_TYPES {
+                    let mut checked = self.search_types.contains(file_type.as_str());
+                    if Self::accent_checkbox(ui, &mut checked, file_type.label()).changed() {
+                        if checked {
+                            self.search_types.insert(file_type.as_str().to_owned());
+                        } else {
+                            self.search_types.remove(file_type.as_str());
+                        }
+                    }
                 }
             });
         });

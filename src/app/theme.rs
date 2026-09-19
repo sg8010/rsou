@@ -752,6 +752,112 @@ impl RsouApp {
         response
     }
 
+    /// 双态开关:`on` 为 true 时滑块靠左选中左侧标签,false 靠右选中右侧。
+    /// 用于「精确 | 宽松」这类两侧都有意义的模式切换;点标签选对应侧,点轨道翻转。
+    pub(crate) fn mode_switch(
+        ui: &mut egui::Ui,
+        on: &mut bool,
+        on_label: &str,
+        off_label: &str,
+    ) -> egui::Response {
+        let enabled = ui.is_enabled();
+        let font = egui::FontId::proportional(13.0);
+        let on_galley =
+            ui.painter()
+                .layout_no_wrap(on_label.to_owned(), font.clone(), Self::text_primary());
+        let off_galley =
+            ui.painter()
+                .layout_no_wrap(off_label.to_owned(), font.clone(), Self::text_primary());
+        let track_size = egui::vec2(34.0, 18.0);
+        let gap = 6.0;
+        let size = egui::vec2(
+            on_galley.size().x + gap + track_size.x + gap + off_galley.size().x,
+            (on_galley.size().y.max(off_galley.size().y) + 4.0).max(22.0),
+        );
+        let sense = if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, mut response) = ui.allocate_exact_size(size, sense);
+        let track_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                rect.left() + on_galley.size().x + gap + track_size.x / 2.0,
+                rect.center().y,
+            ),
+            track_size,
+        );
+        if response.clicked() {
+            *on = match response.interact_pointer_pos() {
+                // 点左标签选左态,点右标签选右态,点轨道翻转。
+                Some(pos) if pos.x < track_rect.left() => true,
+                Some(pos) if pos.x > track_rect.right() => false,
+                _ => !*on,
+            };
+            response.mark_changed();
+        }
+        if ui.is_rect_visible(rect) {
+            ui.painter().rect_filled(
+                track_rect,
+                track_size.y / 2.0,
+                if enabled {
+                    Self::track()
+                } else {
+                    Self::disabled_bg()
+                },
+            );
+            // t:0→右侧(宽松),1→左侧(精确);滑块滑向激活的一侧。
+            let t = ui.ctx().animate_bool(response.id, *on);
+            let half = track_size.y / 2.0;
+            let knob_x = (track_rect.right() - half) * (1.0 - t) + (track_rect.left() + half) * t;
+            ui.painter().circle(
+                egui::pos2(knob_x, track_rect.center().y),
+                half - 3.0,
+                Self::surface(),
+                Stroke::new(
+                    1.0,
+                    if response.hovered() {
+                        Self::accent()
+                    } else {
+                        Self::border_strong()
+                    },
+                ),
+            );
+            let on_color = if !enabled {
+                Self::text_disabled()
+            } else if *on {
+                Self::accent()
+            } else {
+                Self::text_secondary()
+            };
+            let off_color = if !enabled {
+                Self::text_disabled()
+            } else if *on {
+                Self::text_secondary()
+            } else {
+                Self::accent()
+            };
+            ui.painter().text(
+                egui::pos2(rect.left(), rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                on_label,
+                font.clone(),
+                on_color,
+            );
+            ui.painter().text(
+                egui::pos2(rect.right(), rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                off_label,
+                font,
+                off_color,
+            );
+        }
+        if enabled && response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        response
+    }
+
     /// 顶栏/卡片角的小型状态徽标(软底色 + 同色文字 + 小图标)。
     pub(crate) fn status_badge(
         ui: &mut egui::Ui,
