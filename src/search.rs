@@ -279,44 +279,40 @@ fn find_ignoring_whitespace(
         diagnostics.whitespace_prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
         return None;
     }
-    let hay: Vec<(usize, char)> = text.char_indices().collect();
     diagnostics.whitespace_prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
-    diagnostics.character_arrays += 1;
-    diagnostics.character_array_bytes += hay.capacity() * std::mem::size_of::<(usize, char)>();
     let started = Instant::now();
-    let result = scan_ignoring_whitespace(&hay, &needle);
+    let result = scan_ignoring_whitespace(text, &needle);
     diagnostics.whitespace_scan_ms += started.elapsed().as_secs_f64() * 1000.0;
     result
 }
 
-fn scan_ignoring_whitespace(hay: &[(usize, char)], needle: &[char]) -> Option<Span> {
-    for start_index in 0..hay.len() {
-        let mut cursor = start_index;
-        let mut matched = 0usize;
-        // 区间从**第一个非空白字符**起:不能把匹配前跳过的空白算进去,
-        // 否则「合同编号 A4」会把前面的空格高亮进去。
-        let mut start_byte: Option<usize> = None;
-        let mut last_end = hay[start_index].0;
-        while cursor < hay.len() && matched < needle.len() {
-            let (byte, ch) = hay[cursor];
+fn scan_ignoring_whitespace(text: &str, needle: &[char]) -> Option<Span> {
+    let &first = needle.first()?;
+    let mut starts = text.char_indices();
+    while let Some((start, ch)) = starts.next() {
+        // 从非空白首字符尝试,避免重复尝试同一段前导空白。
+        if ch.is_whitespace() || !ch.eq_ignore_ascii_case(&first) {
+            continue;
+        }
+        let mut matched = 1;
+        let mut last_end = start + ch.len_utf8();
+        // 克隆迭代器仅复制游标状态,不复制正文;失败后仍从下一个字符尝试。
+        let mut cursor = starts.clone();
+        while matched < needle.len() {
+            let Some((byte, ch)) = cursor.next() else {
+                break;
+            };
             if ch.is_whitespace() {
-                cursor += 1;
                 continue;
             }
             // ASCII 大小写不敏感(与 locate_literals 的比对口径一致)。
             if !ch.eq_ignore_ascii_case(&needle[matched]) {
                 break;
             }
-            if start_byte.is_none() {
-                start_byte = Some(byte);
-            }
             matched += 1;
             last_end = byte + ch.len_utf8();
-            cursor += 1;
         }
-        if matched == needle.len()
-            && let Some(start) = start_byte
-        {
+        if matched == needle.len() {
             return Some(Span {
                 start,
                 end: last_end,
@@ -763,6 +759,45 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
 mod tests {
     use super::*;
 
+    // 保留优化前算法作为差分和性能对照。
+    fn legacy_whitespace_scan(text: &str, needle: &[char]) -> Option<Span> {
+        let hay: Vec<(usize, char)> = text.char_indices().collect();
+        for start_index in 0..hay.len() {
+            let mut cursor = start_index;
+            let mut matched = 0usize;
+            // 区间从**第一个非空白字符**起:不能把匹配前跳过的空白算进去,
+            // 否则「合同编号 A4」会把前面的空格高亮进去。
+            let mut start_byte: Option<usize> = None;
+            let mut last_end = hay[start_index].0;
+            while cursor < hay.len() && matched < needle.len() {
+                let (byte, ch) = hay[cursor];
+                if ch.is_whitespace() {
+                    cursor += 1;
+                    continue;
+                }
+                // ASCII 大小写不敏感(与 locate_literals 的比对口径一致)。
+                if !ch.eq_ignore_ascii_case(&needle[matched]) {
+                    break;
+                }
+                if start_byte.is_none() {
+                    start_byte = Some(byte);
+                }
+                matched += 1;
+                last_end = byte + ch.len_utf8();
+                cursor += 1;
+            }
+            if matched == needle.len()
+                && let Some(start) = start_byte
+            {
+                return Some(Span {
+                    start,
+                    end: last_end,
+                });
+            }
+        }
+        None
+    }
+
     // 优化前的实现,仅用于差分验证和手动运行的性能对照。
     fn legacy_group_into_fragments(
         content: &str,
@@ -845,6 +880,100 @@ mod tests {
     use crate::parse::FileType;
     use crate::repo::{FileMeta, ParsedDocument};
     use crate::text;
+
+    #[test]
+    fn streaming_whitespace_matches_legacy() {
+        for (text, literal) in [
+            ("", "文档"),
+            (" \t\n", " "),
+            ("合同编号 A4", "a4"),
+            (" 文\u{3000}\n档 文档", "文档"),
+            ("文、档", "文档"),
+            ("aaab", "aab"),
+            ("a a a b", "aab"),
+            ("éÉ", "É"),
+            ("🙂\u{a0}文", "🙂 文"),
+            ("a\u{200b}b", "ab"),
+        ] {
+            let needle: Vec<_> = literal.chars().filter(|c| !c.is_whitespace()).collect();
+            assert_eq!(
+                scan_ignoring_whitespace(text, &needle),
+                legacy_whitespace_scan(text, &needle)
+            );
+        }
+        let alphabet = [
+            'a', 'A', 'b', '文', '档', '🙂', 'é', 'É', ' ', '\n', '\t', '\u{3000}', '\u{a0}', '、',
+        ];
+        let mut seed = 91_u64;
+        let mut next = |max: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 32) as usize) % max
+        };
+        for _ in 0..10_000 {
+            let text: String = (0..next(100))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let literal: String = (0..next(8))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let needle: Vec<_> = literal.chars().filter(|c| !c.is_whitespace()).collect();
+            let mut diagnostics = LocateDiagnostics::default();
+            assert_eq!(
+                find_ignoring_whitespace(&text, &literal, &mut diagnostics),
+                legacy_whitespace_scan(&text, &needle),
+                "正文 {text:?}, 查询 {literal:?}"
+            );
+            assert_eq!(diagnostics.character_arrays, 0);
+            assert_eq!(diagnostics.character_array_bytes, 0);
+        }
+        // 更早的空白匹配不能被后面的直接匹配遮蔽。
+        assert_eq!(
+            locate_literals(" 文 档 文档", &["文档".into()]),
+            vec![Span { start: 1, end: 8 }, Span { start: 9, end: 15 }]
+        );
+    }
+
+    #[test]
+    #[ignore = "手动性能对照：cargo test -p rsou --release --lib streaming_whitespace_benchmark -- --ignored --nocapture"]
+    fn streaming_whitespace_benchmark() {
+        let body = "普通单元格123\t".repeat(1_000_000);
+        let needle: Vec<_> = "文档".chars().collect();
+        for (name, text) in [
+            ("开头命中", format!("文 档{body}")),
+            ("末尾命中", format!("{body}文 档")),
+            ("未命中", body),
+        ] {
+            for round in 0..3 {
+                // 交替执行顺序,输入构造不计入耗时。
+                let old_first = round % 2 == 0;
+                let mut results = Vec::new();
+                for old in [old_first, !old_first] {
+                    let started = Instant::now();
+                    let result = if old {
+                        legacy_whitespace_scan(
+                            std::hint::black_box(&text),
+                            std::hint::black_box(&needle),
+                        )
+                    } else {
+                        scan_ignoring_whitespace(
+                            std::hint::black_box(&text),
+                            std::hint::black_box(&needle),
+                        )
+                    };
+                    std::hint::black_box(result);
+                    eprintln!(
+                        "{name} {} 字节 第 {} 轮 {} {:.3} ms",
+                        text.len(),
+                        round + 1,
+                        if old { "优化前" } else { "优化后" },
+                        started.elapsed().as_secs_f64() * 1000.0
+                    );
+                    results.push(result);
+                }
+                assert_eq!(results[0], results[1]);
+            }
+        }
+    }
 
     fn assert_same_fragments(actual: &[Hit], expected: &[Hit]) {
         assert_eq!(actual.len(), expected.len());

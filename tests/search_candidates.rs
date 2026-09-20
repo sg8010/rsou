@@ -73,12 +73,10 @@ fn diagnostics_count_all_reads_and_rejected_candidates() {
     assert_eq!(diagnostics.content_locate.raw_spans, 4);
     assert_eq!(diagnostics.content_locate.merged_spans, 2);
     assert_eq!(diagnostics.title_locate.raw_spans, 0);
-    assert_eq!(diagnostics.content_locate.character_arrays, 3);
-    assert_eq!(diagnostics.title_locate.character_arrays, 3);
-    assert!(
-        diagnostics.content_locate.character_array_bytes
-            >= 7 * std::mem::size_of::<(usize, char)>()
-    );
+    assert_eq!(diagnostics.content_locate.character_arrays, 0);
+    assert_eq!(diagnostics.title_locate.character_arrays, 0);
+    assert_eq!(diagnostics.content_locate.character_array_bytes, 0);
+    assert_eq!(diagnostics.title_locate.character_array_bytes, 0);
     assert_eq!(diagnostics.slow_documents.len(), 3);
     assert!(diagnostics.content_decode_ms <= diagnostics.load_plain_text_ms);
     let detail = diagnostics

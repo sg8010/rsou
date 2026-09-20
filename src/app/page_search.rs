@@ -315,7 +315,7 @@ impl RsouApp {
                 }
                 ui.collapsing("最慢位置前 10", |ui| {
                     ui.label(&slow_details);
-                    ui.label("空白匹配准备包含查询字符和全文字符数组构造；累计容量不是峰值内存。SQL 执行及其他包含缓存访问，不能视为磁盘读取耗时。各定位分项不含全部释放和计时开销。同组额外读取不表示正文已验证相同。");
+                    ui.label("空白匹配准备为查询字符构造；正文已使用流式扫描，全文字符数组次数和容量应为零。SQL 执行及其他包含缓存访问，不能视为磁盘读取耗时。各定位分项不含全部释放和计时开销。同组额外读取不表示正文已验证相同。");
                 });
                 if ui.small_button("复制检索诊断").clicked() {
                     ui.ctx().copy_text(format!("{summary}\n{details}\n{slow_details}"));
