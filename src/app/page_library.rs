@@ -1,4 +1,4 @@
-//! 资料库页:文档导入、进度卡、两个页签(文件夹树 / 单独文件)与失败清单抽屉。
+//! 资料库页:文档导入、进度卡、两个页签(文件夹树 / 单独文件)与右侧失败清单。
 
 use std::path::PathBuf;
 
@@ -8,6 +8,69 @@ use rsou_lib::filebrowser;
 
 use super::theme::Icon;
 use super::*;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailureCategory {
+    Unsupported,
+    Encrypted,
+    Malformed,
+    ResourceLimit,
+    NeedsOcr,
+    Io,
+    TooLarge,
+    Empty,
+    Other,
+}
+
+impl FailureCategory {
+    const ALL: [Self; 9] = [
+        Self::Unsupported,
+        Self::Encrypted,
+        Self::Malformed,
+        Self::ResourceLimit,
+        Self::NeedsOcr,
+        Self::Io,
+        Self::TooLarge,
+        Self::Empty,
+        Self::Other,
+    ];
+
+    fn code(self) -> Option<rsou_lib::parse::ParseErrorCode> {
+        use rsou_lib::parse::ParseErrorCode as Code;
+        match self {
+            Self::Unsupported => Some(Code::Unsupported),
+            Self::Encrypted => Some(Code::Encrypted),
+            Self::Malformed => Some(Code::Malformed),
+            Self::ResourceLimit => Some(Code::ResourceLimit),
+            Self::NeedsOcr => Some(Code::NeedsOcr),
+            Self::Io => Some(Code::Io),
+            Self::TooLarge => Some(Code::TooLarge),
+            Self::Empty => Some(Code::Empty),
+            Self::Other => None,
+        }
+    }
+
+    fn from_code(code: Option<&str>) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.code().is_some_and(|c| Some(c.as_str()) == code))
+            .unwrap_or(Self::Other)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unsupported => "不支持的格式",
+            Self::Encrypted => "文件加密",
+            Self::Malformed => "文件损坏",
+            Self::ResourceLimit => "资源限制",
+            Self::NeedsOcr => "需要 OCR",
+            Self::Io => "读写错误",
+            Self::TooLarge => "文件过大",
+            Self::Empty => "内容为空",
+            Self::Other => "其他",
+        }
+    }
+}
 
 /// 行内操作意图(表格/树闭包结束后再落地,避免借用冲突)。
 enum RowAction {
@@ -147,12 +210,6 @@ impl RsouApp {
         // clip_rect.bottom()-cursor.top 会随滚动位置变,越滚列表越高。
         let viewport_bottom = ui.cursor().top() + ui.clip_rect().height();
         self.ui_library_tabbed(ui, viewport_bottom);
-
-        // ---------- 失败清单抽屉 ----------
-        if self.show_failures {
-            ui.add_space(Self::SECTION_GAP);
-            self.ui_failures_drawer(ui);
-        }
 
         // ---------- 危险操作的二次确认弹框 ----------
         self.ui_confirm_modal(ui.ctx());
@@ -440,6 +497,7 @@ impl RsouApp {
         let current = self.library_tab;
         let doc_filter = std::cell::RefCell::new(std::mem::take(&mut self.doc_filter));
         let mut show_failures = self.show_failures;
+        let failure_count = self.failed_documents.len();
         Self::tabbed_card(
             ui,
             |ui| {
@@ -465,10 +523,15 @@ impl RsouApp {
                             .color(Self::text_muted()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        Self::accent_checkbox(ui, &mut show_failures, "显示失败清单");
+                        if ui
+                            .selectable_label(show_failures, format!("失败 {failure_count}"))
+                            .clicked()
+                        {
+                            show_failures = !show_failures;
+                        }
                         Self::clearable_input(
                             ui,
-                            &mut *doc_filter.borrow_mut(),
+                            &mut doc_filter.borrow_mut(),
                             160.0,
                             "按文件名过滤",
                         );
@@ -817,51 +880,78 @@ impl RsouApp {
         }
     }
 
-    /// 失败清单抽屉:文件名 + 中文原因 + 重试/移除。
-    fn ui_failures_drawer(&mut self, ui: &mut egui::Ui) {
+    /// 顶部筛选固定,完整路径与错误在独立滚动区展示。
+    pub(super) fn ui_failures_panel(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<RowAction> = None;
         let busy = self.import_active || self.maintenance_active;
-        Self::card(ui, |ui| {
-            ui.horizontal(|ui| {
-                Self::card_title(ui, "失败清单");
-                ui.label(
-                    egui::RichText::new(format!("{} 个文件", self.failed_documents.len()))
-                        .size(12.0)
-                        .color(Self::text_muted()),
-                );
+        ui.horizontal(|ui| {
+            Self::card_title(ui, "失败清单");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if Self::link_button(ui, "关闭").clicked() {
+                    self.show_failures = false;
+                }
             });
-            Self::thin_divider(ui);
+        });
+        let mut counts = [0_usize; FailureCategory::ALL.len()];
+        for doc in &self.failed_documents {
+            counts[FailureCategory::from_code(doc.parse_error_code.as_deref()) as usize] += 1;
+        }
+        let previous_filter = self.failure_filter;
+        // 重试成功或移除后,所选类别消失则回到全部。
+        if self.failure_filter.is_some_and(|c| counts[c as usize] == 0) {
+            self.failure_filter = None;
+        }
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut self.failure_filter,
+                None,
+                format!("全部 {}", self.failed_documents.len()),
+            );
+            for category in FailureCategory::ALL {
+                let count = counts[category as usize];
+                if count > 0 {
+                    ui.selectable_value(
+                        &mut self.failure_filter,
+                        Some(category),
+                        format!("{} {count}", category.label()),
+                    );
+                }
+            }
+        });
+        Self::thin_divider(ui);
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt("failure_list_scroll")
+            .auto_shrink([false, false]);
+        if previous_filter != self.failure_filter {
+            scroll = scroll.vertical_scroll_offset(0.0);
+        }
+        scroll.show(ui, |ui| {
             if self.failed_documents.is_empty() {
                 Self::empty_note(ui, "没有失败的文档。");
-                return;
             }
             for doc in &self.failed_documents {
-                ui.horizontal_wrapped(|ui| {
+                let category = FailureCategory::from_code(doc.parse_error_code.as_deref());
+                if self
+                    .failure_filter
+                    .is_some_and(|selected| selected != category)
+                {
+                    continue;
+                }
+                ui.push_id(doc.id, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(&doc.file_name).strong()).wrap());
+                    ui.add(egui::Label::new(&doc.path).wrap());
+                    let message = doc.parse_error_message.as_deref().unwrap_or("解析失败");
                     ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&doc.file_name)
-                                .size(13.0)
-                                .strong()
-                                .color(Self::text_primary()),
-                        )
-                        .truncate(),
-                    )
-                    .on_hover_text(&doc.path);
-                    ui.label(
-                        egui::RichText::new(
-                            doc.parse_error_message.as_deref().unwrap_or("解析失败"),
-                        )
-                        .size(12.0)
-                        .color(Self::warning()),
+                        egui::Label::new(egui::RichText::new(message).color(Self::warning()))
+                            .wrap(),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
-                            .inner
-                            .clicked()
-                        {
-                            action =
-                                Some(RowAction::AskRemoveDocument(doc.id, doc.file_name.clone()));
+                    ui.horizontal_wrapped(|ui| {
+                        if Self::link_button(ui, "复制路径").clicked() {
+                            ui.ctx().copy_text(doc.path.clone());
+                        }
+                        if Self::link_button(ui, "复制错误信息").clicked() {
+                            ui.ctx().copy_text(message.to_owned());
                         }
                         if ui
                             .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重试"))
@@ -870,9 +960,17 @@ impl RsouApp {
                         {
                             action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
                         }
+                        if ui
+                            .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
+                            .inner
+                            .clicked()
+                        {
+                            action =
+                                Some(RowAction::AskRemoveDocument(doc.id, doc.file_name.clone()));
+                        }
                     });
+                    Self::thin_divider(ui);
                 });
-                ui.add_space(4.0);
             }
         });
         self.apply_row_action(ui, action);

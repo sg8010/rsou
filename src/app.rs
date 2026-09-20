@@ -285,8 +285,9 @@ pub struct RsouApp {
     /// 过滤期间被自动展开的文件夹节点;过滤清空后收回为关,
     /// 只记「原本没开」的节点,不覆盖用户手动展开的状态
     filter_auto_opened: Vec<LibraryNode>,
-    /// 「显示失败清单」抽屉开关
+    /// 右侧失败清单开关,仅由用户操作改变
     show_failures: bool,
+    failure_filter: Option<page_library::FailureCategory>,
     /// 上一个页面(进资料库页时刷新文档列表用)
     prev_page: Page,
     /// 导入进度(进度卡与顶栏徽标)
@@ -411,6 +412,7 @@ impl RsouApp {
             library_tree_state: egui_ltreeview::TreeViewState::default(),
             filter_auto_opened: Vec::new(),
             show_failures: false,
+            failure_filter: None,
             prev_page: Page::Library,
             import_progress: ImportProgress::default(),
             import_rx: None,
@@ -504,6 +506,16 @@ impl eframe::App for RsouApp {
                 self.ui_sidebar(ui);
                 Self::paint_sidebar_border(ui);
             });
+
+        if self.page == Page::Library && self.show_failures {
+            egui::Panel::right("library_failures")
+                .default_size(360.0)
+                .min_size(240.0)
+                .max_size((ui.available_width() * 0.5).max(240.0))
+                .resizable(true)
+                .frame(egui::Frame::new().fill(Self::surface()).inner_margin(16))
+                .show(ui, |ui| self.ui_failures_panel(ui));
+        }
 
         egui::CentralPanel::default()
             // 页面工作区:浅灰底,左右 24 / 上 22 / 下 24 的统一页边距。

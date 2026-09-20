@@ -347,6 +347,8 @@ impl RsouApp {
 
     /// 自绘按钮:egui 的 `Button::fill` 会盖掉 hover 态,要 hover/禁用各自
     /// 一套颜色只能自己量尺寸、自己画。
+    // 统一接收布局参数及普通、悬停、禁用三种样式,仅此绘制函数允许较多参数。
+    #[allow(clippy::too_many_arguments)]
     fn button(
         ui: &mut egui::Ui,
         icon: Option<Icon>,
@@ -1029,7 +1031,7 @@ impl RsouApp {
                 let cc = egui::pos2(c.x - s * 0.06, c.y - s * 0.06);
                 let rr = s * 0.28;
                 painter.circle_stroke(cc, rr, st);
-                let d = (rr + s * 0.02) * 0.7071;
+                let d = (rr + s * 0.02) * std::f32::consts::FRAC_1_SQRT_2;
                 painter.line_segment(
                     [
                         egui::pos2(cc.x + d, cc.y + d),
