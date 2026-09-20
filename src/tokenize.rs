@@ -1,6 +1,6 @@
 //! `rsou` FTS5 自定义 tokenizer(逐字索引,与 wsou 的 `simple 0` 同语义)。
 //!
-//! 规则(见 docs/plan.md §6.1):
+//! 规则:
 //! - 非 ASCII 的字母数字字符(含全部 CJK 与中文标点之外的 Unicode 字符)
 //!   逐码点成词元;
 //! - ASCII 字母连续段小写后成一个词元,ASCII 数字连续段成一个词元,
@@ -207,7 +207,7 @@ mod tests {
 
         // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;搜索决策
         // 单一化后这属于 tokenizer 的正式行为,检索层不再据此剔除结果,只是
-        // 展示层定位不到高亮。详见 docs/plan.md §6.4。
+        // 展示层定位不到高亮(见 docs/search-single-decision.md §26.4)。
         let punctuated_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",

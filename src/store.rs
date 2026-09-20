@@ -4,7 +4,7 @@
 //! tokenizer 的注册是 per-connection 的,任何未经注册就直接 `MATCH` 的连接都会
 //! 报「no such tokenizer」,因此读连接与写连接都必须从这里走。
 //!
-//! schema 单版本管理(见 docs/plan.md §5.2):版本号写在 `settings.schema_version`,
+//! schema 单版本管理:版本号写在 `settings.schema_version`,
 //! 打开到版本不兼容的库时直接报中文错误,不做自动迁移。版本检查在建表之前,
 //! 因此拒绝一个旧库时不会在它里面留下任何新表。
 
@@ -296,7 +296,7 @@ fn stored_schema_version(connection: &Connection) -> anyhow::Result<Option<Strin
     Ok(version)
 }
 
-// docs/plan.md §5.2 的单版本表结构(STRICT 表);追加本阶段定的四个辅助索引。
+// 单版本表结构(STRICT 表);另有四个辅助索引。
 // chunks 是**展示**分块:检索命中后按它把原文切成片段、并给出标题路径。
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS documents (

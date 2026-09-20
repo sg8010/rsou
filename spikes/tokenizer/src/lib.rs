@@ -20,7 +20,7 @@ pub struct TokenSpan {
 
 /// Return the `rsou 0` token sequence without going through SQLite.
 ///
-/// The rules are intentionally the small set specified in `docs/plan.md`:
+/// The rules are intentionally the same small set as `rsou_lib::tokenize`:
 /// ASCII letters and digits form separate runs, ASCII runs are normalized to
 /// lower case, Unicode alphanumeric characters are indexed one code point at
 /// a time, and punctuation/whitespace are separators.  In particular, the

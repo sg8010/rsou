@@ -69,7 +69,7 @@ glutin-winit = { path = "vendor/glutin-winit" }
 # 对该函数的 DLL,避免 x86/x64 的 Win7 产物在启动时加载不存在的 combase.dll。
 windows-link = { path = "vendor/windows-link" }
 # FTS5 自定义 tokenizer 的注册胶水(unsafe 收在这一处、可审计);
-# 本地 vendor 便于审查,详见 docs/plan.md §6.0 方案 A。
+# 本地 vendor 便于审查。
 rusqlite-ext = { path = "vendor/rusqlite-ext" }
 
 [dependencies]

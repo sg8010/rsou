@@ -2,7 +2,7 @@
 //!
 //! 写入约定:
 //! - 单文档的「内容+分块+FTS」在一个 `BEGIN IMMEDIATE` 事务里完成,
-//!   不会出现半成品可检索(见 docs/plan.md §5.2);
+//!   不会出现半成品可检索;
 //! - FTS 是 contentless-delete 表,**一行一篇文档**,删除即
 //!   `DELETE FROM documents_fts WHERE rowid = ?`(按 rowid 直接清词元,
 //!   不需要回读旧值,对删除顺序没有要求),rowid 显式等于 documents.id;

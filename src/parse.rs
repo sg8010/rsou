@@ -1,6 +1,6 @@
 //! 文档解析:扩展名路由、anydoc 调用、txt/md 自读与中文错误映射。
 //!
-//! 路由(见 docs/plan.md §4.2):
+//! 路由:
 //! - `.txt/.md` 自己读:BOM 去除 → UTF-8 严格 → GB18030 回退;
 //! - 其余支持的扩展名走 anydoc:`Format::from_bytes` 探测、`from_path` 兜底;
 //! - 不支持的扩展名在导入扫描时就被丢弃,不会走到这里。
@@ -239,7 +239,7 @@ fn parse_anydoc(path: &Path, bytes: &[u8]) -> Result<Parsed, ParseError> {
     })
 }
 
-/// ConvertError → 中文失败原因(文案见 docs/plan.md §4.3)。
+/// ConvertError → 中文失败原因。
 /// ConvertError 是 #[non_exhaustive],未知变体兜底按 Malformed 处理。
 pub fn map_convert_error(error: &ConvertError) -> ParseError {
     match error {
