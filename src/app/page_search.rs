@@ -234,14 +234,14 @@ impl RsouApp {
                 }
             );
             ui.label(
-                egui::RichText::new(summary)
+                egui::RichText::new(&summary)
                     .size(13.0)
                     .color(Self::text_secondary()),
             );
             let diagnostics = &response.diagnostics;
             ui.scope(|ui| {
                 ui.set_max_width(SEARCH_DIAGNOSTICS_MAX_WIDTH);
-                let details = format!(
+                let mut details = format!(
                     "阶段：编译 {:.1} ms · FTS 计数 {:.1} ms · FTS 排名/候选 {:.1} ms · 元数据 {:.1} ms · 正文读取 {:.1} ms · 命中定位 {:.1} ms · 分块读取 {:.1} ms · 片段生成 {:.1} ms · 收尾 {:.1} ms\n规模：FTS {} 篇 / {} 组 · 候选 {} 组 / {} 个位置 · 正文 {} 字节 · 分块 {} · 命中区间 {}",
                     diagnostics.compile_ms,
                     diagnostics.fts_count_ms,
@@ -260,14 +260,66 @@ impl RsouApp {
                     diagnostics.chunk_count,
                     diagnostics.literal_spans,
                 );
+                details.push_str(&format!(
+                    "\n正文读取：{} 次（缺失 {} 次）· SQL 执行及其他 {:.1} ms · 文本转换/复制 {:.1} ms · 同组额外读取 {} 次 / {} 字节 · 查询字面量 {} 个",
+                    diagnostics.content_reads,
+                    diagnostics.missing_contents,
+                    (diagnostics.load_plain_text_ms - diagnostics.content_decode_ms).max(0.0),
+                    diagnostics.content_decode_ms,
+                    diagnostics.extra_group_reads,
+                    diagnostics.extra_group_bytes,
+                    diagnostics.literal_count,
+                ));
+                for (name, locate) in [
+                    ("正文", &diagnostics.content_locate),
+                    ("标题", &diagnostics.title_locate),
+                ] {
+                    details.push_str(&format!(
+                        "\n{name}定位：小写构造 {:.1} ms · 直接匹配 {:.1} ms · 空白匹配准备 {:.1} ms · 空白匹配扫描 {:.1} ms · 排序合并 {:.1} ms · 区间 {} → {} · 字符数组 {} 次 / 累计容量 {} 字节",
+                        locate.lowercase_ms,
+                        locate.direct_match_ms,
+                        locate.whitespace_prepare_ms,
+                        locate.whitespace_scan_ms,
+                        locate.sort_merge_ms,
+                        locate.raw_spans,
+                        locate.merged_spans,
+                        locate.character_arrays,
+                        locate.character_array_bytes,
+                    ));
+                }
                 ui.add(
                     egui::Label::new(
-                        egui::RichText::new(details)
+                        egui::RichText::new(&details)
                             .size(11.0)
                             .color(Self::text_secondary()),
                     )
                     .wrap(),
                 );
+                let mut slow_details = String::from(
+                    "最慢位置（按正文读取＋定位排序，含未通过精确复核者；分块数为实际读取数）：",
+                );
+                for doc in &diagnostics.slow_documents {
+                    slow_details.push_str(&format!(
+                        "\n文档 ID {} · 正文 {} 字节 · 分块 {} · 命中 {} · 读取 {:.1} ms（转换/复制 {:.1} ms）· 定位 {:.1} ms · {}",
+                        doc.document_id,
+                        doc.plain_text_bytes,
+                        doc.chunk_count,
+                        doc.literal_spans,
+                        doc.read_ms,
+                        doc.decode_ms,
+                        doc.locate_ms,
+                        if doc.missing_content { "正文缺失" }
+                        else if doc.exact_match { "通过复核" }
+                        else { "未通过复核" },
+                    ));
+                }
+                ui.collapsing("最慢位置前 10", |ui| {
+                    ui.label(&slow_details);
+                    ui.label("空白匹配准备包含查询字符和全文字符数组构造；累计容量不是峰值内存。SQL 执行及其他包含缓存访问，不能视为磁盘读取耗时。各定位分项不含全部释放和计时开销。同组额外读取不表示正文已验证相同。");
+                });
+                if ui.small_button("复制检索诊断").clicked() {
+                    ui.ctx().copy_text(format!("{summary}\n{details}\n{slow_details}"));
+                }
             });
         }
         ui.add_space(8.0);
