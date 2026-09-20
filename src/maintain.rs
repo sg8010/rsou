@@ -80,9 +80,9 @@ pub struct IntegrityReport {
     /// (contentless-delete 表没有列值可对拍,这层只查倒排索引内部一致性)
     pub fts_ok: bool,
     pub fts_message: Option<String>,
-    /// documents 有、documents_fts 无的行数
+    /// 已解析文档有、documents_fts 无的行数
     pub missing_in_fts: i64,
-    /// documents_fts 有、documents 无的孤儿行数
+    /// documents_fts 有、但对应文档不存在或不是 parsed 的孤儿行数
     pub orphan_in_fts: i64,
 }
 
@@ -94,7 +94,8 @@ impl IntegrityReport {
     /// 中文一段话总结(设置页卡片与 `rsou-cli check` 共用)。
     pub fn summary(&self) -> String {
         if self.is_consistent() {
-            return "索引一致:SQLite 结构与全文索引自检正常,行数对齐".to_owned();
+            return "索引结构正常:SQLite 结构与全文索引自检通过,索引行与已解析文档一一对齐"
+                .to_owned();
         }
         let mut problems: Vec<String> = Vec::new();
         if !self.sqlite_ok {
@@ -110,7 +111,10 @@ impl IntegrityReport {
             problems.push(format!("{} 篇文档没有索引行", self.missing_in_fts));
         }
         if self.orphan_in_fts > 0 {
-            problems.push(format!("{} 条索引行找不到文档", self.orphan_in_fts));
+            problems.push(format!(
+                "{} 条索引行没有对应的已解析文档",
+                self.orphan_in_fts
+            ));
         }
         format!("索引不一致:{};建议执行「重建全文索引」", problems.join(","))
     }
@@ -140,19 +144,11 @@ pub fn check_integrity(conn: &Connection) -> anyhow::Result<IntegrityReport> {
         Err(error) => (false, Some(error.to_string())),
     };
 
-    // 双向差集:只比对已解析文档(FTS 里只有它们)。
-    let missing_in_fts: i64 = conn.query_row(
-        "SELECT count(*) FROM documents d \
-         WHERE d.parse_status = 'parsed' AND d.id NOT IN (SELECT rowid FROM documents_fts)",
-        [],
-        |row| row.get(0),
-    )?;
-    let orphan_in_fts: i64 = conn.query_row(
-        "SELECT count(*) FROM documents_fts \
-         WHERE rowid NOT IN (SELECT id FROM documents)",
-        [],
-        |row| row.get(0),
-    )?;
+    // 双向差集:不变式是「documents_fts 的 rowid 集合 == parse_status='parsed'
+    // 的 documents.id 集合」。孤儿侧必须连 parse_status 一起比对——只查
+    // 「documents 里没有这个 id」会漏掉 failed/待解析文档残留的索引行
+    // (id 仍在 documents 里,却本不该有 FTS 行)。
+    let (missing_in_fts, orphan_in_fts) = fts_row_mismatch(conn)?;
 
     Ok(IntegrityReport {
         sqlite_ok,
@@ -164,20 +160,42 @@ pub fn check_integrity(conn: &Connection) -> anyhow::Result<IntegrityReport> {
     })
 }
 
+/// 行集合双向差集:(已解析文档缺索引行, 索引行没有对应的已解析文档)。
+/// 只做两个 count 查询(不跑 `PRAGMA integrity_check`),开库路径可接受:
+/// 5 万篇实测约 25ms(release),见 `bench_needs_fts_rebuild_on_large_library`。
+/// `check_integrity` 与 `needs_fts_rebuild` 共用。
+fn fts_row_mismatch(conn: &Connection) -> anyhow::Result<(i64, i64)> {
+    let missing: i64 = conn.query_row(
+        "SELECT count(*) FROM documents d \
+         WHERE d.parse_status = 'parsed' \
+         AND NOT EXISTS(SELECT 1 FROM documents_fts f WHERE f.rowid = d.id)",
+        [],
+        |row| row.get(0),
+    )?;
+    let orphan: i64 = conn.query_row(
+        "SELECT count(*) FROM documents_fts f \
+         WHERE NOT EXISTS(\
+             SELECT 1 FROM documents d \
+             WHERE d.id = f.rowid AND d.parse_status = 'parsed')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok((missing, orphan))
+}
+
 /// 全文索引是否待重建:迁移丢弃旧表时置 `settings.fts_rebuild_pending`;
-/// 索引为空但已有已解析文档时也算(迁移中途崩溃同样兜住)。
+/// 没有标志但行集合对不上时也算——覆盖迁移在「DROP 旧表」与「写标志」之间
+/// 中断,随后又有新文档写入索引,使索引从「空」变成「部分有内容」的遗留库。
 /// `rebuild_fts` 提交时清标志。
 pub fn needs_fts_rebuild(conn: &Connection) -> anyhow::Result<bool> {
     if repo::get_setting(conn, crate::store::FTS_REBUILD_PENDING_KEY)?.as_deref() == Some("1") {
         return Ok(true);
     }
-    let pending: bool = conn.query_row(
-        "SELECT NOT EXISTS(SELECT 1 FROM documents_fts) \
-         AND EXISTS(SELECT 1 FROM documents WHERE parse_status = 'parsed')",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(pending)
+    // 行集合必须与已解析文档严格对齐:空索引、部分索引、以及 failed 文档
+    // 残留的索引行都落到这里,统一由重建收口。只比对行集合,不跑
+    // PRAGMA integrity_check——开库路径上它太贵。
+    let (missing, orphan) = fts_row_mismatch(conn)?;
+    Ok(missing > 0 || orphan > 0)
 }
 
 /// 全量重建 documents_fts:一个 BEGIN IMMEDIATE 事务里先 'delete-all' 清空
@@ -474,6 +492,67 @@ mod tests {
     }
 
     #[test]
+    fn failed_document_leftover_fts_row_is_detected_and_rebuilt() {
+        // failed 文档的 id 仍在 documents 里,只查「documents 无此 id」会漏掉
+        // 它残留的 FTS 行;孤儿判定必须连 parse_status 一起比对。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/a.txt", "正常内容");
+        save_doc(&mut conn, "/d/b.txt", "将要失败的文档");
+        let failed_id: i64 = conn
+            .query_row("SELECT max(rowid) FROM documents_fts", [], |r| r.get(0))
+            .unwrap();
+        // 只把状态改成 failed:模拟旧版本删除或状态回退时漏删 FTS 行。
+        conn.execute(
+            "UPDATE documents SET parse_status = 'failed' WHERE id = ?1",
+            params![failed_id],
+        )
+        .unwrap();
+
+        let report = check_integrity(&conn).unwrap();
+        assert_eq!(report.orphan_in_fts, 1);
+        assert_eq!(report.missing_in_fts, 0);
+        assert!(!report.is_consistent(), "{}", report.summary());
+        assert!(
+            needs_fts_rebuild(&conn).unwrap(),
+            "无标志也要发现行集合漂移"
+        );
+
+        rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
+        let report = check_integrity(&conn).unwrap();
+        assert!(report.is_consistent(), "{}", report.summary());
+        assert!(!needs_fts_rebuild(&conn).unwrap());
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE rowid = ?1",
+                params![failed_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "failed 文档不应留下索引行");
+    }
+
+    #[test]
+    fn partially_populated_index_without_flag_requires_rebuild() {
+        // 迁移在 DROP 与写标志之间中断后,又用旧版本导入了新文档:索引
+        // 「非空但残缺」,仅靠「索引为空」的兜底发现不了。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/a.txt", "旧文档一");
+        save_doc(&mut conn, "/d/b.txt", "旧文档二");
+        conn.execute(
+            "DELETE FROM documents_fts WHERE rowid = (SELECT min(id) FROM documents)",
+            [],
+        )
+        .unwrap();
+
+        assert!(
+            needs_fts_rebuild(&conn).unwrap(),
+            "索引有内容但缺行,必须判为待重建"
+        );
+        rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
+        assert!(!needs_fts_rebuild(&conn).unwrap());
+    }
+
+    #[test]
     fn needs_fts_rebuild_tracks_flag_and_empty_index() {
         let mut conn = crate::store::open_in_memory().unwrap();
         // 空库不需要重建。
@@ -494,6 +573,41 @@ mod tests {
         )
         .unwrap();
         assert!(needs_fts_rebuild(&conn).unwrap());
+    }
+
+    /// 开库时行集合比对的开销基准。`needs_fts_rebuild` 只在 open 路径上跑
+    /// (GUI 启动一次、CLI 每进程几次),不在渲染/检索热路径;这个用例把实测
+    /// 成本钉下来,便于以后判断是否值得加“行数快路径”优化。
+    #[test]
+    #[ignore = "手动性能对照：cargo test -p rsou --release --lib bench_needs_fts_rebuild -- --ignored --nocapture"]
+    fn bench_needs_fts_rebuild_on_large_library() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let tx = conn.transaction().unwrap();
+        for i in 1..=50_000i64 {
+            tx.execute(
+                "INSERT INTO documents(id, path, canonical_path, file_name, ext, file_type, \
+                 file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at) \
+                 VALUES(?1, ?2, ?2, 'a.txt', 'txt', 'text', 1, 1, ?3, 'parsed', 1, 1)",
+                params![i, format!("/d/{i}.txt"), format!("h{i}")],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO documents_fts(rowid, title, content) \
+                 VALUES(?1, 'title', 'word alpha beta')",
+                params![i],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let start = std::time::Instant::now();
+        assert!(!needs_fts_rebuild(&conn).unwrap());
+        println!("needs_fts_rebuild(5 万篇健康库) = {:?}", start.elapsed());
+        conn.execute("DELETE FROM documents_fts WHERE rowid = 7", [])
+            .unwrap();
+        let start = std::time::Instant::now();
+        assert!(needs_fts_rebuild(&conn).unwrap());
+        println!("needs_fts_rebuild(5 万篇缺 1 行) = {:?}", start.elapsed());
     }
 
     #[test]

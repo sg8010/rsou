@@ -78,15 +78,17 @@ fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
     let missing: i64 = conn
         .query_row(
             "SELECT count(*) FROM documents d WHERE d.parse_status = 'parsed' \
-             AND d.id NOT IN (SELECT rowid FROM documents_fts)",
+             AND NOT EXISTS(SELECT 1 FROM documents_fts f WHERE f.rowid = d.id)",
             [],
             |r| r.get(0),
         )
         .unwrap();
     let orphan: i64 = conn
         .query_row(
-            "SELECT count(*) FROM documents_fts \
-             WHERE rowid NOT IN (SELECT id FROM documents)",
+            "SELECT count(*) FROM documents_fts f \
+             WHERE NOT EXISTS(\
+                 SELECT 1 FROM documents d \
+                 WHERE d.id = f.rowid AND d.parse_status = 'parsed')",
             [],
             |r| r.get(0),
         )
