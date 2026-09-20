@@ -137,77 +137,17 @@ fn borrowed_content_benchmark() {
 }
 
 #[test]
-fn diagnostics_count_all_reads_and_rejected_candidates() {
+fn missing_candidate_content_is_skipped() {
     let mut conn = rsou_lib::store::open_in_memory().unwrap();
-    let first = save(&mut conn, "/d/a.txt", "说明", &["文档"]);
-    let second = save(&mut conn, "/d/b.txt", "说明", &["文档"]);
-    let rejected = save(&mut conn, "/d/c.txt", "说明", &["文、档"]);
-    conn.execute(
-        "UPDATE documents SET content_hash = ?1 WHERE id IN (?2, ?3)",
-        rusqlite::params!["a".repeat(64), first, second],
-    )
-    .unwrap();
-    let response = search::search(&conn, &request()).unwrap();
-    let diagnostics = &response.diagnostics;
-    assert_eq!(response.documents.len(), 2);
-    assert_eq!(diagnostics.literal_count, 1);
-    assert_eq!(diagnostics.content_reads, 3);
-    assert_eq!(diagnostics.missing_contents, 0);
-    assert_eq!(diagnostics.plain_text_bytes, "文档文档文、档".len());
-    assert_eq!(diagnostics.extra_group_reads, 1);
-    assert_eq!(diagnostics.extra_group_bytes, "文档".len());
-    assert_eq!(diagnostics.content_locate.raw_spans, 4);
-    assert_eq!(diagnostics.content_locate.merged_spans, 2);
-    assert_eq!(diagnostics.title_locate.raw_spans, 0);
-    assert_eq!(diagnostics.content_locate.character_arrays, 0);
-    assert_eq!(diagnostics.title_locate.character_arrays, 0);
-    assert_eq!(diagnostics.content_locate.character_array_bytes, 0);
-    assert_eq!(diagnostics.title_locate.character_array_bytes, 0);
-    assert_eq!(diagnostics.slow_documents.len(), 3);
-    assert!(diagnostics.content_decode_ms <= diagnostics.load_plain_text_ms);
-    let detail = diagnostics
-        .slow_documents
-        .iter()
-        .find(|d| d.document_id == rejected)
-        .unwrap();
-    assert!(!detail.exact_match);
-    assert_eq!(detail.chunk_count, 0);
-    assert_eq!(detail.literal_spans, 0);
-    assert!(
-        diagnostics
-            .slow_documents
-            .windows(2)
-            .all(|pair| pair[0].read_ms + pair[0].locate_ms >= pair[1].read_ms + pair[1].locate_ms)
-    );
-}
-
-#[test]
-fn diagnostics_bound_details_and_record_missing_content() {
-    let mut conn = rsou_lib::store::open_in_memory().unwrap();
-    for index in 0..12 {
-        save(&mut conn, &format!("/d/{index}.txt"), "说明", &["文档"]);
-    }
-    let response = search::search(&conn, &request()).unwrap();
-    assert_eq!(response.diagnostics.content_reads, 12);
-    assert_eq!(response.diagnostics.slow_documents.len(), 10);
-    // 保留 FTS 候选,用空视图模拟候选读取时正文已经不存在。
+    save(&mut conn, "/d/missing.txt", "说明", &["文档"]);
+    // 保留 FTS 候选,模拟候选读取时正文已经不存在。
     conn.execute_batch(
         "ALTER TABLE document_contents RENAME TO stored_contents;
          CREATE VIEW document_contents AS SELECT document_id, plain_text FROM stored_contents WHERE 0;"
     ).unwrap();
     let response = search::search(&conn, &request()).unwrap();
+    assert_eq!(response.total_documents, 1);
     assert!(response.documents.is_empty());
-    assert_eq!(response.diagnostics.content_reads, 12);
-    assert_eq!(response.diagnostics.missing_contents, 12);
-    assert_eq!(response.diagnostics.plain_text_bytes, 0);
-    assert_eq!(response.diagnostics.content_locate.character_arrays, 0);
-    assert!(
-        response
-            .diagnostics
-            .slow_documents
-            .iter()
-            .all(|d| d.missing_content)
-    );
 }
 
 fn old_ranking(conn: &Connection) -> Vec<(i64, f64)> {

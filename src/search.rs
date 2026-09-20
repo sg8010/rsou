@@ -120,80 +120,8 @@ pub struct SearchResponse {
     /// FTS 内容组总数,与 total_documents 一样可能含标点假阳性。
     pub total_groups: usize,
     pub elapsed_ms: f64,
-    /// 本次检索的阶段耗时与处理规模,用于定位慢查询。
-    pub diagnostics: SearchDiagnostics,
     /// 编译产物(literals 供预览定位)
     pub compiled: CompiledQuery,
-}
-
-/// 检索埋点:阶段耗时与候选处理规模。
-///
-/// 这些数据只描述一次检索的实际执行路径,不改变检索结果。耗时单位均为毫秒。
-#[derive(Debug, Clone, Default)]
-pub struct SearchDiagnostics {
-    pub compile_ms: f64,
-    pub fts_count_ms: f64,
-    pub fts_candidates_ms: f64,
-    pub metadata_ms: f64,
-    pub load_plain_text_ms: f64,
-    pub locate_literals_ms: f64,
-    pub load_chunks_ms: f64,
-    pub group_fragments_ms: f64,
-    pub finalize_ms: f64,
-    /// FTS 匹配到的文档位置数(结构化过滤后)。
-    pub fts_documents: usize,
-    /// FTS 匹配到的内容组数(结构化过滤后)。
-    pub fts_groups: usize,
-    /// 实际进入精确复核的内容组数。
-    pub candidate_groups: usize,
-    /// 实际进入精确复核的文档位置数。
-    pub candidate_locations: usize,
-    /// 精确复核阶段从数据库读取的正文总字节数。
-    pub plain_text_bytes: usize,
-    /// 精确复核阶段读取的分块总数。
-    pub chunk_count: usize,
-    /// 定位出的字面量命中区间总数(正文与标题合计)。
-    pub literal_spans: usize,
-    /// 展开、去重后的查询字面量数。
-    pub literal_count: usize,
-    pub content_locate: LocateDiagnostics,
-    pub title_locate: LocateDiagnostics,
-    /// 包含成功及未找到正文的查询;读取总耗时包含 SQL 执行和文本转换。
-    pub content_reads: usize,
-    pub missing_contents: usize,
-    pub content_decode_ms: f64,
-    /// 同一候选组中首个成功读取位置之外的读取量,不代表正文必然相同。
-    pub extra_group_reads: usize,
-    pub extra_group_bytes: usize,
-    /// 全部候选位置中,按正文读取+定位耗时降序保留前十,包括精确复核未通过者。
-    pub slow_documents: Vec<DocumentSearchDiagnostics>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct LocateDiagnostics {
-    pub lowercase_ms: f64,
-    pub direct_match_ms: f64,
-    pub whitespace_prepare_ms: f64,
-    pub whitespace_scan_ms: f64,
-    pub sort_merge_ms: f64,
-    pub raw_spans: usize,
-    pub merged_spans: usize,
-    pub character_arrays: usize,
-    /// 累计数组元素容量对应的字节数,不是峰值内存或实际分配器占用。
-    pub character_array_bytes: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DocumentSearchDiagnostics {
-    pub document_id: i64,
-    pub plain_text_bytes: usize,
-    pub chunk_count: usize,
-    pub literal_spans: usize,
-    pub read_ms: f64,
-    pub decode_ms: f64,
-    pub locate_ms: f64,
-    pub exact_match: bool,
-    pub missing_content: bool,
 }
 
 impl SearchResponse {
@@ -216,41 +144,25 @@ impl SearchResponse {
 /// 这是唯一的定位与精确过滤入口:标点不剔除,所以 `文档` 不会命中 `文、档`;
 /// 空白/换行不参与比对,所以 `文档` 会命中 `文 档` 与 `文\n档`。
 pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
-    locate_literals_profiled(text, literals, &mut LocateDiagnostics::default())
-}
-
-fn locate_literals_profiled(
-    text: &str,
-    literals: &[String],
-    diagnostics: &mut LocateDiagnostics,
-) -> Vec<Span> {
-    let started = Instant::now();
     let hay = text.to_ascii_lowercase();
-    diagnostics.lowercase_ms += started.elapsed().as_secs_f64() * 1000.0;
     let mut spans: Vec<Span> = Vec::new();
     for literal in literals {
-        let started = Instant::now();
         let needle = literal.to_ascii_lowercase();
-        diagnostics.lowercase_ms += started.elapsed().as_secs_f64() * 1000.0;
         if needle.is_empty() {
             continue;
         }
-        let started = Instant::now();
         for (start, part) in hay.match_indices(&needle) {
             spans.push(Span {
                 start,
                 end: start + part.len(),
             });
         }
-        diagnostics.direct_match_ms += started.elapsed().as_secs_f64() * 1000.0;
         // 逐字索引把空白也当分隔符,所以字面量可能跨空白:`document 管理`
         // 对 `document\n管理` 也应命中。逐字定位一次去空白后的形态。
-        if let Some(skipped) = find_ignoring_whitespace(text, literal, diagnostics) {
+        if let Some(skipped) = find_ignoring_whitespace(text, literal) {
             spans.push(skipped);
         }
     }
-    diagnostics.raw_spans += spans.len();
-    let started = Instant::now();
     spans.sort_by_key(|span| (span.start, span.end));
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for span in spans {
@@ -261,29 +173,14 @@ fn locate_literals_profiled(
             _ => merged.push(span),
         }
     }
-    diagnostics.sort_merge_ms += started.elapsed().as_secs_f64() * 1000.0;
-    diagnostics.merged_spans += merged.len();
     merged
 }
 
 /// 在 `text` 里找 `literal`,允字面量的字符之间隔着空白(与 FTS 逐字索引一致)。
 /// 返回原文字节区间;找不到返回 None。
-fn find_ignoring_whitespace(
-    text: &str,
-    literal: &str,
-    diagnostics: &mut LocateDiagnostics,
-) -> Option<Span> {
-    let started = Instant::now();
+fn find_ignoring_whitespace(text: &str, literal: &str) -> Option<Span> {
     let needle: Vec<char> = literal.chars().filter(|c| !c.is_whitespace()).collect();
-    if needle.is_empty() {
-        diagnostics.whitespace_prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
-        return None;
-    }
-    diagnostics.whitespace_prepare_ms += started.elapsed().as_secs_f64() * 1000.0;
-    let started = Instant::now();
-    let result = scan_ignoring_whitespace(text, &needle);
-    diagnostics.whitespace_scan_ms += started.elapsed().as_secs_f64() * 1000.0;
-    result
+    scan_ignoring_whitespace(text, &needle)
 }
 
 fn scan_ignoring_whitespace(text: &str, needle: &[char]) -> Option<Span> {
@@ -495,13 +392,8 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
     let started = Instant::now();
-    let compile_started = Instant::now();
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
-    let mut diagnostics = SearchDiagnostics {
-        compile_ms: compile_started.elapsed().as_secs_f64() * 1000.0,
-        ..SearchDiagnostics::default()
-    };
 
     // WHERE 子句与参数只拼一次,给「取结果」与「数总数」两条 SQL 共用。
     let mut where_sql = String::from("WHERE documents_fts MATCH ?");
@@ -554,7 +446,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     let group_key = "CASE WHEN length(d.content_hash) = 64 \
         AND d.content_hash NOT GLOB '*[^0-9a-fA-F]*' \
         THEN lower(d.content_hash) ELSE 'id:' || d.id END";
-    let count_started = Instant::now();
     let (total_documents, total_groups): (usize, usize) = conn
         .query_row(
             &format!("SELECT COUNT(*), COUNT(DISTINCT {group_key}) {from_sql} {where_sql}"),
@@ -567,9 +458,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             },
         )
         .context("统计检索命中文档失败")?;
-    diagnostics.fts_count_ms = count_started.elapsed().as_secs_f64() * 1000.0;
-    diagnostics.fts_documents = total_documents;
-    diagnostics.fts_groups = total_groups;
 
     // 先在结构化过滤后的 FTS 结果中按哈希分组再限量,避免大量副本
     // 挤掉其他内容。这里只物化 ID/哈希/分数,不读取候选组以外的正文。
@@ -591,7 +479,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
          JOIN selected_groups g ON g.group_key = m.group_key \
          ORDER BY g.best_rank, g.first_id, m.score, m.id"
     );
-    let candidates_started = Instant::now();
     let candidates = conn
         .prepare(&candidate_sql)
         .context("准备检索语句失败")?
@@ -605,107 +492,42 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .context("执行检索失败")?
         .collect::<Result<Vec<_>, _>>()
         .context("读取检索候选失败")?;
-    diagnostics.fts_candidates_ms = candidates_started.elapsed().as_secs_f64() * 1000.0;
-    diagnostics.candidate_locations = candidates.len();
-    diagnostics.candidate_groups = if candidates.is_empty() {
-        0
-    } else {
-        1 + candidates
-            .windows(2)
-            .filter(|window| window[0].2 != window[1].2)
-            .count()
-    };
     let ids: Vec<i64> = candidates.iter().map(|(id, _, _)| *id).collect();
-    let metadata_started = Instant::now();
     let mut meta = repo::get_documents_by_ids(conn, &ids).context("读取文档元数据失败")?;
-    diagnostics.metadata_ms = metadata_started.elapsed().as_secs_f64() * 1000.0;
     let mut content_stmt =
         conn.prepare("SELECT plain_text FROM document_contents WHERE document_id = ?1")?;
 
     let literals = &compiled.literals;
-    diagnostics.literal_count = literals.len();
     let mut documents = Vec::with_capacity(candidates.len().min(request.max_documents));
     let mut current_key = None;
     let mut representative = None;
-    let mut group_content_read = false;
     for (id, rank, key) in candidates {
         if current_key.as_ref() != Some(&key) {
             current_key = Some(key);
             representative = None;
-            group_content_read = false;
         }
         let Some(document) = meta.remove(&id) else {
             // 候选取回后文档已被删除——跳过。
             continue;
         };
-        let load_plain_text_started = Instant::now();
         // 保持当前行有效直到定位和片段生成结束,直接借用 SQLite 正文。
         // 返回的片段仍拥有自己的字符串,不向调用方泄漏行内借用。
         let mut content_rows = content_stmt.query([id]).context("读取候选文档正文失败")?;
-        let content_row = content_rows.next().context("读取候选文档正文失败")?;
-        let mut decode_ms = 0.0;
-        let content = if let Some(row) = content_row {
-            let started = Instant::now();
-            let text = row
-                .get_ref(0)
-                .context("读取候选文档正文失败")?
-                .as_str()
-                .context("转换候选文档正文失败")?;
-            decode_ms = started.elapsed().as_secs_f64() * 1000.0;
-            Some(text)
-        } else {
-            None
-        };
-        let read_ms = load_plain_text_started.elapsed().as_secs_f64() * 1000.0;
-        diagnostics.load_plain_text_ms += read_ms;
-        diagnostics.content_decode_ms += decode_ms;
-        diagnostics.content_reads += 1;
-        let detail_index = diagnostics.slow_documents.len();
-        diagnostics.slow_documents.push(DocumentSearchDiagnostics {
-            document_id: id,
-            read_ms,
-            decode_ms,
-            missing_content: content.is_none(),
-            ..Default::default()
-        });
-        let Some(content) = content else {
-            diagnostics.missing_contents += 1;
+        let Some(row) = content_rows.next().context("读取候选文档正文失败")? else {
             continue;
         };
-        diagnostics.plain_text_bytes += content.len();
-        diagnostics.slow_documents[detail_index].plain_text_bytes = content.len();
-        if group_content_read {
-            diagnostics.extra_group_reads += 1;
-            diagnostics.extra_group_bytes += content.len();
-        }
-        group_content_read = true;
+        let content = row
+            .get_ref(0)
+            .context("读取候选文档正文失败")?
+            .as_str()
+            .context("转换候选文档正文失败")?;
         // 定位结果直接复用于精确复核与片段生成,不重复调用定位函数。
-        let locate_started = Instant::now();
-        let content_highlights =
-            locate_literals_profiled(content, literals, &mut diagnostics.content_locate);
-        let title_highlights =
-            locate_literals_profiled(&document.title, literals, &mut diagnostics.title_locate);
-        let locate_ms = locate_started.elapsed().as_secs_f64() * 1000.0;
-        diagnostics.locate_literals_ms += locate_ms;
-        diagnostics.literal_spans += content_highlights.len() + title_highlights.len();
-        let detail = &mut diagnostics.slow_documents[detail_index];
-        detail.locate_ms = locate_ms;
-        detail.literal_spans = content_highlights.len() + title_highlights.len();
-        detail.exact_match = detail.literal_spans > 0;
+        let content_highlights = locate_literals(content, literals);
+        let title_highlights = locate_literals(&document.title, literals);
         if content_highlights.is_empty() && title_highlights.is_empty() {
-            let release_started = Instant::now();
-            drop(content_rows);
-            let release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
-            diagnostics.load_plain_text_ms += release_ms;
-            diagnostics.slow_documents[detail_index].read_ms += release_ms;
             continue;
         }
-        let load_chunks_started = Instant::now();
         let bounds = chunk_ranges(conn, id).unwrap_or_default();
-        diagnostics.load_chunks_ms += load_chunks_started.elapsed().as_secs_f64() * 1000.0;
-        diagnostics.chunk_count += bounds.len();
-        diagnostics.slow_documents[detail_index].chunk_count = bounds.len();
-        let group_fragments_started = Instant::now();
         let hits = group_into_fragments(
             content,
             &content_highlights,
@@ -713,14 +535,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             &document.title,
             request.max_fragments_per_document,
         );
-        diagnostics.group_fragments_ms += group_fragments_started.elapsed().as_secs_f64() * 1000.0;
-        // 原 query_row 会在返回前重置语句;借用改造后仍将这部分计入读取,
-        // 避免仅因释放被延后就表现为读取提速。
-        let release_started = Instant::now();
         drop(content_rows);
-        let release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
-        diagnostics.load_plain_text_ms += release_ms;
-        diagnostics.slow_documents[detail_index].read_ms += release_ms;
         let total_for_doc = hits.len();
         documents.push(DocumentHit {
             group_id: *representative.get_or_insert(id),
@@ -732,13 +547,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         });
     }
 
-    let finalize_started = Instant::now();
-    diagnostics.slow_documents.sort_by(|a, b| {
-        (b.read_ms + b.locate_ms)
-            .total_cmp(&(a.read_ms + a.locate_ms))
-            .then(a.document_id.cmp(&b.document_id))
-    });
-    diagnostics.slow_documents.truncate(10);
     // 最高排名位置可能被精确复核剔除,用实际代表的位置重新确定组排序。
     let mut ranked_groups: Vec<_> = documents
         .iter()
@@ -761,7 +569,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .filter(|hit| hit.group_id == hit.document.id)
         .map(|doc| doc.hits.len())
         .sum();
-    diagnostics.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
 
     Ok(SearchResponse {
         documents,
@@ -769,7 +576,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         total_documents,
         total_groups,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
-        diagnostics,
         compiled,
     })
 }
@@ -936,14 +742,11 @@ mod tests {
                 .map(|_| alphabet[next(alphabet.len())])
                 .collect();
             let needle: Vec<_> = literal.chars().filter(|c| !c.is_whitespace()).collect();
-            let mut diagnostics = LocateDiagnostics::default();
             assert_eq!(
-                find_ignoring_whitespace(&text, &literal, &mut diagnostics),
+                find_ignoring_whitespace(&text, &literal),
                 legacy_whitespace_scan(&text, &needle),
                 "正文 {text:?}, 查询 {literal:?}"
             );
-            assert_eq!(diagnostics.character_arrays, 0);
-            assert_eq!(diagnostics.character_array_bytes, 0);
         }
         // 更早的空白匹配不能被后面的直接匹配遮蔽。
         assert_eq!(
