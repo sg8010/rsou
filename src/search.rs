@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, params_from_iter};
+use rusqlite::{Connection, params_from_iter};
 
 use crate::query::{self, CompiledQuery, Scope};
 use crate::repo::{self, DocumentRow};
@@ -639,16 +639,23 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             continue;
         };
         let load_plain_text_started = Instant::now();
+        // 保持当前行有效直到定位和片段生成结束,直接借用 SQLite 正文。
+        // 返回的片段仍拥有自己的字符串,不向调用方泄漏行内借用。
+        let mut content_rows = content_stmt.query([id]).context("读取候选文档正文失败")?;
+        let content_row = content_rows.next().context("读取候选文档正文失败")?;
         let mut decode_ms = 0.0;
-        let content = content_stmt
-            .query_row([id], |row| {
-                let started = Instant::now();
-                let result = row.get::<_, String>(0);
-                decode_ms = started.elapsed().as_secs_f64() * 1000.0;
-                result
-            })
-            .optional()
-            .context("读取候选文档正文失败")?;
+        let content = if let Some(row) = content_row {
+            let started = Instant::now();
+            let text = row
+                .get_ref(0)
+                .context("读取候选文档正文失败")?
+                .as_str()
+                .context("转换候选文档正文失败")?;
+            decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+            Some(text)
+        } else {
+            None
+        };
         let read_ms = load_plain_text_started.elapsed().as_secs_f64() * 1000.0;
         diagnostics.load_plain_text_ms += read_ms;
         diagnostics.content_decode_ms += decode_ms;
@@ -675,7 +682,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         // 定位结果直接复用于精确复核与片段生成,不重复调用定位函数。
         let locate_started = Instant::now();
         let content_highlights =
-            locate_literals_profiled(&content, literals, &mut diagnostics.content_locate);
+            locate_literals_profiled(content, literals, &mut diagnostics.content_locate);
         let title_highlights =
             locate_literals_profiled(&document.title, literals, &mut diagnostics.title_locate);
         let locate_ms = locate_started.elapsed().as_secs_f64() * 1000.0;
@@ -686,6 +693,11 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         detail.literal_spans = content_highlights.len() + title_highlights.len();
         detail.exact_match = detail.literal_spans > 0;
         if content_highlights.is_empty() && title_highlights.is_empty() {
+            let release_started = Instant::now();
+            drop(content_rows);
+            let release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
+            diagnostics.load_plain_text_ms += release_ms;
+            diagnostics.slow_documents[detail_index].read_ms += release_ms;
             continue;
         }
         let load_chunks_started = Instant::now();
@@ -695,13 +707,20 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         diagnostics.slow_documents[detail_index].chunk_count = bounds.len();
         let group_fragments_started = Instant::now();
         let hits = group_into_fragments(
-            &content,
+            content,
             &content_highlights,
             &bounds,
             &document.title,
             request.max_fragments_per_document,
         );
         diagnostics.group_fragments_ms += group_fragments_started.elapsed().as_secs_f64() * 1000.0;
+        // 原 query_row 会在返回前重置语句;借用改造后仍将这部分计入读取,
+        // 避免仅因释放被延后就表现为读取提速。
+        let release_started = Instant::now();
+        drop(content_rows);
+        let release_ms = release_started.elapsed().as_secs_f64() * 1000.0;
+        diagnostics.load_plain_text_ms += release_ms;
+        diagnostics.slow_documents[detail_index].read_ms += release_ms;
         let total_for_doc = hits.len();
         documents.push(DocumentHit {
             group_id: *representative.get_or_insert(id),

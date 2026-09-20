@@ -51,6 +51,92 @@ fn request() -> SearchRequest {
 }
 
 #[test]
+fn borrowed_content_produces_owned_fragments_after_rows_and_connection_close() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    let pieces = ["甲文档🙂", "乙文 档", "丙文档"];
+    for (index, piece) in pieces.iter().enumerate() {
+        save(&mut conn, &format!("/d/{index}.txt"), "说明", &[piece]);
+    }
+    let response = search::search(&conn, &request()).unwrap();
+    drop(conn);
+    assert_eq!(response.documents.len(), pieces.len());
+    for doc in &response.documents {
+        let index: usize = doc
+            .document
+            .file_name
+            .trim_end_matches(".txt")
+            .parse()
+            .unwrap();
+        let hit = &doc.hits[0];
+        assert_eq!(hit.content, pieces[index]);
+        assert_eq!(hit.start_offset, 0);
+        assert_eq!(hit.end_offset, pieces[index].len());
+        assert_eq!(hit.highlights.len(), 1);
+        let span = hit.highlights[0];
+        assert_eq!(
+            &hit.content[span.start..span.end],
+            if index == 1 { "文 档" } else { "文档" }
+        );
+    }
+}
+
+#[test]
+fn borrowed_content_rejects_invalid_utf8() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    save(&mut conn, "/d/bad.txt", "说明", &["文档"]);
+    conn.execute_batch(
+        "ALTER TABLE document_contents RENAME TO stored_contents;
+         CREATE VIEW document_contents AS
+         SELECT document_id, CAST(X'FF' AS TEXT) AS plain_text FROM stored_contents;",
+    )
+    .unwrap();
+    let error = search::search(&conn, &request()).unwrap_err();
+    assert!(error.to_string().contains("转换候选文档正文失败"));
+}
+
+#[test]
+#[ignore = "手动性能对照：cargo test -p rsou --release --test search_candidates borrowed_content_benchmark -- --ignored --nocapture"]
+fn borrowed_content_benchmark() {
+    let conn = rsou_lib::store::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TEMP TABLE read_benchmark (id INTEGER PRIMARY KEY, plain_text TEXT NOT NULL)",
+    )
+    .unwrap();
+    let text = "普通单元格123\t".repeat(1_000_000);
+    conn.execute("INSERT INTO read_benchmark VALUES (1, ?1)", [&text])
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT plain_text FROM read_benchmark WHERE id = ?1")
+        .unwrap();
+    // 两条路径均校验 UTF-8,在同一连接、相同查询和热缓存上交替测量。
+    for round in 0..3 {
+        for owned in [round % 2 == 0, round % 2 != 0] {
+            let started = std::time::Instant::now();
+            let mut bytes = 0;
+            for _ in 0..10 {
+                if owned {
+                    let content: String = stmt.query_row([1], |row| row.get(0)).unwrap();
+                    bytes += std::hint::black_box(content.as_str()).len();
+                } else {
+                    let mut rows = stmt.query([1]).unwrap();
+                    let row = rows.next().unwrap().unwrap();
+                    let content = row.get_ref(0).unwrap().as_str().unwrap();
+                    bytes += std::hint::black_box(content).len();
+                }
+            }
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(bytes, text.len() * 10);
+            eprintln!(
+                "第 {} 轮 {}：10 次共 {} 字节，{elapsed:.3} ms",
+                round + 1,
+                if owned { "优化前" } else { "优化后" },
+                bytes
+            );
+        }
+    }
+}
+
+#[test]
 fn diagnostics_count_all_reads_and_rejected_candidates() {
     let mut conn = rsou_lib::store::open_in_memory().unwrap();
     let first = save(&mut conn, "/d/a.txt", "说明", &["文档"]);
