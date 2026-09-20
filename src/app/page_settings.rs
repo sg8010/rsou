@@ -369,6 +369,7 @@ impl RsouApp {
     /// 卡片 4:解析选项。
     fn ui_settings_parse(&mut self, ui: &mut egui::Ui) {
         let mut new_max_mb = None;
+        let mut new_save_markdown = None;
         Self::card(ui, |ui| {
             Self::card_title(ui, "解析选项");
             Self::thin_divider(ui);
@@ -396,9 +397,25 @@ impl RsouApp {
                     .size(12.0)
                     .color(Self::text_muted()),
             );
+            ui.add_space(10.0);
+            let mut save_markdown = self.save_markdown;
+            if Self::accent_checkbox(ui, &mut save_markdown, "保存 Markdown 原文").changed() {
+                new_save_markdown = Some(save_markdown);
+            }
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "关闭时只保存纯文本,索引文件更小;仅影响新导入的文档,不改写已有数据",
+                )
+                .size(12.0)
+                .color(Self::text_muted()),
+            );
         });
         if let Some(mb) = new_max_mb {
             self.set_max_file_mb(mb);
+        }
+        if let Some(enabled) = new_save_markdown {
+            self.set_save_markdown(enabled);
         }
     }
 

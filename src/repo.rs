@@ -139,6 +139,9 @@ impl FileMeta {
 }
 
 /// 解析 + 文本化 + 分块后的完整产物(worker 线程产出,写库线程消费)。
+///
+/// `markdown` 是过程数据:plain/标题/分块都由它派生,但是否落库由
+/// `settings.save_markdown` 决定(见 `save_parsed_in`)。
 #[derive(Debug)]
 pub struct ParsedDocument {
     pub title: String,
@@ -299,12 +302,19 @@ pub fn save_parsed_in(
     )?;
     clear_document_body(conn, id)?;
 
+    // markdown 只是过程数据(plain/标题/分块都由它派生):默认不持久化,
+    // settings.save_markdown=1 时才落库(设置页开关;省一份全文体积)。
+    let markdown = if save_markdown_enabled(conn) {
+        parsed.markdown.as_str()
+    } else {
+        ""
+    };
     conn.execute(
         "INSERT INTO document_contents(document_id, markdown, plain_text, warnings_json) \
          VALUES (?1, ?2, ?3, ?4)",
         params![
             id,
-            parsed.markdown,
+            markdown,
             parsed.plain.text,
             warnings_to_json(&parsed.warnings),
         ],
@@ -640,6 +650,19 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> anyhow::Result<
 pub const DEFAULT_MAX_FILE_MB: u64 = 100;
 pub const MAX_FILE_MB_LIMIT: u64 = 2048;
 
+/// settings.save_markdown 的默认值:不保存(索引文件小一半左右)。
+pub const DEFAULT_SAVE_MARKDOWN: bool = false;
+
+/// 是否持久化 document_contents.markdown:读 settings.save_markdown,
+/// 缺失、非法或读取出错时回默认(写库路径上不为配置项读失败而中断导入)。
+pub fn save_markdown_enabled(conn: &Connection) -> bool {
+    get_setting(conn, "save_markdown")
+        .ok()
+        .flatten()
+        .map(|value| value.trim() == "1")
+        .unwrap_or(DEFAULT_SAVE_MARKDOWN)
+}
+
 /// 单文件体积上限(字节):读 settings.max_file_mb,缺失或非法时回默认。
 pub fn max_file_bytes(conn: &Connection) -> u64 {
     let mb = get_setting(conn, "max_file_mb")
@@ -881,5 +904,79 @@ mod tests {
             "应已改判为单独文件"
         );
         assert_eq!(list_standalone_documents(&conn).unwrap().len(), 1);
+    }
+
+    /// 与 save_doc 同款,但带一份非空 markdown 供开关断言。
+    fn save_doc_with_markdown(conn: &mut Connection, path: &str, markdown: &str) -> i64 {
+        let meta = FileMeta {
+            path: path.into(),
+            canonical_path: path.into(),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            ext: "txt".to_owned(),
+            file_type: FileType::Text,
+            file_size: 1,
+            file_mtime_ms: 1,
+            source_root: None,
+        };
+        let plain = text::markdown_to_plain(markdown);
+        let title = text::extract_title(&plain, &meta.stem());
+        let chunks = crate::chunk::chunk_document(&title, &plain);
+        let parsed = ParsedDocument {
+            title,
+            markdown: markdown.to_owned(),
+            plain,
+            chunks,
+            warnings: Vec::new(),
+            parser_name: "t",
+            parser_version: "t",
+        };
+        save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
+    }
+
+    fn stored_markdown(conn: &Connection, document_id: i64) -> String {
+        conn.query_row(
+            "SELECT markdown FROM document_contents WHERE document_id = ?1",
+            params![document_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn markdown_is_not_persisted_by_default() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        assert!(!save_markdown_enabled(&conn));
+
+        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容");
+        assert_eq!(stored_markdown(&conn, id), "", "默认应只存 plain_text");
+        // 纯文本与检索不受影响。
+        assert_eq!(
+            get_plain_text(&conn, id).unwrap().unwrap(),
+            "标题\n\n正文内容"
+        );
+    }
+
+    #[test]
+    fn save_markdown_setting_controls_persistence() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        set_setting(&conn, "save_markdown", "1").unwrap();
+        assert!(save_markdown_enabled(&conn));
+
+        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容");
+        assert_eq!(stored_markdown(&conn, id), "# 标题\n正文内容");
+
+        // 关掉后重解析同一文件:正文照常重写,markdown 被清成空串。
+        set_setting(&conn, "save_markdown", "0").unwrap();
+        assert!(!save_markdown_enabled(&conn));
+        save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容v2");
+        assert_eq!(
+            stored_markdown(&conn, id),
+            "",
+            "关闭后重导入应不再存 markdown"
+        );
+        assert_eq!(
+            get_plain_text(&conn, id).unwrap().unwrap(),
+            "标题\n\n正文内容v2"
+        );
     }
 }

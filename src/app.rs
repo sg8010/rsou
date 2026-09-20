@@ -368,6 +368,8 @@ pub struct RsouApp {
     settings_notice: Option<String>,
     /// 单文件体积上限(MB;settings.max_file_mb,设置页 DragValue)
     max_file_mb: u64,
+    /// 是否持久化 Markdown 中间稿(settings.save_markdown,设置页复选框)
+    save_markdown: bool,
     /// 最近一次用户词典加载结果(启动时与设置页「重新加载」时更新)
     dict_report: DictReport,
     /// 词典卡片的两个「快速添加」输入框(用户词 / 同义词组)
@@ -459,6 +461,7 @@ impl RsouApp {
             confirm_clear: false,
             settings_notice: None,
             max_file_mb: rsou_lib::repo::DEFAULT_MAX_FILE_MB,
+            save_markdown: rsou_lib::repo::DEFAULT_SAVE_MARKDOWN,
             dict_report: DictReport::default(),
             dict_user_word_input: String::new(),
             dict_synonym_input: String::new(),

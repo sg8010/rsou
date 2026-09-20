@@ -264,7 +264,7 @@ CREATE TABLE IF NOT EXISTS documents (
 
 CREATE TABLE IF NOT EXISTS document_contents (
   document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
-  markdown TEXT NOT NULL,               -- anydoc 产物,可选展示
+  markdown TEXT NOT NULL,               -- anydoc 产物;settings.save_markdown=1 才存,否则空串
   plain_text TEXT NOT NULL,             -- 从 markdown 提取的纯文本,偏移基准
   warnings_json TEXT NOT NULL DEFAULT '[]'
 ) STRICT;

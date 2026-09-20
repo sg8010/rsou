@@ -40,6 +40,7 @@ impl RsouApp {
             .and_then(|value| value.trim().parse::<u64>().ok())
             .filter(|mb| (1..=repo::MAX_FILE_MB_LIMIT).contains(mb))
             .unwrap_or(repo::DEFAULT_MAX_FILE_MB);
+        self.save_markdown = repo::save_markdown_enabled(conn);
     }
 
     /// 加载 / 重新加载用户词典(启动与设置页「重新加载」都走这里)。
@@ -63,6 +64,17 @@ impl RsouApp {
             && let Err(error) = repo::set_setting(conn, "max_file_mb", &mb.to_string())
         {
             log::warn!("保存 max_file_mb 失败: {error:#}");
+        }
+    }
+
+    /// 设置页复选框变更时持久化(下一次导入起生效;不改写已入库数据)。
+    pub(crate) fn set_save_markdown(&mut self, enabled: bool) {
+        self.save_markdown = enabled;
+        if let Some(conn) = &self.db
+            && let Err(error) =
+                repo::set_setting(conn, "save_markdown", if enabled { "1" } else { "0" })
+        {
+            log::warn!("保存 save_markdown 失败: {error:#}");
         }
     }
 
