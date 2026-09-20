@@ -360,7 +360,7 @@ impl RsouApp {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
-                    // 工具行拆成标题和操作两行,避免长标题把右侧按钮挤出面板。
+                    // 标题、路径和操作各占一行,长路径换行后也不会侵占按钮空间。
                     if let Some(doc) = &document {
                         let title = if doc.title.is_empty() {
                             &doc.file_name
@@ -376,12 +376,15 @@ impl RsouApp {
                             )
                             .truncate(),
                         );
-                        ui.horizontal(|ui| {
-                            ui.label(
+                        ui.add(
+                            egui::Label::new(
                                 egui::RichText::new(&doc.path)
                                     .size(11.0)
                                     .color(Self::text_muted()),
-                            );
+                            )
+                            .wrap(),
+                        );
+                        ui.horizontal(|ui| {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
