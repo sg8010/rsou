@@ -221,7 +221,7 @@ impl RsouApp {
         }
     }
 
-    /// 卡片 3:索引维护(四个操作 + 重建进度 + 二次确认清空)。
+    /// 卡片 3:索引维护(检查/重建/优化/清理 Markdown/清空 + 重建进度 + 二次确认清空)。
     fn ui_settings_maintenance(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<MaintainKind> = None;
         let mut clear_confirm = false;
@@ -276,6 +276,14 @@ impl RsouApp {
                         .clicked()
                     {
                         action = Some(MaintainKind::Optimize);
+                    }
+                    if Self::small_secondary_button(ui, Some(Icon::Doc), "清理 Markdown", 0.0, true)
+                        .on_hover_text(
+                            "把已入库的 Markdown 原文清空(纯文本与索引不受影响)并压缩索引文件",
+                        )
+                        .clicked()
+                    {
+                        action = Some(MaintainKind::ClearMarkdown);
                     }
                     if self.confirm_clear {
                         if Self::small_danger_outline_button(

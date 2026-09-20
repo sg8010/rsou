@@ -186,14 +186,24 @@ mod tests {
             )
             .unwrap();
 
-        let title: String = connection
+        let matched: bool = connection
             .query_row(
-                "SELECT title FROM documents_fts WHERE documents_fts MATCH ?1 AND rowid = 1",
+                "SELECT count(*) > 0 FROM documents_fts \
+                 WHERE documents_fts MATCH ?1 AND rowid = 1",
                 ["\"合同\""],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(title, "合同");
+        assert!(matched);
+        // contentless-delete 表不存列值:读回恒为 NULL,正文只有 plain_text 一份。
+        let title: Option<String> = connection
+            .query_row(
+                "SELECT title FROM documents_fts WHERE rowid = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, None);
 
         // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;
         // 这是已知行为,由检索层的二次精确过滤收口(见 plan §6.4)。

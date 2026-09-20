@@ -57,42 +57,12 @@ fn run_with_options(
     (counts, outcomes)
 }
 
-/// 验证索引不变式(文档级 FTS):
-/// - 每篇已解析文档恰好一行 FTS,且 `content == plain_text`、`title == documents.title`;
-/// - FTS 行数 == 已解析文档数;
+/// 验证索引不变式(文档级 contentless-delete FTS):
+/// - 每篇已解析文档恰好一行 FTS:`rowid == documents.id` 且双向差集为空
+///   (FTS 不存列值,词元正确性由检索行为/重建覆盖);
 /// - 展示分块 `chunks` 的区间落在 `plain_text` 内且与原文逐字节一致、互不重叠。
 fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
-    let mut stmt = conn
-        .prepare(
-            "SELECT d.title, f.title, dc.plain_text, f.content \
-             FROM documents d \
-             JOIN documents_fts f ON f.rowid = d.id \
-             JOIN document_contents dc ON dc.document_id = d.id \
-             WHERE d.parse_status = 'parsed'",
-        )
-        .unwrap();
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert!(!rows.is_empty(), "应至少有一篇已索引文档");
-    for (doc_title, fts_title, plain, content) in &rows {
-        assert_eq!(fts_title, doc_title, "FTS 标题应与 documents.title 相等");
-        assert_eq!(content, plain, "FTS 内容应与 plain_text 逐字节相等");
-    }
-
-    // FTS 行数 == 已解析文档数。
-    let fts: i64 = conn
-        .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
-        .unwrap();
+    // FTS 行数 == 已解析文档数,且双向差集为空。
     let parsed: i64 = conn
         .query_row(
             "SELECT count(*) FROM documents WHERE parse_status = 'parsed'",
@@ -100,7 +70,28 @@ fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
             |r| r.get(0),
         )
         .unwrap();
+    assert!(parsed > 0, "应至少有一篇已索引文档");
+    let fts: i64 = conn
+        .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(fts, parsed);
+    let missing: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents d WHERE d.parse_status = 'parsed' \
+             AND d.id NOT IN (SELECT rowid FROM documents_fts)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let orphan: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents_fts \
+             WHERE rowid NOT IN (SELECT id FROM documents)",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((missing, orphan), (0, 0), "FTS 与 documents 的行集合应对齐");
 
     // 展示分块的偏移不变式:区间落在 plain_text 内、与原文一致、单调不重叠。
     let mut stmt = conn

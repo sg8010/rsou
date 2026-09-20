@@ -27,7 +27,21 @@ impl RsouApp {
         // 启动时后台读一遍,资料库页首次进入就有数据
         app.request_documents_refresh();
         app.load_settings();
+        // schema 迁移丢弃旧索引后:后台自动重建,不阻塞启动;
+        // 进度走维护通道,设置页卡片可见。
+        if app.fts_rebuild_pending() {
+            app.library_notice = Some("索引格式已升级,正在后台重建全文索引…".to_owned());
+            app.start_maintain(&cc.egui_ctx, MaintainKind::Rebuild);
+        }
         app
+    }
+
+    /// 全文索引是否处于待重建状态(旧库迁移丢弃索引后置位,重建完成自动消除)。
+    fn fts_rebuild_pending(&self) -> bool {
+        self.db
+            .as_ref()
+            .and_then(|conn| maintain::needs_fts_rebuild(conn).ok())
+            .unwrap_or(false)
     }
 
     /// 读 settings 里的用户配置,并加载数据目录下的用户词典。
@@ -462,7 +476,7 @@ impl RsouApp {
             .spawn(move || {
                 let result =
                     store::open(&db_path, OpenMode::ReadWrite).and_then(|mut conn| match kind {
-                        MaintainKind::Check => maintain::check_integrity(&conn, 2000)
+                        MaintainKind::Check => maintain::check_integrity(&conn)
                             .map(|report| (report.summary(), !report.is_consistent())),
                         MaintainKind::Rebuild => {
                             maintain::rebuild_fts(&mut conn, &mut |done, total| {
@@ -475,6 +489,17 @@ impl RsouApp {
                         MaintainKind::Optimize => {
                             maintain::optimize(&conn).map(|()| ("索引已优化".to_owned(), false))
                         }
+                        MaintainKind::ClearMarkdown => maintain::purge_stored_markdown(&conn)
+                            .and_then(|cleared| {
+                                maintain::optimize(&conn).map(|()| {
+                                    (
+                                        format!(
+                                            "已清理 {cleared} 篇文档的 Markdown 原文并压缩索引文件"
+                                        ),
+                                        false,
+                                    )
+                                })
+                            }),
                         MaintainKind::Clear => maintain::clear_all(&mut conn)
                             .map(|()| ("资料库已清空".to_owned(), false)),
                     });

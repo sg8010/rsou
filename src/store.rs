@@ -23,7 +23,15 @@ use crate::tokenize;
 /// 版本 3 给 documents 加 `source_root`:记录文档是被哪个「已添加文件夹」导入的
 /// (NULL = 单独添加的文件)。旧的「文件夹 → 文档」归属关系没存过,无法补,
 /// 但加上列后新导入就能用了;旧库升上来时存量文档一律归到「单独文件」页。
-pub const SCHEMA_VERSION: &str = "3";
+/// 版本 4 把 documents_fts 改成 contentless-delete 表(`content=''`):
+/// 全文只在 `document_contents.plain_text` 存一份,FTS 不再重复存约一倍体积。
+/// 旧表整个丢弃(索引由启动后的维护任务重灌,不在 open 里做全量重建),
+/// 检索语义不变。
+pub const SCHEMA_VERSION: &str = "4";
+
+/// 待重建标志:迁移丢弃旧 FTS 表时置 '1',`maintain::rebuild_fts` 提交时清掉。
+/// GUI 启动读到它即自动发起重建;CLI 各命令打印提示。
+pub(crate) const FTS_REBUILD_PENDING_KEY: &str = "fts_rebuild_pending";
 
 /// 数据目录布局:`data_dir/index.sqlite3` + `data_dir/tmp/`。
 #[derive(Debug, Clone)]
@@ -146,6 +154,9 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     // “no such column”。所以先把缺的列补上,再跑 SCHEMA_SQL(CREATE TABLE/INDEX
     // 都是 IF NOT EXISTS,对新库和已升上来的旧库都幂等)。
     add_missing_columns(connection)?;
+    // v3 及以前:documents_fts 是普通表(整存一份全文)。先把它丢掉,SCHEMA_SQL
+    // 的 CREATE IF NOT EXISTS 才会建出新的 contentless-delete 表。
+    drop_legacy_fts(connection)?;
     connection
         .execute_batch(SCHEMA_SQL)
         .context("创建索引库表结构失败")?;
@@ -167,12 +178,48 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
 
 /// 能否从 `from` 就地升级到当前版本。
 ///
-/// 只允许**纯追加列**的那一步:v2 → v3 只是给 `documents` 加了可空的
-/// `source_root`,不动任何已有数据,所以升级不丢索引、不需要重新导入。
-/// v1 → v2 改的是 FTS 表结构(每分块一行 → 每文档一行),语义变了、无法
-/// 就地沿用,因此继续拒绝并提示重建。
+/// - v2 → v4:补 `source_root` 列(v3 那一步)+ 换 contentless-delete FTS 表;
+/// - v3 → v4:只换 FTS 表结构。
+///
+/// 都不丢文档数据;旧 FTS 表丢弃后索引由维护任务重建(见 `drop_legacy_fts`)。
+/// v1 的 chunks_fts 是每分块一行的另一套结构,继续拒绝并提示重建。
 fn can_upgrade_from(from: &str) -> bool {
-    from == "2"
+    matches!(from, "2" | "3")
+}
+
+/// v4 迁移:旧 documents_fts 是普通 FTS5 表(带 %_content 影子表,整存一份
+/// 全文);contentless-delete 表没有 %_content——以影子表是否存在判定旧格式,
+/// 与 schema_version 无关。
+///
+/// 发现旧表即 DROP(影子表随主表一起删),新表交给 SCHEMA_SQL 的
+/// CREATE IF NOT EXISTS;同时置 `fts_rebuild_pending`,索引由启动后的维护
+/// 任务重建——全量重灌若在 open 里做会长时间卡住 GUI 启动。DROP 后崩溃的
+/// 话下次打开:影子表已无 → 不再进本函数,空索引由 `maintain::needs_fts_rebuild`
+/// 兜底识别,不会丢状态。
+fn drop_legacy_fts(connection: &Connection) -> anyhow::Result<()> {
+    let legacy: bool = connection
+        .query_row(
+            "SELECT count(*) > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'documents_fts_content'",
+            [],
+            |row| row.get(0),
+        )
+        .context("检查旧全文索引表结构失败")?;
+    if !legacy {
+        return Ok(());
+    }
+    connection
+        .execute_batch("DROP TABLE documents_fts")
+        .context("丢弃旧全文索引表失败")?;
+    connection
+        .execute(
+            "INSERT INTO settings(key, value) VALUES (?1, '1') \
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [FTS_REBUILD_PENDING_KEY],
+        )
+        .context("写入重建标志失败")?;
+    log::info!("documents_fts 已升级为 contentless-delete 格式,等待重建全文索引");
+    Ok(())
 }
 
 /// 把当前 schema 里有、而旧库缺的列补上(CREATE TABLE IF NOT EXISTS 不会动已存在的表)。
@@ -279,13 +326,18 @@ CREATE TABLE IF NOT EXISTS chunks (
   UNIQUE (document_id, chunk_index)
 ) STRICT;
 
--- 普通 FTS5 表:rowid 显式取 documents.id,**一行 = 一篇文档**。
+-- contentless-delete FTS5 表:rowid 显式取 documents.id,**一行 = 一篇文档**。
 -- 因此 FTS 的隐式 AND / OR / NOT 都是文档级语义(多词只要同篇命中即可),
--- 不会因为分块边界丢掉召回。content 就是 document_contents.plain_text 全文,
--- 高亮由检索层直接在原文上定位字面量,不用 FTS5 的 highlight()。
+-- 不会因为分块边界丢掉召回。
+-- content='' + contentless_delete=1:写入的 title/content 只建索引、不落存储,
+-- 全文只在 document_contents.plain_text 存一份(省约一倍体积);列值读回恒为
+-- NULL,检索只用 MATCH/rank/rowid。删除按 rowid 直接回收词元,不需要像外部
+-- 内容表那样先回读旧值——任何顺序都不会留残留。
 -- tokenizer 'rsou' 由本程序注册(参数 '0' = 关闭拼音,与 wsou 的 simple 0 对齐)。
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   title, content,
+  content = '',
+  contentless_delete = 1,
   tokenize = 'rsou 0'
 );
 
@@ -459,7 +511,7 @@ mod tests {
             assert_required_indexes_only(&connection);
             assert_eq!(
                 stored_schema_version(&connection).unwrap().as_deref(),
-                Some("3")
+                Some(SCHEMA_VERSION)
             );
             let markdown: String = connection
                 .query_row(
@@ -630,6 +682,84 @@ mod tests {
         assert!(!can_upgrade_from("0"));
         assert!(!can_upgrade_from("999"));
         assert!(can_upgrade_from("2"));
+        assert!(can_upgrade_from("3"));
+    }
+
+    #[test]
+    fn v3_database_migrates_fts_to_contentless_and_flags_rebuild() {
+        // 模拟 v3:documents_fts 是普通表(带 _content 影子表、另存一份全文)。
+        let path = temp_db("migrate-v3");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE documents_fts;
+                     CREATE VIRTUAL TABLE documents_fts USING fts5(title, content, tokenize='rsou 0');
+                     UPDATE settings SET value = '3' WHERE key = 'schema_version';
+                     INSERT INTO documents(path, canonical_path, file_name, title, ext, file_type,
+                         file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at)
+                         VALUES ('/d/a.txt', '/d/a.txt', 'a.txt', '甲标题', 'txt', 'text',
+                                 1, 1, 'h', 'parsed', 1, 1);
+                     INSERT INTO document_contents(document_id, markdown, plain_text)
+                         VALUES (1, '# 甲标题', '甲标题 正文 alpha');
+                     INSERT INTO documents_fts(rowid, title, content)
+                         VALUES (1, '甲标题', '甲标题 正文 alpha');",
+                )
+                .unwrap();
+            // 普通表确实带 _content 影子表。
+            let shadow: bool = connection
+                .query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master \
+                     WHERE type = 'table' AND name = 'documents_fts_content'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(shadow, "模拟的普通表应有 %_content 影子表");
+        }
+
+        // 重新打开:旧表被丢弃、新表为空、置重建标志、版本升到 4。
+        let connection = open(&path, OpenMode::ReadWrite).unwrap();
+        assert_eq!(
+            stored_schema_version(&connection).unwrap().as_deref(),
+            Some(SCHEMA_VERSION)
+        );
+        let shadow: bool = connection
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'documents_fts_content'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!shadow, "contentless-delete 表不应有 %_content 影子表");
+        let fts_rows: i64 = connection
+            .query_row("SELECT count(*) FROM documents_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 0, "迁移只丢弃旧索引,重建由维护任务做");
+        assert_eq!(
+            crate::repo::get_setting(&connection, FTS_REBUILD_PENDING_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        assert!(crate::maintain::needs_fts_rebuild(&connection).unwrap());
+
+        // 文档数据不动,重建后检索恢复。
+        let mut connection = connection;
+        let rows = crate::maintain::rebuild_fts(&mut connection, &mut |_, _| {}).unwrap();
+        assert_eq!(rows, 1);
+        assert!(!crate::maintain::needs_fts_rebuild(&connection).unwrap());
+        let hits: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"alpha\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

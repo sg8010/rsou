@@ -3,10 +3,11 @@
 //! 写入约定:
 //! - 单文档的「内容+分块+FTS」在一个 `BEGIN IMMEDIATE` 事务里完成,
 //!   不会出现半成品可检索(见 docs/plan.md §5.2);
-//! - FTS 是普通表,**一行一篇文档**,删除即 `DELETE FROM documents_fts WHERE rowid = ?`,
-//!   rowid 显式等于 documents.id;
-//! - `documents_fts.content` 与 `document_contents.plain_text` 是同一份全文
-//!   (不是分块文本);分块只用于展示,由检索层按字节偏移切片段;
+//! - FTS 是 contentless-delete 表,**一行一篇文档**,删除即
+//!   `DELETE FROM documents_fts WHERE rowid = ?`(按 rowid 直接清词元,
+//!   不需要回读旧值,对删除顺序没有要求),rowid 显式等于 documents.id;
+//! - 全文只在 `document_contents.plain_text` 存一份;FTS 的 title/content 列
+//!   只建索引不落存储(读回恒 NULL);分块只用于展示,由检索层按字节偏移切片段;
 //! - 时间戳一律 Unix 毫秒。
 
 use std::path::{Path, PathBuf};
@@ -337,6 +338,7 @@ pub fn save_parsed_in(
     drop(insert_chunk);
 
     // 一篇文档一行:FTS 的 AND/OR/NOT 因而都是文档级语义。
+    // contentless-delete 表:这里的 title/content 只进倒排索引,不落存储。
     conn.execute(
         "INSERT INTO documents_fts(rowid, title, content) VALUES (?1, ?2, ?3)",
         params![id, parsed.title, parsed.plain.text],
@@ -446,6 +448,8 @@ fn upsert_document(
 }
 
 /// 清掉文档旧的正文/分块/FTS(重解析与失败写库共用)。
+/// contentless-delete 下 FTS 删除按 rowid 清词元,与 contents 谁先谁后无所谓;
+/// 保持「FTS 先行」只是沿用旧约定的直观顺序。
 fn clear_document_body(conn: &Connection, document_id: i64) -> anyhow::Result<()> {
     conn.execute(
         "DELETE FROM documents_fts WHERE rowid = ?1",
@@ -462,7 +466,7 @@ fn clear_document_body(conn: &Connection, document_id: i64) -> anyhow::Result<()
     Ok(())
 }
 
-/// 删除整篇文档(FTS 先行,再靠外键级联清 chunks/contents)。
+/// 删除整篇文档(先删 FTS 行,再删 documents 靠外键级联清 chunks/contents)。
 pub fn delete_document(conn: &mut Connection, id: i64) -> anyhow::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -485,7 +489,7 @@ pub fn delete_source_root(conn: &mut Connection, source_root: &str) -> anyhow::R
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启移除文件夹事务失败")?;
-    // FTS 先行(与 delete_document 同序),再删 documents 靠外键级联清
+    // 与 delete_document 同序:先删 FTS 行,再删 documents 靠外键级联清
     // chunks/contents。
     tx.execute(
         "DELETE FROM documents_fts WHERE rowid IN \
@@ -863,7 +867,7 @@ mod tests {
         assert_eq!(list_standalone_documents(&conn).unwrap().len(), 1);
 
         // FTS 也不该留下被删文档的行(否则完整性检查会报孤儿)。
-        let report = crate::maintain::check_integrity(&conn, 100).unwrap();
+        let report = crate::maintain::check_integrity(&conn).unwrap();
         assert!(report.is_consistent(), "{}", report.summary());
     }
 
@@ -907,7 +911,12 @@ mod tests {
     }
 
     /// 与 save_doc 同款,但带一份非空 markdown 供开关断言。
-    fn save_doc_with_markdown(conn: &mut Connection, path: &str, markdown: &str) -> i64 {
+    fn save_doc_with_markdown(
+        conn: &mut Connection,
+        path: &str,
+        source_root: Option<&str>,
+        markdown: &str,
+    ) -> i64 {
         let meta = FileMeta {
             path: path.into(),
             canonical_path: path.into(),
@@ -916,7 +925,7 @@ mod tests {
             file_type: FileType::Text,
             file_size: 1,
             file_mtime_ms: 1,
-            source_root: None,
+            source_root: source_root.map(str::to_owned),
         };
         let plain = text::markdown_to_plain(markdown);
         let title = text::extract_title(&plain, &meta.stem());
@@ -947,7 +956,7 @@ mod tests {
         let mut conn = crate::store::open_in_memory().unwrap();
         assert!(!save_markdown_enabled(&conn));
 
-        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容");
+        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 标题\n正文内容");
         assert_eq!(stored_markdown(&conn, id), "", "默认应只存 plain_text");
         // 纯文本与检索不受影响。
         assert_eq!(
@@ -962,13 +971,13 @@ mod tests {
         set_setting(&conn, "save_markdown", "1").unwrap();
         assert!(save_markdown_enabled(&conn));
 
-        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容");
+        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 标题\n正文内容");
         assert_eq!(stored_markdown(&conn, id), "# 标题\n正文内容");
 
         // 关掉后重解析同一文件:正文照常重写,markdown 被清成空串。
         set_setting(&conn, "save_markdown", "0").unwrap();
         assert!(!save_markdown_enabled(&conn));
-        save_doc_with_markdown(&mut conn, "/d/a.txt", "# 标题\n正文内容v2");
+        save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 标题\n正文内容v2");
         assert_eq!(
             stored_markdown(&conn, id),
             "",
@@ -978,5 +987,61 @@ mod tests {
             get_plain_text(&conn, id).unwrap().unwrap(),
             "标题\n\n正文内容v2"
         );
+    }
+
+    /// 查询某个短语在 FTS 里的命中行数(验证词元级行为,不读列值)。
+    fn match_count(conn: &Connection, phrase: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
+            [format!("\"{phrase}\"")],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reimport_replaces_stale_index_terms() {
+        // contentless-delete:同一路径重导入时,先 DELETE 同 rowid 行——
+        // 旧词元必须随之消失,不能留下可命中的残留。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let id = save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 旧标题\n\n独有旧词");
+        let same_id = save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 新标题\n\n独有新词");
+        assert_eq!(id, same_id, "重导入应复用同一 documents.id");
+
+        assert_eq!(match_count(&conn, "独有旧词"), 0, "旧正文词元应已清掉");
+        assert_eq!(match_count(&conn, "旧标题"), 0, "旧标题词元应已清掉");
+        assert_eq!(match_count(&conn, "独有新词"), 1);
+        assert_eq!(match_count(&conn, "新标题"), 1);
+    }
+
+    #[test]
+    fn delete_document_removes_index_terms() {
+        // 删除路径(contentless-delete 按 rowid 直接清词元)不依赖回读旧值,
+        // 删完后被删文档的词元不再可命中。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let id_a = save_doc_with_markdown(&mut conn, "/d/a.txt", None, "# 文档甲\n\n独有词甲");
+        save_doc_with_markdown(&mut conn, "/d/b.txt", None, "# 文档乙\n\n独有词乙");
+
+        delete_document(&mut conn, id_a).unwrap();
+
+        assert_eq!(match_count(&conn, "独有词甲"), 0, "被删文档的词元应已清掉");
+        assert_eq!(match_count(&conn, "独有词乙"), 1);
+        assert!(
+            crate::maintain::check_integrity(&conn)
+                .unwrap()
+                .is_consistent()
+        );
+    }
+
+    #[test]
+    fn delete_source_root_removes_index_terms() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc_with_markdown(&mut conn, "/a/1.txt", Some("/a"), "# 甲\n\n文件夹独有词");
+        let meta_other = save_doc(&mut conn, "/b/2.txt", Some("/b"));
+        let _ = meta_other;
+
+        assert_eq!(delete_source_root(&mut conn, "/a").unwrap(), 1);
+        assert_eq!(match_count(&conn, "文件夹独有词"), 0);
+        assert_eq!(match_count(&conn, "合同"), 1, "其它文件夹的词元不受影响");
     }
 }

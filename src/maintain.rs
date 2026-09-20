@@ -1,9 +1,10 @@
-//! 索引维护:统计、完整性检查、FTS 重建、optimize/VACUUM 与清空。
-//! 一致性约定(与 repo.rs 相同):`documents_fts.rowid == documents.id`,且
-//! `documents_fts.content == document_contents.plain_text`,
-//! `documents_fts.title == documents.title`。
-//! `check_integrity` 验证这两层不变式与 SQLite/FTS5 自身的健康;
-//! `rebuild_fts` 按该约定从 documents + plain_text 全量重写 FTS 表。
+//! 索引维护:统计、完整性检查、FTS 重建、optimize/VACUUM、清空与 Markdown 清理。
+//! 一致性约定(与 repo.rs 相同):`documents_fts.rowid == documents.id`,
+//! FTS 的 title/content 词元分别对应 `documents.title` 与
+//! `document_contents.plain_text`(全文只存这一份)。
+//! `documents_fts` 是 contentless-delete 表、不存列值,所以完整性检查覆盖
+//! 「行对齐 + 索引内部一致」两层;`rebuild_fts` 从 documents + plain_text
+//! 全量重灌索引,任何漂移都以它收口。
 //!
 //! 文档级 FTS 让不变式退化得很干净:一行对一篇,`rowid` 差集就是全部,
 //! 不再需要「分块偏移 → FTS 内容」的逐片比对。
@@ -76,34 +77,24 @@ pub struct IntegrityReport {
     /// integrity_check 输出的非 "ok" 行(正常情况下为空)
     pub sqlite_messages: Vec<String>,
     /// FTS5 自带的 integrity-check 命令是否成功
+    /// (contentless-delete 表没有列值可对拍,这层只查倒排索引内部一致性)
     pub fts_ok: bool,
     pub fts_message: Option<String>,
     /// documents 有、documents_fts 无的行数
     pub missing_in_fts: i64,
     /// documents_fts 有、documents 无的孤儿行数
     pub orphan_in_fts: i64,
-    /// 抽样比对中 content/title 与 documents/plain_text 不一致的条数
-    pub content_mismatch: i64,
-    /// 实际抽样的行数
-    pub sampled: i64,
 }
 
 impl IntegrityReport {
     pub fn is_consistent(&self) -> bool {
-        self.sqlite_ok
-            && self.fts_ok
-            && self.missing_in_fts == 0
-            && self.orphan_in_fts == 0
-            && self.content_mismatch == 0
+        self.sqlite_ok && self.fts_ok && self.missing_in_fts == 0 && self.orphan_in_fts == 0
     }
 
     /// 中文一段话总结(设置页卡片与 `rsou-cli check` 共用)。
     pub fn summary(&self) -> String {
         if self.is_consistent() {
-            return format!(
-                "索引一致:SQLite 结构正常,抽样 {} 篇文档的标题与正文全部吻合",
-                self.sampled
-            );
+            return "索引一致:SQLite 结构与全文索引自检正常,行数对齐".to_owned();
         }
         let mut problems: Vec<String> = Vec::new();
         if !self.sqlite_ok {
@@ -121,22 +112,15 @@ impl IntegrityReport {
         if self.orphan_in_fts > 0 {
             problems.push(format!("{} 条索引行找不到文档", self.orphan_in_fts));
         }
-        if self.content_mismatch > 0 {
-            problems.push(format!("{} 条索引内容与原文不一致", self.content_mismatch));
-        }
-        format!(
-            "索引不一致:{}(抽样 {} 篇);建议执行「重建全文索引」",
-            problems.join(","),
-            self.sampled
-        )
+        format!("索引不一致:{};建议执行「重建全文索引」", problems.join(","))
     }
 }
 
-/// 四层检查:SQLite 完整性 → FTS5 自检 → 双向 rowid 差集 → 内容抽样比对。
+/// 三层检查:SQLite 完整性 → FTS5 自检(索引内部一致性)→ 双向 rowid 差集。
 ///
 /// FTS 自检失败不上抛(记录在 report 里,界面继续显示其它层的结论);
 /// 其它层的 SQL 失败视为检查本身失败,向上返回 Err。
-pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result<IntegrityReport> {
+pub fn check_integrity(conn: &Connection) -> anyhow::Result<IntegrityReport> {
     let sqlite_messages = conn
         .prepare("PRAGMA integrity_check")?
         .query_map([], |row| row.get::<_, String>(0))?
@@ -170,32 +154,6 @@ pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result
         |row| row.get(0),
     )?;
 
-    // 抽样比对:FTS 行按 rowid 等值 JOIN 回 documents/contents,逐列核对。
-    let rows = conn
-        .prepare(
-            "SELECT f.title, d.title, f.content, dc.plain_text \
-             FROM documents_fts f \
-             JOIN documents d ON d.id = f.rowid \
-             JOIN document_contents dc ON dc.document_id = d.id \
-             ORDER BY f.rowid LIMIT ?1",
-        )?
-        .query_map(params![sample_limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let sampled = rows.len() as i64;
-    let mut content_mismatch = 0i64;
-    for (fts_title, title, fts_content, plain) in &rows {
-        if fts_title != title || fts_content != plain {
-            content_mismatch += 1;
-        }
-    }
-
     Ok(IntegrityReport {
         sqlite_ok,
         sqlite_messages,
@@ -203,14 +161,28 @@ pub fn check_integrity(conn: &Connection, sample_limit: usize) -> anyhow::Result
         fts_message,
         missing_in_fts,
         orphan_in_fts,
-        content_mismatch,
-        sampled,
     })
 }
 
-/// 全量重建 documents_fts:一个 BEGIN IMMEDIATE 事务里先整表 DELETE 清表
-/// (顺带清掉孤儿行;'delete-all' 命令只适用 contentless/external-content
-/// 表,普通 FTS5 表不可用),再从 documents + plain_text 整篇重插。
+/// 全文索引是否待重建:迁移丢弃旧表时置 `settings.fts_rebuild_pending`;
+/// 索引为空但已有已解析文档时也算(迁移中途崩溃同样兜住)。
+/// `rebuild_fts` 提交时清标志。
+pub fn needs_fts_rebuild(conn: &Connection) -> anyhow::Result<bool> {
+    if repo::get_setting(conn, crate::store::FTS_REBUILD_PENDING_KEY)?.as_deref() == Some("1") {
+        return Ok(true);
+    }
+    let pending: bool = conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM documents_fts) \
+         AND EXISTS(SELECT 1 FROM documents WHERE parse_status = 'parsed')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(pending)
+}
+
+/// 全量重建 documents_fts:一个 BEGIN IMMEDIATE 事务里先 'delete-all' 清空
+/// 索引(contentless-delete 专用命令,顺带清掉孤儿行与残留词元),再从
+/// documents + plain_text 分批重插;提交前清掉 fts_rebuild_pending 标志。
 /// 返回重建行数(= 已解析文档数);每 PROGRESS_STEP 行回调一次进度(done, total)。
 pub fn rebuild_fts(
     conn: &mut Connection,
@@ -229,8 +201,11 @@ pub fn rebuild_fts(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启重建事务失败")?;
-    tx.execute("DELETE FROM documents_fts", [])
-        .context("清空全文索引失败")?;
+    tx.execute(
+        "INSERT INTO documents_fts(documents_fts) VALUES('delete-all')",
+        [],
+    )
+    .context("清空全文索引失败")?;
 
     // 分批 INSERT:整库一行一批会让进度回调只能报一次,大资料库上界面
     // 会长时间停在 0%。按 id 区间切,每 PROGRESS_STEP 篇回调一次。
@@ -257,6 +232,10 @@ pub fn rebuild_fts(
         }
     }
 
+    tx.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        [crate::store::FTS_REBUILD_PENDING_KEY],
+    )?;
     tx.commit().context("提交重建事务失败")?;
     Ok(inserted)
 }
@@ -275,20 +254,42 @@ pub fn optimize(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 清空资料库:一个事务删除 FTS 全部行、全部文档(级联 contents/chunks)、
+/// 清空资料库:一个事务清空 FTS 索引、全部文档(级联 contents/chunks)、
 /// 全部导入记录(级联 import_items);settings(含 schema_version)保留。
 pub fn clear_all(conn: &mut Connection) -> anyhow::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .context("开启清空事务失败")?;
-    tx.execute("DELETE FROM documents_fts", [])
-        .context("清空全文索引失败")?;
+    // contentless-delete 表:'delete-all' 一条命令清掉全部索引条目。
+    tx.execute(
+        "INSERT INTO documents_fts(documents_fts) VALUES('delete-all')",
+        [],
+    )
+    .context("清空全文索引失败")?;
     tx.execute("DELETE FROM documents", [])
         .context("清空文档表失败")?;
     tx.execute("DELETE FROM import_runs", [])
         .context("清空导入记录失败")?;
+    tx.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        [crate::store::FTS_REBUILD_PENDING_KEY],
+    )?;
     tx.commit().context("提交清空事务失败")?;
     Ok(())
+}
+
+/// 清掉存量 `document_contents.markdown`(改写为空串),返回清理的行数。
+///
+/// 只清数据不回收页面——调用方随后跑 `optimize`(VACUUM)才能落实体积;
+/// 「保存 Markdown 原文」开关只管新导入,这个函数负责回收存量。
+pub fn purge_stored_markdown(conn: &Connection) -> anyhow::Result<u64> {
+    let cleared = conn
+        .execute(
+            "UPDATE document_contents SET markdown = '' WHERE markdown <> ''",
+            [],
+        )
+        .context("清理 Markdown 原文失败")?;
+    Ok(cleared as u64)
 }
 
 #[cfg(test)]
@@ -381,7 +382,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = check_integrity(&conn, 2000).unwrap();
+        let report = check_integrity(&conn).unwrap();
         assert_eq!(report.missing_in_fts, 1);
         assert!(!report.is_consistent());
         assert!(report.summary().contains("不一致"));
@@ -391,7 +392,7 @@ mod tests {
         assert_eq!(rows, 3);
         assert!(progress_calls >= 1);
 
-        let report = check_integrity(&conn, 2000).unwrap();
+        let report = check_integrity(&conn).unwrap();
         assert!(report.is_consistent(), "{}", report.summary());
 
         // 重建后的结果集与之前逐字段相等。
@@ -412,45 +413,118 @@ mod tests {
         )
         .unwrap();
 
-        let report = check_integrity(&conn, 2000).unwrap();
+        let report = check_integrity(&conn).unwrap();
         assert_eq!(report.orphan_in_fts, 1);
         assert!(!report.is_consistent());
 
         rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
-        let report = check_integrity(&conn, 2000).unwrap();
+        let report = check_integrity(&conn).unwrap();
         assert_eq!(report.orphan_in_fts, 0);
         assert!(report.is_consistent());
     }
 
     #[test]
-    fn tampered_content_detected_by_sampling() {
+    fn stale_index_tokens_are_filtered_by_literal_recheck() {
+        // contentless-delete 允许同 rowid 重复 INSERT(词元叠加):借此模拟
+        // 「索引里多出与原文不符的词元」这种漂移。行级检查看不出问题
+        // (rowid 对齐、索引内部一致),但检索层在 plain_text 上做字面量复核,
+        // 假阳性不会进入结果。
         let mut conn = crate::store::open_in_memory().unwrap();
-        save_doc(&mut conn, "/d/a.txt", "内容是正常的原文");
-        let victim: i64 = conn
-            .query_row("SELECT rowid FROM documents_fts LIMIT 1", [], |r| r.get(0))
-            .unwrap();
+        let id = save_doc(&mut conn, "/d/a.txt", "内容是正常的原文");
         conn.execute(
-            "UPDATE documents_fts SET content = '被篡改的内容' WHERE rowid = ?1",
-            params![victim],
+            "INSERT INTO documents_fts(rowid, title, content) VALUES (?1, 'x', '垃圾词')",
+            params![id],
         )
         .unwrap();
 
-        let report = check_integrity(&conn, 2000).unwrap();
-        assert_eq!(report.content_mismatch, 1);
-        assert_eq!(report.sampled, 1);
-        assert!(!report.is_consistent());
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"垃圾词\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "残留词元会让 MATCH 命中");
+
+        let response = search::search(&conn, &request("垃圾词")).unwrap();
+        assert_eq!(response.total_documents, 1);
+        assert!(response.documents.is_empty(), "字面量复核应把假阳性剔除");
+
+        // 重建能把这类漂移一并清掉。
+        rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"垃圾词\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 0, "重建后残留词元应消失");
     }
 
     #[test]
-    fn tampered_title_detected_by_sampling() {
-        // title 也是不变式的一部分,不只 content。
+    fn needs_fts_rebuild_tracks_flag_and_empty_index() {
         let mut conn = crate::store::open_in_memory().unwrap();
-        save_doc(&mut conn, "/d/a.txt", "# 原标题\n\n正文");
-        conn.execute("UPDATE documents_fts SET title = '被换掉的标题'", [])
+        // 空库不需要重建。
+        assert!(!needs_fts_rebuild(&conn).unwrap());
+        save_doc(&mut conn, "/d/a.txt", "正常文档");
+        assert!(!needs_fts_rebuild(&conn).unwrap());
+
+        // 迁移置位 → 需要重建。
+        repo::set_setting(&conn, crate::store::FTS_REBUILD_PENDING_KEY, "1").unwrap();
+        assert!(needs_fts_rebuild(&conn).unwrap());
+        rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
+        assert!(!needs_fts_rebuild(&conn).unwrap(), "重建提交后应清标志");
+
+        // 无标志但索引空、有已解析文档(迁移中途崩溃的情形)也判为待重建。
+        conn.execute(
+            "INSERT INTO documents_fts(documents_fts) VALUES('delete-all')",
+            [],
+        )
+        .unwrap();
+        assert!(needs_fts_rebuild(&conn).unwrap());
+    }
+
+    #[test]
+    fn purge_stored_markdown_clears_existing_but_keeps_plain_text() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        repo::set_setting(&conn, "save_markdown", "1").unwrap();
+        let meta = FileMeta {
+            path: "/d/a.txt".into(),
+            canonical_path: "/d/a.txt".into(),
+            file_name: "a.txt".to_owned(),
+            ext: "txt".to_owned(),
+            file_type: FileType::Text,
+            file_size: 1,
+            file_mtime_ms: 1,
+            source_root: None,
+        };
+        let plain = text::markdown_to_plain("# 标题\n\n正文");
+        let parsed = ParsedDocument {
+            title: "标题".to_owned(),
+            markdown: "# 标题\n\n正文".to_owned(),
+            plain,
+            chunks: Vec::new(),
+            warnings: Vec::new(),
+            parser_name: "t",
+            parser_version: "t",
+        };
+        let id = repo::save_parsed(&mut conn, &meta, "h", &parsed, 1).unwrap();
+        assert_eq!(purge_stored_markdown(&conn).unwrap(), 1);
+        // 再跑一遍是幂等空转。
+        assert_eq!(purge_stored_markdown(&conn).unwrap(), 0);
+        let markdown: String = conn
+            .query_row(
+                "SELECT markdown FROM document_contents WHERE document_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
             .unwrap();
-        let report = check_integrity(&conn, 2000).unwrap();
-        assert_eq!(report.content_mismatch, 1);
-        assert!(!report.is_consistent());
+        assert_eq!(markdown, "");
+        assert_eq!(
+            repo::get_plain_text(&conn, id).unwrap().unwrap(),
+            "标题\n\n正文"
+        );
     }
 
     #[test]
@@ -458,6 +532,7 @@ mod tests {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc(&mut conn, "/d/a.txt", "待清空");
         repo::set_setting(&conn, "max_file_mb", "128").unwrap();
+        repo::set_setting(&conn, crate::store::FTS_REBUILD_PENDING_KEY, "1").unwrap();
 
         clear_all(&mut conn).unwrap();
 
@@ -482,6 +557,13 @@ mod tests {
             repo::get_setting(&conn, "max_file_mb").unwrap().as_deref(),
             Some("128")
         );
+        // 清空顺带摘掉待重建标志(库里已无文档,没有要重建的东西)。
+        assert_eq!(
+            repo::get_setting(&conn, crate::store::FTS_REBUILD_PENDING_KEY)
+                .unwrap()
+                .as_deref(),
+            None
+        );
     }
 
     #[test]
@@ -490,7 +572,7 @@ mod tests {
         save_doc(&mut conn, "/d/a.txt", "优化前先有内容");
         optimize(&conn).unwrap();
         // optimize 不改变可检索内容。
-        let report = check_integrity(&conn, 2000).unwrap();
+        let report = check_integrity(&conn).unwrap();
         assert!(report.is_consistent());
     }
 
@@ -509,6 +591,6 @@ mod tests {
             calls.last().copied(),
             Some((PROGRESS_STEP + 10, PROGRESS_STEP + 10))
         );
-        assert!(check_integrity(&conn, 2000).unwrap().is_consistent());
+        assert!(check_integrity(&conn).unwrap().is_consistent());
     }
 }

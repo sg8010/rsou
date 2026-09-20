@@ -203,12 +203,14 @@ pub(crate) struct PreviewSpanCache {
     pub spans: Vec<Span>,
 }
 
-/// 索引维护任务的种类(设置页四个按钮一一对应)。
+/// 索引维护任务的种类(设置页按钮一一对应)。
 #[derive(Clone, Copy)]
 pub(crate) enum MaintainKind {
     Check,
     Rebuild,
     Optimize,
+    /// 清掉存量 Markdown 原文并压缩索引文件
+    ClearMarkdown,
     Clear,
 }
 

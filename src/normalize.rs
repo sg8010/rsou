@@ -137,7 +137,8 @@ fn apply(connection: &Connection, plan: &[Change]) -> anyhow::Result<()> {
                     update.execute(rusqlite::params![id, path, canonical_path])?;
                 }
                 Change::DropDuplicate { id } => {
-                    // FTS 先行,再靠外键级联清 chunks/contents(与 repo::delete_document 同序)。
+                    // 与 repo::delete_document 同序;contentless-delete 的 FTS 删除
+                    // 按 rowid 清词元,不读旧值,顺序本身不承重。
                     delete_fts.execute([id])?;
                     delete_doc.execute([id])?;
                 }
@@ -334,7 +335,7 @@ mod tests {
         assert_eq!(fts, 2, "重复行的 FTS 行应被删掉");
 
         // 完整性检查应通过(没有孤儿 FTS 行)。
-        let report = crate::maintain::check_integrity(&conn, 100).unwrap();
+        let report = crate::maintain::check_integrity(&conn).unwrap();
         assert!(report.is_consistent(), "{}", report.summary());
 
         // 再跑一次:幂等。

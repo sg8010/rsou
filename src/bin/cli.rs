@@ -31,6 +31,7 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   check                 完整性检查;索引不一致时退出码 1
   rebuild               重建全文索引(打印进度与行数)
   optimize              FTS optimize + WAL 截断 + VACUUM
+  purge-markdown        清空已入库的 Markdown 原文并压缩索引文件
   clear                 清空资料库(需 --yes;保留 settings)
 
 选项:
@@ -139,6 +140,7 @@ fn main() -> ExitCode {
         "check" => run(&db_path, cmd_check),
         "rebuild" => cmd_rebuild(&db_path),
         "optimize" => run(&db_path, cmd_optimize),
+        "purge-markdown" => run(&db_path, cmd_purge_markdown),
         "clear" => {
             if !yes {
                 eprintln!("clear 会删除全部文档与索引,请加 --yes 确认\n{USAGE}");
@@ -165,7 +167,15 @@ fn run(
     body: fn(&rusqlite::Connection, &Path) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let connection = store::open(path, OpenMode::ReadWrite)?;
+    warn_if_rebuild_pending(&connection);
     body(&connection, path)
+}
+
+/// 旧库迁移后索引待重建时给一句中文提示(不阻塞命令本身)。
+fn warn_if_rebuild_pending(connection: &rusqlite::Connection) {
+    if let Ok(true) = maintain::needs_fts_rebuild(connection) {
+        eprintln!("提示: 全文索引待重建(运行 rsou-cli rebuild);检索结果可能不完整");
+    }
 }
 
 fn cmd_docs(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
@@ -360,6 +370,7 @@ fn cmd_search(
         .unwrap_or(100);
 
     let conn = store::open(db_path, OpenMode::ReadOnly)?;
+    warn_if_rebuild_pending(&conn);
     // 词典与 GUI 共用一套加载路径:不加载的话同一个查询在两边会给出不同结果。
     load_dict(db_path);
     let response = search::search(
@@ -438,8 +449,11 @@ fn mark_snippet(content: &str, spans: &[Span]) -> String {
 
 /// check:打印完整性报告;不一致时返回 Err(退出码 1)。
 fn cmd_check(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
-    let report = maintain::check_integrity(connection, 2000)?;
+    let report = maintain::check_integrity(connection)?;
     println!("{}", report.summary());
+    if maintain::needs_fts_rebuild(connection)? {
+        anyhow::bail!("全文索引待重建");
+    }
     if !report.is_consistent() {
         anyhow::bail!("索引不一致");
     }
@@ -460,6 +474,14 @@ fn cmd_rebuild(db_path: &Path) -> anyhow::Result<()> {
 fn cmd_optimize(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
     maintain::optimize(connection)?;
     println!("索引已优化");
+    Ok(())
+}
+
+/// purge-markdown:清掉存量 Markdown 原文,随后 optimize 回收体积。
+fn cmd_purge_markdown(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
+    let cleared = maintain::purge_stored_markdown(connection)?;
+    maintain::optimize(connection)?;
+    println!("已清理 {cleared} 篇文档的 Markdown 原文并压缩索引文件");
     Ok(())
 }
 
