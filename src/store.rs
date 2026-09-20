@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::tokenize;
 
@@ -140,6 +140,8 @@ fn configure(connection: Connection, mode: OpenMode) -> anyhow::Result<Connectio
 /// 顺序有意为之:先比对已有库的版本,再建表。反过来的话,拒绝一个旧库之前
 /// 已经把新表建了进去,旧版本程序再打开同一个库就会看到一个半新半旧的库。
 pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
+    let tx = Transaction::new_unchecked(connection, TransactionBehavior::Immediate)
+        .context("开启表结构迁移事务失败")?;
     if let Some(v) = stored_schema_version(connection)?
         && v != SCHEMA_VERSION
         && !can_upgrade_from(&v)
@@ -161,7 +163,17 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
         .execute_batch(SCHEMA_SQL)
         .context("创建索引库表结构失败")?;
 
-    crate::normalize::normalize(connection)?;
+    // 兼容此前迁移在 DROP 与写标志之间中断的库。必须在导入新文档前持久化,
+    // 否则新文档填入 FTS 后,「空索引」的兜底判断就无法发现旧文档漏索引。
+    connection
+        .execute(
+            "INSERT INTO settings(key, value) \
+             SELECT ?1, '1' WHERE NOT EXISTS(SELECT 1 FROM documents_fts) \
+             AND EXISTS(SELECT 1 FROM documents WHERE parse_status = 'parsed') \
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+            [FTS_REBUILD_PENDING_KEY],
+        )
+        .context("保存待重建状态失败")?;
 
     if stored_schema_version(connection)?.as_deref() != Some(SCHEMA_VERSION) {
         connection
@@ -172,6 +184,9 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
             )
             .context("写入 schema_version 失败")?;
     }
+    tx.commit().context("提交表结构迁移失败")?;
+    // 路径归一化有自己的事务,需在表结构迁移提交后运行。
+    crate::normalize::normalize(connection)?;
     crate::repo::prune_import_history(connection, crate::repo::now_ms())?;
     Ok(())
 }
@@ -193,9 +208,8 @@ fn can_upgrade_from(from: &str) -> bool {
 ///
 /// 发现旧表即 DROP(影子表随主表一起删),新表交给 SCHEMA_SQL 的
 /// CREATE IF NOT EXISTS;同时置 `fts_rebuild_pending`,索引由启动后的维护
-/// 任务重建——全量重灌若在 open 里做会长时间卡住 GUI 启动。DROP 后崩溃的
-/// 话下次打开:影子表已无 → 不再进本函数,空索引由 `maintain::needs_fts_rebuild`
-/// 兜底识别,不会丢状态。
+/// 任务重建——全量重灌若在 open 里做会长时间卡住 GUI 启动。调用方将 DROP、
+/// 新表创建、重建标志和版本更新放在同一事务,中断时旧表也会回滚恢复。
 fn drop_legacy_fts(connection: &Connection) -> anyhow::Result<()> {
     let legacy: bool = connection
         .query_row(
@@ -760,6 +774,135 @@ mod tests {
         assert_eq!(hits, 1);
         drop(connection);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_fts_migration_rolls_back_and_can_be_retried() {
+        let path = temp_db("migration-rollback");
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE documents_fts;
+                 CREATE VIRTUAL TABLE documents_fts USING fts5(title, content, tokenize='rsou 0');
+                 INSERT INTO documents_fts(rowid, title, content) VALUES (1, 'old', 'alpha');
+                 UPDATE settings SET value = '3' WHERE key = 'schema_version';
+                 CREATE TRIGGER abort_migration BEFORE UPDATE OF value ON settings
+                 WHEN NEW.key = 'schema_version'
+                 BEGIN SELECT RAISE(ABORT, 'simulated migration failure'); END;",
+                )
+                .unwrap();
+        }
+        let error = open(&path, OpenMode::ReadWrite).unwrap_err();
+        assert!(format!("{error:#}").contains("simulated migration failure"));
+        {
+            let connection = open(&path, OpenMode::ReadOnly).unwrap();
+            assert_eq!(
+                stored_schema_version(&connection).unwrap().as_deref(),
+                Some("3")
+            );
+            assert_eq!(
+                crate::repo::get_setting(&connection, FTS_REBUILD_PENDING_KEY).unwrap(),
+                None
+            );
+            // 能读回原文并 MATCH:旧 FTS 主表、影子表和索引词元一并恢复。
+            let content: String = connection
+                .query_row(
+                    "SELECT content FROM documents_fts WHERE documents_fts MATCH 'alpha'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(content, "alpha");
+        }
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch("DROP TRIGGER abort_migration")
+                .unwrap();
+        }
+        {
+            let connection = open(&path, OpenMode::ReadWrite).unwrap();
+            assert_eq!(
+                stored_schema_version(&connection).unwrap().as_deref(),
+                Some(SCHEMA_VERSION)
+            );
+            assert_eq!(
+                crate::repo::get_setting(&connection, FTS_REBUILD_PENDING_KEY)
+                    .unwrap()
+                    .as_deref(),
+                Some("1")
+            );
+            let shadow: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'documents_fts_content')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert!(!shadow);
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn interrupted_migration_persists_pending_before_new_import() {
+        // 覆盖旧版本 DROP 后退出,以及已建空表但没有重建标志的两种遗留状态。
+        for missing_fts in [true, false] {
+            let path = temp_db(if missing_fts {
+                "recover-missing-fts"
+            } else {
+                "recover-empty-fts"
+            });
+            {
+                let connection = open(&path, OpenMode::ReadWrite).unwrap();
+                connection.execute_batch(
+                    "INSERT INTO documents(id, path, canonical_path, file_name, ext, file_type,
+                         file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at)
+                         VALUES (1, '/old.txt', '/old.txt', 'old.txt', 'txt', 'text', 1, 1, 'h', 'parsed', 1, 1);
+                     INSERT INTO document_contents(document_id, markdown, plain_text) VALUES (1, '', 'oldword');",
+                ).unwrap();
+                if missing_fts {
+                    connection
+                        .execute_batch(
+                            "DROP TABLE documents_fts;
+                         UPDATE settings SET value = '3' WHERE key = 'schema_version';",
+                        )
+                        .unwrap();
+                }
+            }
+            {
+                let connection = open(&path, OpenMode::ReadWrite).unwrap();
+                assert_eq!(
+                    crate::repo::get_setting(&connection, FTS_REBUILD_PENDING_KEY)
+                        .unwrap()
+                        .as_deref(),
+                    Some("1")
+                );
+                connection.execute_batch(
+                    "INSERT INTO documents(id, path, canonical_path, file_name, ext, file_type,
+                         file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at)
+                         VALUES (2, '/new.txt', '/new.txt', 'new.txt', 'txt', 'text', 1, 1, 'h2', 'parsed', 1, 1);
+                     INSERT INTO document_contents(document_id, markdown, plain_text) VALUES (2, '', 'newword');
+                     INSERT INTO documents_fts(rowid, title, content) VALUES (2, 'new', 'newword');",
+                ).unwrap();
+            }
+            {
+                let mut connection = open(&path, OpenMode::ReadWrite).unwrap();
+                assert!(crate::maintain::needs_fts_rebuild(&connection).unwrap());
+                assert_eq!(
+                    crate::maintain::rebuild_fts(&mut connection, &mut |_, _| {}).unwrap(),
+                    2
+                );
+                assert!(!crate::maintain::needs_fts_rebuild(&connection).unwrap());
+                let hits: i64 = connection
+                    .query_row(
+                        "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH 'oldword'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(hits, 1);
+            }
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
     }
 
     #[test]

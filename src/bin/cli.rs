@@ -174,7 +174,9 @@ fn run(
 /// 旧库迁移后索引待重建时给一句中文提示(不阻塞命令本身)。
 fn warn_if_rebuild_pending(connection: &rusqlite::Connection) {
     if let Ok(true) = maintain::needs_fts_rebuild(connection) {
-        eprintln!("提示: 全文索引待重建(运行 rsou-cli rebuild);检索结果可能不完整");
+        eprintln!(
+            "提示: 全文索引待重建，请对当前数据库运行 rsou-cli --db <数据库路径> rebuild 后再检索"
+        );
     }
 }
 
@@ -275,6 +277,8 @@ fn cmd_import(db_path: &Path, inputs: Vec<PathBuf>, force: bool) -> anyhow::Resu
         "导入完成:成功 {}、失败 {}、跳过 {}(共 {})",
         counts.ok, counts.failed, counts.skipped, counts.total
     );
+    let connection = store::open(db_path, OpenMode::ReadOnly)?;
+    warn_if_rebuild_pending(&connection);
     Ok(())
 }
 
@@ -370,7 +374,11 @@ fn cmd_search(
         .unwrap_or(100);
 
     let conn = store::open(db_path, OpenMode::ReadOnly)?;
-    warn_if_rebuild_pending(&conn);
+    if maintain::needs_fts_rebuild(&conn)? {
+        anyhow::bail!(
+            "全文索引待重建，暂不能检索；请对当前数据库运行 rsou-cli --db <数据库路径> rebuild"
+        );
+    }
     // 词典与 GUI 共用一套加载路径:不加载的话同一个查询在两边会给出不同结果。
     load_dict(db_path);
     let response = search::search(
@@ -480,7 +488,9 @@ fn cmd_optimize(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Resu
 /// purge-markdown:清掉存量 Markdown 原文,随后 optimize 回收体积。
 fn cmd_purge_markdown(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
     let cleared = maintain::purge_stored_markdown(connection)?;
-    maintain::optimize(connection)?;
+    if let Err(error) = maintain::optimize(connection) {
+        anyhow::bail!("已清理 {cleared} 篇文档的 Markdown 原文，但压缩索引文件失败: {error:#}");
+    }
     println!("已清理 {cleared} 篇文档的 Markdown 原文并压缩索引文件");
     Ok(())
 }

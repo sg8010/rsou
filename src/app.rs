@@ -214,6 +214,15 @@ pub(crate) enum MaintainKind {
     Clear,
 }
 
+#[derive(Default)]
+pub(crate) enum FtsReadiness {
+    #[default]
+    Ready,
+    Pending,
+    Rebuilding,
+    Failed(String),
+}
+
 /// 维护 worker 回传的消息。`inconsistent` 仅在 kind==Check 时有意义:
 /// 检查不一致时卡片上额外出现「立即重建」按钮。
 pub(crate) struct MaintainMsg {
@@ -246,6 +255,7 @@ pub struct RsouApp {
     db: Option<Connection>,
     /// 索引库打开/建表失败的中文原因(不 panic,直接显示在页面上)
     db_error: Option<String>,
+    fts_readiness: FtsReadiness,
     /// 数据目录布局(data_dir / db_path / tmp_dir)
     dirs: DataDirs,
     /// 界面上下文(后台线程读完数据后 request_repaint 用)
@@ -401,6 +411,7 @@ impl RsouApp {
             page: Page::Library,
             db: None,
             db_error: None,
+            fts_readiness: FtsReadiness::Ready,
             dirs: store::data_dirs(),
             egui_ctx: ctx.clone(),
             startup_log_path: None,

@@ -29,19 +29,14 @@ impl RsouApp {
         app.load_settings();
         // schema 迁移丢弃旧索引后:后台自动重建,不阻塞启动;
         // 进度走维护通道,设置页卡片可见。
-        if app.fts_rebuild_pending() {
-            app.library_notice = Some("索引格式已升级,正在后台重建全文索引…".to_owned());
+        if matches!(app.fts_readiness, FtsReadiness::Pending) {
             app.start_maintain(&cc.egui_ctx, MaintainKind::Rebuild);
         }
         app
     }
 
-    /// 全文索引是否处于待重建状态(旧库迁移丢弃索引后置位,重建完成自动消除)。
-    fn fts_rebuild_pending(&self) -> bool {
-        self.db
-            .as_ref()
-            .and_then(|conn| maintain::needs_fts_rebuild(conn).ok())
-            .unwrap_or(false)
+    pub(crate) fn fts_ready(&self) -> bool {
+        matches!(self.fts_readiness, FtsReadiness::Ready)
     }
 
     /// 读 settings 里的用户配置,并加载数据目录下的用户词典。
@@ -118,6 +113,11 @@ impl RsouApp {
     fn open_store(&mut self) {
         match store::open(&self.dirs.db_path, OpenMode::ReadWrite) {
             Ok(connection) => {
+                self.fts_readiness = match maintain::needs_fts_rebuild(&connection) {
+                    Ok(true) => FtsReadiness::Pending,
+                    Ok(false) => FtsReadiness::Ready,
+                    Err(error) => FtsReadiness::Failed(format!("读取索引状态失败: {error:#}")),
+                };
                 self.db = Some(connection);
                 self.db_error = None;
             }
@@ -318,6 +318,10 @@ impl RsouApp {
     /// 发起一次检索(空查询不触发;检索线程每次新建、只读连接)。
     /// 不检查 GUI 连接:worker 自己开只读连接,库不可用时错误走状态行。
     pub(crate) fn start_search(&mut self, ctx: &egui::Context) {
+        if !self.fts_ready() {
+            self.search_error = Some("全文索引尚未就绪，请等待重建完成或重试。".to_owned());
+            return;
+        }
         let query = self.search_query.trim().to_owned();
         if query.is_empty() {
             return;
@@ -460,6 +464,9 @@ impl RsouApp {
         if self.maintenance_active || self.import_active {
             return;
         }
+        if matches!(kind, MaintainKind::Rebuild) && !self.fts_ready() {
+            self.fts_readiness = FtsReadiness::Rebuilding;
+        }
         self.maintenance_active = true;
         self.maintain_result = None;
         self.maintain_gen += 1;
@@ -491,7 +498,9 @@ impl RsouApp {
                         }
                         MaintainKind::ClearMarkdown => maintain::purge_stored_markdown(&conn)
                             .and_then(|cleared| {
-                                maintain::optimize(&conn).map(|()| {
+                                maintain::optimize(&conn).map_err(|error| {
+                                    anyhow::anyhow!("已清理 {cleared} 篇文档的 Markdown 原文，但压缩失败: {error:#}")
+                                }).map(|()| {
                                     (
                                         format!(
                                             "已清理 {cleared} 篇文档的 Markdown 原文并压缩索引文件"
@@ -525,8 +534,30 @@ impl RsouApp {
                 self.maintenance_active = false;
                 self.maintain_rx = None;
                 self.maintain_progress = None;
-                self.maintain_result = Some(Err(format!("无法启动维护线程: {error}")));
+                let result = Err(format!("无法启动维护线程: {error}"));
+                self.finish_fts_maintenance(kind, &result);
+                self.maintain_result = Some(result);
             }
+        }
+    }
+
+    fn finish_fts_maintenance(&mut self, kind: MaintainKind, result: &Result<String, String>) {
+        if !matches!(kind, MaintainKind::Rebuild | MaintainKind::Clear) {
+            return;
+        }
+        match result {
+            Ok(message) => {
+                self.fts_readiness = FtsReadiness::Ready;
+                self.library_notice = Some(message.clone());
+                self.search_error = None;
+                if !self.search_query.trim().is_empty() {
+                    self.start_search(&self.egui_ctx.clone());
+                }
+            }
+            Err(error) if !self.fts_ready() => {
+                self.fts_readiness = FtsReadiness::Failed(error.clone());
+            }
+            Err(_) => {}
         }
     }
 
@@ -571,6 +602,7 @@ impl RsouApp {
                 self.maintenance_active = false;
                 self.maintain_rx = None;
                 self.maintain_progress = None;
+                self.finish_fts_maintenance(kind, &result);
                 self.maintain_result = Some(result);
                 self.maintain_inconsistent = inconsistent;
                 self.refresh_index_stats();
@@ -843,6 +875,54 @@ mod tests {
     use super::*;
     use rsou_lib::query::CompiledQuery;
     use rsou_lib::search::DocumentHit;
+
+    #[test]
+    fn pending_and_failed_indexes_block_search_until_successful_rebuild() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        app.search_query = "alpha".to_owned();
+        app.fts_readiness = FtsReadiness::Pending;
+        app.start_search(&ctx);
+        assert!(!app.search_active);
+        assert!(app.search_rx.is_none());
+        assert!(app.search_error.as_deref().unwrap().contains("尚未就绪"));
+
+        app.fts_readiness = FtsReadiness::Rebuilding;
+        app.finish_fts_maintenance(MaintainKind::Rebuild, &Err("写入失败".to_owned()));
+        assert!(matches!(&app.fts_readiness, FtsReadiness::Failed(e) if e == "写入失败"));
+        app.start_search(&ctx);
+        assert!(!app.search_active);
+        app.finish_fts_maintenance(MaintainKind::Check, &Ok("检查完成".to_owned()));
+        assert!(!app.fts_ready(), "其它维护成功不能解除 pending");
+
+        let dir = std::env::temp_dir().join(format!(
+            "rsou-gui-rebuild-{}-{}",
+            std::process::id(),
+            repo::now_ms()
+        ));
+        app.dirs = DataDirs {
+            db_path: dir.join("index.sqlite3"),
+            tmp_dir: dir.join("tmp"),
+            data_dir: dir,
+        };
+        app.db = Some(store::open(&app.dirs.db_path, OpenMode::ReadWrite).unwrap());
+        app.finish_fts_maintenance(MaintainKind::Rebuild, &Ok("重建完成".to_owned()));
+        assert!(app.fts_ready());
+        assert!(app.search_active, "重建成功后自动重跑已输入查询");
+        assert!(app.search_error.is_none());
+        assert_eq!(app.library_notice.as_deref(), Some("重建完成"));
+    }
+
+    #[test]
+    fn failed_regular_rebuild_keeps_existing_index_searchable() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        app.finish_fts_maintenance(MaintainKind::Rebuild, &Err("写入失败".to_owned()));
+        assert!(app.fts_ready(), "普通重建失败回滚后旧索引仍完整可用");
+        app.fts_readiness = FtsReadiness::Failed("重建失败".to_owned());
+        app.finish_fts_maintenance(MaintainKind::Clear, &Ok("资料库已清空".to_owned()));
+        assert!(app.fts_ready(), "清空资料库同时解除 pending");
+    }
 
     fn doc(id: i64) -> DocumentHit {
         DocumentHit {

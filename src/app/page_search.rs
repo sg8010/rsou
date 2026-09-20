@@ -99,14 +99,52 @@ fn preview_hit_offsets(doc_hit: &DocumentHit) -> Vec<usize> {
 }
 
 impl RsouApp {
+    /// 资料库和搜索页共用的索引就绪提示与重试入口。
+    pub(crate) fn ui_fts_readiness(&mut self, ui: &mut egui::Ui) {
+        let message = match &self.fts_readiness {
+            FtsReadiness::Ready => return,
+            FtsReadiness::Pending => "全文索引待重建，暂时无法搜索。".to_owned(),
+            FtsReadiness::Rebuilding => {
+                let progress = self.maintain_progress.as_ref().map(|p| {
+                    (
+                        p.done.load(Ordering::Relaxed),
+                        p.total.load(Ordering::Relaxed),
+                    )
+                });
+                match progress {
+                    Some((done, total)) if total > 0 => {
+                        format!("正在准备全文索引（{done}/{total}），完成后即可搜索。")
+                    }
+                    _ => "正在准备全文索引，完成后即可搜索。".to_owned(),
+                }
+            }
+            FtsReadiness::Failed(error) => format!("全文索引尚未就绪：{error}"),
+        };
+        Self::warn_banner(ui, &message);
+        if !matches!(self.fts_readiness, FtsReadiness::Rebuilding)
+            && Self::small_secondary_button(
+                ui,
+                Some(Icon::Refresh),
+                "重试重建",
+                0.0,
+                !self.maintenance_active && !self.import_active,
+            )
+            .clicked()
+        {
+            self.start_maintain(ui.ctx(), MaintainKind::Rebuild);
+        }
+        ui.add_space(8.0);
+    }
+
     pub(crate) fn ui_page_search(&mut self, ui: &mut egui::Ui) {
         Self::page_header(ui, self.page.title(), self.page.description());
         ui.add_space(Self::HEADER_TO_CONTENT);
+        self.ui_fts_readiness(ui);
 
         // ---------- 搜索卡:输入行 + 两行过滤 ----------
         let mut want_search = false;
         let db_ready = self.db.is_some();
-        let can_search = db_ready && !self.search_query.trim().is_empty();
+        let can_search = db_ready && self.fts_ready() && !self.search_query.trim().is_empty();
         Self::card(ui, |ui| {
             // 第一行:搜索输入 + 搜索按钮 + 精确/宽松开关 + 范围 + 时间。
             ui.horizontal_wrapped(|ui| {

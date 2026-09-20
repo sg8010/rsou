@@ -135,6 +135,7 @@ impl RsouApp {
             ui.add_space(8.0);
             Self::warn_banner(ui, &format!("无法打开索引库,导入与检索不可用: {error}"));
         }
+        self.ui_fts_readiness(ui);
         if let Some(notice) = self.library_notice.clone() {
             ui.add_space(6.0);
             ui.label(

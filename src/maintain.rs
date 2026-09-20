@@ -188,7 +188,10 @@ pub fn rebuild_fts(
     conn: &mut Connection,
     progress: &mut dyn FnMut(u64, u64),
 ) -> anyhow::Result<u64> {
-    let total: u64 = conn
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("开启重建事务失败")?;
+    let total: u64 = tx
         .query_row(
             "SELECT count(*) FROM documents d \
              JOIN document_contents dc ON dc.document_id = d.id \
@@ -198,9 +201,6 @@ pub fn rebuild_fts(
         )?
         .max(0) as u64;
 
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("开启重建事务失败")?;
     tx.execute(
         "INSERT INTO documents_fts(documents_fts) VALUES('delete-all')",
         [],
@@ -209,24 +209,35 @@ pub fn rebuild_fts(
 
     // 分批 INSERT:整库一行一批会让进度回调只能报一次,大资料库上界面
     // 会长时间停在 0%。按 id 区间切,每 PROGRESS_STEP 篇回调一次。
-    let mut inserted = 0u64;
+    let mut last_id = 0i64;
+    let mut processed = 0u64;
     loop {
+        let batch_last_id: Option<i64> = tx.query_row(
+            "SELECT max(id) FROM (\
+             SELECT d.id FROM documents d \
+             JOIN document_contents dc ON dc.document_id = d.id \
+             WHERE d.parse_status = 'parsed' AND d.id > ?1 \
+             ORDER BY d.id LIMIT ?2)",
+            params![last_id, PROGRESS_STEP as i64],
+            |row| row.get(0),
+        )?;
+        let Some(batch_last_id) = batch_last_id else {
+            break;
+        };
         let batch = tx
             .execute(
                 "INSERT INTO documents_fts(rowid, title, content) \
                  SELECT d.id, d.title, dc.plain_text \
                  FROM documents d \
                  JOIN document_contents dc ON dc.document_id = d.id \
-                 WHERE d.parse_status = 'parsed' AND d.id > ?1 \
-                 ORDER BY d.id LIMIT ?2",
-                params![inserted as i64, PROGRESS_STEP as i64],
+                 WHERE d.parse_status = 'parsed' AND d.id > ?1 AND d.id <= ?2 \
+                 ORDER BY d.id",
+                params![last_id, batch_last_id],
             )
             .context("重建全文索引失败")? as u64;
-        if batch == 0 {
-            break;
-        }
-        inserted += batch;
-        progress(inserted.min(total), total);
+        last_id = batch_last_id;
+        processed += batch;
+        progress(processed, total);
         if batch < PROGRESS_STEP {
             break;
         }
@@ -237,7 +248,7 @@ pub fn rebuild_fts(
         [crate::store::FTS_REBUILD_PENDING_KEY],
     )?;
     tx.commit().context("提交重建事务失败")?;
-    Ok(inserted)
+    Ok(processed)
 }
 
 /// 索引优化:FTS5 'optimize' 合并内部段 → WAL 截断 → VACUUM。
@@ -574,6 +585,87 @@ mod tests {
         // optimize 不改变可检索内容。
         let report = check_integrity(&conn).unwrap();
         assert!(report.is_consistent());
+    }
+
+    #[test]
+    fn rebuild_uses_document_ids_across_deleted_and_failed_rows() {
+        for sparse in [false, true] {
+            let mut conn = crate::store::open_in_memory().unwrap();
+            // 已删除的低 ID 区间之后,仍有一篇失败文档占据 ID 500。
+            conn.execute(
+                "INSERT INTO documents(id, path, canonical_path, file_name, ext, file_type, \
+                 file_size, file_mtime_ms, content_hash, parse_status, created_at, updated_at) \
+                 VALUES(500, '/d/failed.txt', '/d/failed.txt', 'failed.txt', 'txt', 'text', \
+                 0, 0, 'failed', 'failed', 0, 0)",
+                [],
+            )
+            .unwrap();
+            let count = if sparse { 503 } else { 501 };
+            for i in 0..count {
+                save_doc(
+                    &mut conn,
+                    &format!("/d/{i}.txt"),
+                    &format!("文档 {i}\n\n{}", "测试正文 ".repeat(i % 7 + 1)),
+                );
+            }
+            if sparse {
+                conn.execute_batch(
+                    "DELETE FROM documents_fts WHERE rowid IN (700, 800);\
+                     DELETE FROM documents WHERE id = 700;\
+                     DELETE FROM document_contents WHERE document_id = 800;\
+                     DELETE FROM chunks WHERE document_id = 800;\
+                     UPDATE documents SET parse_status = 'failed' WHERE id = 800;",
+                )
+                .unwrap();
+            }
+            let before = search::search(&conn, &request("正文")).unwrap();
+            let ranks = |response: &SearchResponse| {
+                response
+                    .documents
+                    .iter()
+                    .map(|doc| (doc.document.id, doc.best_rank))
+                    .collect::<Vec<_>>()
+            };
+            let mut calls = Vec::new();
+            let rows =
+                rebuild_fts(&mut conn, &mut |done, total| calls.push((done, total))).unwrap();
+            assert_eq!(rows, 501);
+            assert_eq!(calls, vec![(500, 501), (501, 501)]);
+            assert!(check_integrity(&conn).unwrap().is_consistent());
+            let after = search::search(&conn, &request("正文")).unwrap();
+            assert_eq!(signature(&after), signature(&before));
+            // contentless-delete 删除后的 BM25 分数不保证与重建后完全
+            // 一致;有删除时验证排序,无删除时也验证精确分数。
+            if !sparse {
+                assert_eq!(ranks(&after), ranks(&before));
+            }
+            assert_eq!(after.total_documents, before.total_documents);
+            assert_eq!(after.total_hits, before.total_hits);
+        }
+    }
+
+    #[test]
+    fn rebuild_failure_keeps_pending_and_rolls_back_index() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/a.txt", "正文内容");
+        repo::set_setting(&conn, crate::store::FTS_REBUILD_PENDING_KEY, "1").unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_rebuild BEFORE DELETE ON settings \
+             WHEN OLD.key = 'fts_rebuild_pending' \
+             BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
+        )
+        .unwrap();
+        let before = search::search(&conn, &request("正文")).unwrap();
+        assert!(rebuild_fts(&mut conn, &mut |_, _| {}).is_err());
+        assert!(needs_fts_rebuild(&conn).unwrap());
+        assert!(check_integrity(&conn).unwrap().is_consistent());
+        assert_eq!(
+            signature(&search::search(&conn, &request("正文")).unwrap()),
+            signature(&before)
+        );
+        conn.execute_batch("DROP TRIGGER fail_rebuild").unwrap();
+        assert_eq!(rebuild_fts(&mut conn, &mut |_, _| {}).unwrap(), 1);
+        assert!(!needs_fts_rebuild(&conn).unwrap());
     }
 
     #[test]
