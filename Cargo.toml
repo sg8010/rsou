@@ -18,11 +18,6 @@ name = "rsou-cli"
 path = "src/bin/cli.rs"
 
 [workspace]
-members = [
-    "spikes/anydoc-matrix",
-    "spikes/tokenizer",
-    "spikes/scale",
-]
 
 # jieba 查询分词只服务「宽松模式」:关闭 feature 时宽松退化为精确(不报错)。
 [features]

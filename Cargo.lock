@@ -2930,30 +2930,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rsou-anydoc-matrix-spike"
-version = "0.1.0"
-dependencies = [
- "anydoc",
- "zip",
-]
-
-[[package]]
-name = "rsou-scale-spike"
-version = "0.1.0"
-dependencies = [
- "rsou-tokenizer-spike",
- "rusqlite",
-]
-
-[[package]]
-name = "rsou-tokenizer-spike"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "rusqlite-ext",
-]
-
-[[package]]
 name = "rsqlite-vfs"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

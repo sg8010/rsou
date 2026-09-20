@@ -1,5 +1,5 @@
-//! 测试 fixtures:各格式的最小可解析样本(与 spikes/anydoc-matrix 同源,
-//! 补了 pptx/odt/rtf/csv/epub/txt 与 GB18030 编码)。
+//! 测试 fixtures:各格式的最小可解析样本,覆盖 docx/xlsx/pdf/pptx/odt/rtf/csv/epub/txt
+//! 与 GB18030 编码。
 
 // 不同测试文件各取所需,未用到的构造器不算死代码。
 #![allow(dead_code)]
