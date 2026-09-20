@@ -26,7 +26,8 @@ pub enum Scope {
 /// 查询长度上限(字符数)。
 pub const MAX_QUERY_CHARS: usize = 500;
 
-/// 编译产物:MATCH 表达式 + 正向字面量(二次过滤与预览定位用)。
+/// 编译产物:MATCH 表达式 + 正向字面量(供展示定位与预览高亮用,
+/// 不参与搜索真假判定)。
 #[derive(Debug, Clone)]
 pub struct CompiledQuery {
     /// FTS5 MATCH 表达式
@@ -777,7 +778,7 @@ mod tests {
     fn synonyms_expand_terms_into_or_groups() {
         let query = compile_with("电脑", Scope::All, false, test_expand).unwrap();
         assert_eq!(query.match_expr, "(\"电脑\" OR \"计算机\" OR \"PC\")");
-        // 扁平 OR:每个变体都是二次过滤认可的字面量。
+        // 扁平 OR:每个变体都作为展示定位的字面量。
         assert_eq!(query.literals, ["电脑", "计算机", "PC"]);
     }
 

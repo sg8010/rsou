@@ -205,8 +205,9 @@ mod tests {
             .unwrap();
         assert_eq!(title, None);
 
-        // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;
-        // 这是已知行为,由检索层的二次精确过滤收口(见 plan §6.4)。
+        // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;搜索决策
+        // 单一化后这属于 tokenizer 的正式行为,检索层不再据此剔除结果,只是
+        // 展示层定位不到高亮。详见 docs/plan.md §6.4。
         let punctuated_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
@@ -215,7 +216,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(punctuated_count, 1);
-        // 而检索层会把这条误配剔掉。
+        // 展示层在原文上定位字面量时标点不剔除,所以不会高亮;但文档仍然命中。
         let text = "文、档";
         assert!(crate::search::locate_literals(text, &["文档".to_owned()]).is_empty());
     }

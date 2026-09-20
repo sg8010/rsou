@@ -262,7 +262,7 @@ impl RsouApp {
                 response.elapsed_ms,
                 if response.total_documents > response.documents.len() {
                     format!(
-                        "（FTS 候选 {} 组、{} 个位置，部分未展示或未通过精确匹配）",
+                        "（共命中 {} 组、{} 个文件位置，当前仅展示排名靠前的部分结果）",
                         response.total_groups, response.total_documents
                     )
                 } else {
@@ -807,11 +807,22 @@ fn ui_doc_card(
                         )));
                         ui.label(egui::RichText::new(&doc.ext).size(11.0).color(icon_color));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                egui::RichText::new(format!("命中 {} 处", doc_hit.total_hits))
-                                    .size(12.0)
-                                    .color(RsouApp::text_muted()),
-                            );
+                            // 展示层定位可能为空(FTS tokenizer 与 Locator 规则不同),
+                            // 此时不显示命中处数,但文档仍然保留在结果列表里。
+                            let label = if doc_hit.total_hits > 0 {
+                                Some(format!("命中 {} 处", doc_hit.total_hits))
+                            } else if !doc_hit.title_highlights.is_empty() {
+                                Some("标题命中".to_owned())
+                            } else {
+                                None
+                            };
+                            if let Some(label) = label {
+                                ui.label(
+                                    egui::RichText::new(label)
+                                        .size(12.0)
+                                        .color(RsouApp::text_muted()),
+                                );
+                            }
                         });
                     });
                     ui.add(

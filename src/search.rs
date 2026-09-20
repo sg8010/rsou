@@ -3,11 +3,13 @@
 //! 关键点:
 //! - FTS 表 `documents_fts` **一行一篇文档**,所以 MATCH 里的隐式 AND / OR / NOT
 //!   都是**文档级**语义(多词只要同篇命中即可),不会因为分块边界丢召回;
+//! - **`documents_fts MATCH` 是「文档是否命中」的唯一判定来源**:MATCH 返回、
+//!   并通过 SQL 结构化过滤的文档,即属于最终搜索结果。应用层不得再依据
+//!   高亮 / span / Hit / fragment 等展示数据二次否决结果;
 //! - 高亮不走 FTS5 的 `highlight()`:逐字索引下标点不产生词元,`文、档` 会被
-//!   短语 `"文档"` 命中,而 `highlight()` 只返回区间、要判对错得再把区间文本取
-//!   出来比对——既然要取文本,直接在 `plain_text` 上查字面量更直接。`locate_literals`
-//!   一次完成「定位 + 精确过滤」:标点不剔除,因此 `文、档` 天然不命中,
-//!   而空白/换行的 `文 档` 命中(与 plan §6.4 的收口规则一致);
+//!   短语 `"文档"` 命中,而 `locate_literals` 在原文上定位字面量时标点不剔除,
+//!   因此 `文、档` 不会高亮。这种差异只影响展示:命中但定位不到时文档仍然返回,
+//!   只是没有高亮,空白/换行的 `文 档` 则能正常高亮;
 //! - 展示分块由命中偏移 + `chunks` 边界切出,分块只影响「怎么展示」,
 //!   不影响「能不能搜到」。
 
@@ -38,7 +40,7 @@ pub struct SearchRequest {
     /// true = 宽松模式(jieba 切词);无 jieba feature 时退化为精确
     pub loose: bool,
     pub filters: Filters,
-    /// 返回内容组数上限;最多复核前 200 个 FTS 内容组,默认展示 100 组。
+    /// 返回内容组数上限;最多读取排名靠前的 200 个 FTS 内容组,默认展示 100 组。
     pub max_documents: usize,
     /// 每篇最多返回几个展示片段(`chunks` 中命中块 + 相邻块,按命中位置取前 N)
     pub max_fragments_per_document: usize,
@@ -63,8 +65,8 @@ impl Default for SearchRequest {
 /// 一篇长文档可能命中几百个块,右侧预览的「上一批/下一批」就失去意义了。
 pub const DEFAULT_MAX_FRAGMENTS: usize = 20;
 
-/// 每次最多精确复核的 FTS 内容组数,同组的位置不占额外名额,不继续补页。
-const MAX_CANDIDATES: usize = 200;
+/// 每次最多读取的排名靠前 FTS 内容组数,同组的位置不占额外名额,不继续补页。
+const MAX_RANKED_GROUPS: usize = 200;
 
 /// 字节区间(content 内 / 列文本内)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,12 +97,13 @@ pub struct Hit {
 /// 一篇文档的聚合结果。
 #[derive(Debug)]
 pub struct DocumentHit {
-    /// 所属内容组的代表文档 ID(组内相关度最高且通过精确复核的位置)。
+    /// 所属内容组的代表文档 ID(组内相关度最高的位置)。
     pub group_id: i64,
     pub document: DocumentRow,
     /// 文档标题内的高亮区间
     pub title_highlights: Vec<Span>,
-    /// 展示片段,按在文档中的位置升序
+    /// 展示片段,按在文档中的位置升序。为空只表示展示层没定位到,
+    /// 该文档仍属于 FTS 命中结果。
     pub hits: Vec<Hit>,
     /// 该文档的全部命中批次(可能多于 `hits`,超出上限的部分不再展示)
     pub total_hits: usize,
@@ -115,9 +118,9 @@ pub struct SearchResponse {
     pub documents: Vec<DocumentHit>,
     /// 已展示组的代表文档命中片段总数,不累加副本的片段。
     pub total_hits: usize,
-    /// FTS 命中文档总数(含结构化过滤,不受候选/展示上限影响,可能含少量假阳性)。
+    /// 满足 FTS MATCH + 结构化过滤条件的文件位置数。
     pub total_documents: usize,
-    /// FTS 内容组总数,与 total_documents 一样可能含标点假阳性。
+    /// 满足 FTS MATCH + 结构化过滤条件的内容组数。
     pub total_groups: usize,
     pub elapsed_ms: f64,
     /// 编译产物(literals 供预览定位)
@@ -139,9 +142,11 @@ impl SearchResponse {
     }
 }
 
-/// 预览用:在全文里定位所有字面量(ASCII 大小写不敏感子串),合并重叠区间。
+/// 在原文中定位所有正向查询项(ASCII 大小写不敏感子串),合并重叠区间,
+/// 供 UI 高亮与命中导航使用。
 ///
-/// 这是唯一的定位与精确过滤入口:标点不剔除,所以 `文档` 不会命中 `文、档`;
+/// 本函数是唯一的展示定位入口,但**不参与搜索真假判定**:即使返回空结果,
+/// 也不得移除 FTS5 已命中的文档。标点不剔除,所以 `文档` 不会命中 `文、档`;
 /// 空白/换行不参与比对,所以 `文档` 会命中 `文 档` 与 `文\n档`。
 pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
     let hay = text.to_ascii_lowercase();
@@ -386,8 +391,11 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
     without_title.to_owned()
 }
 
-/// 执行检索:编译查询 → 过滤并按 SHA-256 分组 → 相关度前 200 组 → 按 ID 读取正文
-/// → 定位并精确复核 → 按展示分块切片段。
+/// 执行检索:编译查询 → FTS MATCH + 结构化过滤 → 按 SHA-256 分组并排名
+/// → 按 ID 读取正文 → 为最终结果生成展示高亮与片段。
+///
+/// **FTS MATCH 是全文文本条件唯一的搜索判定来源**:MATCH 返回且通过结构化
+/// 过滤的文档即最终命中结果,后续的定位/片段只服务展示,不再改变结果集合。
 ///
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
@@ -439,8 +447,8 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     }
     where_sql.push_str(&filter_sql);
 
-    // 总数只统计 FTS 候选,接受逐字 tokenizer 的少量标点假阳性。
-    // 与候选查询共用 JOIN、WHERE 和参数,保证结构化过滤口径一致。
+    // 总数即最终命中数:满足 FTS MATCH + 结构化过滤条件的文件位置数与内容组数。
+    // 与命中查询共用 JOIN、WHERE 和参数,保证过滤口径一致。
     let from_sql = "FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid";
     // 缺失或无效哈希独立成组,避免旧数据/失败占位值误合并。
     let group_key = "CASE WHEN length(d.content_hash) = 64 \
@@ -459,28 +467,28 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         )
         .context("统计检索命中文档失败")?;
 
-    // 先在结构化过滤后的 FTS 结果中按哈希分组再限量,避免大量副本
-    // 挤掉其他内容。这里只物化 ID/哈希/分数,不读取候选组以外的正文。
-    let candidate_limit = if request.max_documents == 0 {
+    // 先在结构化过滤后的 FTS 命中结果中按哈希分组,再按组相关度限量,避免大量
+    // 副本挤掉其他内容。这里只物化 ID/哈希/分数,不读取命中组以外的正文。
+    let ranked_group_limit = if request.max_documents == 0 {
         0
     } else {
-        MAX_CANDIDATES
+        MAX_RANKED_GROUPS
     };
-    let candidate_sql = format!(
+    let ranked_sql = format!(
         "WITH matches AS MATERIALIZED (\
            SELECT d.id, documents_fts.rank AS score, {group_key} AS group_key \
            {from_sql} {where_sql} AND rank MATCH 'bm25(5.0, 1.0)'\
          ), selected_groups AS (\
            SELECT group_key, MIN(score) AS best_rank, MIN(id) AS first_id \
            FROM matches GROUP BY group_key \
-           ORDER BY best_rank, first_id LIMIT {candidate_limit}\
+           ORDER BY best_rank, first_id LIMIT {ranked_group_limit}\
          ) \
          SELECT m.id, m.score, m.group_key FROM matches m \
          JOIN selected_groups g ON g.group_key = m.group_key \
          ORDER BY g.best_rank, g.first_id, m.score, m.id"
     );
-    let candidates = conn
-        .prepare(&candidate_sql)
+    let matched_rows = conn
+        .prepare(&ranked_sql)
         .context("准备检索语句失败")?
         .query_map(params_from_iter(params.iter()), |row| {
             Ok((
@@ -491,41 +499,42 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         })
         .context("执行检索失败")?
         .collect::<Result<Vec<_>, _>>()
-        .context("读取检索候选失败")?;
-    let ids: Vec<i64> = candidates.iter().map(|(id, _, _)| *id).collect();
+        .context("读取检索命中失败")?;
+    let ids: Vec<i64> = matched_rows.iter().map(|(id, _, _)| *id).collect();
     let mut meta = repo::get_documents_by_ids(conn, &ids).context("读取文档元数据失败")?;
     let mut content_stmt =
         conn.prepare("SELECT plain_text FROM document_contents WHERE document_id = ?1")?;
 
     let literals = &compiled.literals;
-    let mut documents = Vec::with_capacity(candidates.len().min(request.max_documents));
+    let mut documents = Vec::with_capacity(matched_rows.len().min(request.max_documents));
     let mut current_key = None;
     let mut representative = None;
-    for (id, rank, key) in candidates {
+    for (id, rank, key) in matched_rows {
         if current_key.as_ref() != Some(&key) {
             current_key = Some(key);
             representative = None;
         }
         let Some(document) = meta.remove(&id) else {
-            // 候选取回后文档已被删除——跳过。
+            // 命中取回后文档已被删除——跳过。
             continue;
         };
         // 保持当前行有效直到定位和片段生成结束,直接借用 SQLite 正文。
         // 返回的片段仍拥有自己的字符串,不向调用方泄漏行内借用。
-        let mut content_rows = content_stmt.query([id]).context("读取候选文档正文失败")?;
-        let Some(row) = content_rows.next().context("读取候选文档正文失败")? else {
+        let mut content_rows = content_stmt.query([id]).context("读取命中文档正文失败")?;
+        let Some(row) = content_rows.next().context("读取命中文档正文失败")? else {
             continue;
         };
         let content = row
             .get_ref(0)
-            .context("读取候选文档正文失败")?
+            .context("读取命中文档正文失败")?
             .as_str()
-            .context("转换候选文档正文失败")?;
-        // 定位结果直接复用于精确复核与片段生成,不重复调用定位函数。
+            .context("转换命中文档正文失败")?;
+        // FTS MATCH 已完成最终搜索判定:命中结果不得因展示层定位为空而被丢弃。
+        // 高亮与片段只用于 UI 展示和命中导航,不参与搜索真假判定。
         let content_highlights = locate_literals(content, literals);
         let title_highlights = locate_literals(&document.title, literals);
         if content_highlights.is_empty() && title_highlights.is_empty() {
-            continue;
+            log::debug!("FTS result has no display spans: document_id={id}");
         }
         let bounds = chunk_ranges(conn, id).unwrap_or_default();
         let hits = group_into_fragments(
@@ -547,7 +556,8 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         });
     }
 
-    // 最高排名位置可能被精确复核剔除,用实际代表的位置重新确定组排序。
+    // 代表位置可能因正文缺失被跳过,用实际代表的位置重新确定组排序;
+    // 这里不涉及任何展示定位过滤。
     let mut ranked_groups: Vec<_> = documents
         .iter()
         .filter(|hit| hit.group_id == hit.document.id)
@@ -560,6 +570,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .enumerate()
         .map(|(index, (id, _))| (id, index))
         .collect();
+    // 仅按 max_documents 限制展示的组数,与展示高亮/片段无关。
     documents.retain(|hit| group_order.contains_key(&hit.group_id));
     documents.sort_by_key(|hit| group_order[&hit.group_id]);
 
@@ -986,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_insensitive_but_punctuation_rejected() {
+    fn fts_hit_without_display_spans_is_kept() {
         let mut conn = crate::store::open_in_memory().unwrap();
         save_doc(&mut conn, "/d/空格.txt", FileType::Text, "文 档");
         save_doc(&mut conn, "/d/换行.txt", FileType::Text, "文\n档");
@@ -994,12 +1005,56 @@ mod tests {
         save_doc(&mut conn, "/d/连写.txt", FileType::Text, "文档");
         let response = search(&conn, &request("文档")).unwrap();
         let paths = hit_paths(&response);
-        assert_eq!(response.total_documents, 4, "FTS 总数包含标点假阳性");
-        assert_eq!(paths.len(), 3, "{paths:?}");
-        // 二次过滤现在由 locate_literals 承担:「文、档」不产生任何片段,
-        // 于是整篇被丢掉(与分块实现的结论一致)。
-        assert!(!paths.iter().any(|p| p.contains("顿号")));
+        // FTS MATCH 是唯一搜索判定来源:4 篇全部保留在最终结果里。
+        assert_eq!(response.total_documents, 4);
+        assert_eq!(paths.len(), 4, "{paths:?}");
+        // 「文、档」没有展示定位结果,但不得因此被剔除。
+        let punctuated = response
+            .documents
+            .iter()
+            .find(|d| d.document.path.contains("顿号"))
+            .expect("标点文档仍应返回");
+        assert!(punctuated.hits.is_empty());
+        assert!(punctuated.title_highlights.is_empty());
         assert_eq!(response.total_hits, 3);
+    }
+
+    #[test]
+    fn partially_located_literals_keep_the_document() {
+        // 查询两个词,只有其中一个能在原文里定位到:文档必须保留,
+        // 不能因为展示高亮不完整而被过滤。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/部分.txt", FileType::Text, "合、同……发票");
+        let response = search(&conn, &request("合同 发票")).unwrap();
+        assert_eq!(response.total_documents, 1, "FTS 命中必须保留");
+        let doc = &response.documents[0];
+        assert!(!doc.hits.is_empty(), "发票应被定位到");
+        let located: Vec<&str> = doc
+            .hits
+            .iter()
+            .flat_map(|hit| {
+                hit.highlights
+                    .iter()
+                    .map(|span| &hit.content[span.start..span.end])
+            })
+            .collect();
+        assert_eq!(located, ["发票"], "合同无法定位,不应阻止文档保留");
+    }
+
+    #[test]
+    fn normal_hit_keeps_highlights_and_fragments() {
+        // 普通命中:高亮、片段、标题定位都正常,不能因本次改造回退。
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/d/普通.txt", FileType::Text, "双方签订合同。");
+        let response = search(&conn, &request("合同")).unwrap();
+        assert_eq!(response.total_documents, 1);
+        let doc = &response.documents[0];
+        assert_eq!(doc.total_hits, 1);
+        let hit = &doc.hits[0];
+        assert_eq!(
+            &hit.content[hit.highlights[0].start..hit.highlights[0].end],
+            "合同"
+        );
     }
 
     #[test]

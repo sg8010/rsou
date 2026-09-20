@@ -91,7 +91,7 @@ fn borrowed_content_rejects_invalid_utf8() {
     )
     .unwrap();
     let error = search::search(&conn, &request()).unwrap_err();
-    assert!(error.to_string().contains("转换候选文档正文失败"));
+    assert!(error.to_string().contains("转换命中文档正文失败"));
 }
 
 #[test]
@@ -164,19 +164,25 @@ fn old_ranking(conn: &Connection) -> Vec<(i64, f64)> {
 }
 
 #[test]
-fn fts_total_includes_punctuation_false_positives() {
+fn fts_hits_without_display_spans_are_kept() {
     let mut conn = rsou_lib::store::open_in_memory().unwrap();
     save(&mut conn, "/d/false.txt", "说明", &["文、档"]);
     let valid = save(&mut conn, "/d/valid.txt", "说明", &["文 档"]);
     let response = search::search(&conn, &request()).unwrap();
+    // FTS MATCH 是唯一搜索判定来源:两篇都命中,都保留在最终结果里。
     assert_eq!(response.total_documents, 2);
-    assert_eq!(response.documents.len(), 1);
-    assert_eq!(response.documents[0].document.id, valid);
-    assert_eq!(response.total_hits, 1);
+    assert_eq!(response.documents.len(), 2);
+    let punctuated = response
+        .documents
+        .iter()
+        .find(|doc| doc.document.id != valid)
+        .expect("标点命中文档仍应返回");
+    assert!(punctuated.hits.is_empty(), "展示层无需定位到高亮");
+    assert_eq!(response.total_hits, 1, "只统计展示层真实定位到的片段");
 }
 
 #[test]
-fn false_positives_in_first_200_candidates_do_not_trigger_backfill() {
+fn display_layer_never_drops_ranked_fts_hits() {
     let mut conn = rsou_lib::store::open_in_memory().unwrap();
     for index in 0..205 {
         save(&mut conn, &format!("/d/{index}.txt"), "说明", &["文、档"]);
@@ -187,7 +193,8 @@ fn false_positives_in_first_200_candidates_do_not_trigger_backfill() {
     assert_eq!(ranking.last().unwrap().0, valid);
     assert!(ranking[199].1 < ranking.last().unwrap().1);
 
-    // 将候选外正文替换为读取即报错的表达式,确保不仅是不展示,也没有读取它。
+    // 将排名 200 名开外的正文替换为读取即报错的表达式,确保不仅是不展示,
+    // 也没有读取它——排名/展示上限仍然生效。
     conn.execute_batch(&format!(
         "ALTER TABLE document_contents RENAME TO stored_contents;
          CREATE VIEW document_contents AS
@@ -215,7 +222,10 @@ fn false_positives_in_first_200_candidates_do_not_trigger_backfill() {
     )
     .unwrap();
     assert_eq!(response.total_documents, 206);
-    assert!(response.documents.is_empty(), "不得读取后续候选补满结果");
+    // 前 200 组都是没有展示 span 的 FTS 命中,必须全部保留;
+    // 不得读取后续命中补位。
+    assert_eq!(response.documents.len(), 200);
+    assert!(response.documents.iter().all(|doc| doc.hits.is_empty()));
     assert_eq!(response.total_hits, 0);
 }
 
@@ -467,7 +477,7 @@ fn invalid_hashes_are_not_merged_and_different_hashes_keep_separate_results() {
 }
 
 #[test]
-fn a_false_positive_copy_does_not_hide_a_valid_location() {
+fn false_positive_copy_does_not_hide_a_valid_location() {
     let mut conn = rsou_lib::store::open_in_memory().unwrap();
     let false_id = save(&mut conn, "/false.txt", "文、档", &["无关"]);
     let valid = save(&mut conn, "/valid.txt", "说明", &["文档正文"]);
@@ -476,6 +486,14 @@ fn a_false_positive_copy_does_not_hide_a_valid_location() {
     }
     let response = search::search(&conn, &request()).unwrap();
     assert_eq!(response.total_groups, 1);
-    assert_eq!(response.documents.len(), 1);
-    assert_eq!(response.documents[0].group_id, valid);
+    // 同一内容组内的两个文件位置都必须保留;代表位置按相关度取头部。
+    assert_eq!(response.documents.len(), 2);
+    assert_eq!(response.documents[0].document.id, false_id);
+    assert!(response.documents[0].hits.is_empty());
+    let real = response
+        .documents
+        .iter()
+        .find(|doc| doc.document.id == valid)
+        .expect("真正含字面量的位置也应保留");
+    assert!(!real.hits.is_empty());
 }

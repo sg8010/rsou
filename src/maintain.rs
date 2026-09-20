@@ -453,11 +453,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_index_tokens_are_filtered_by_literal_recheck() {
+    fn stale_index_tokens_stay_in_results_until_rebuild() {
         // contentless-delete 允许同 rowid 重复 INSERT(词元叠加):借此模拟
-        // 「索引里多出与原文不符的词元」这种漂移。行级检查看不出问题
-        // (rowid 对齐、索引内部一致),但检索层在 plain_text 上做字面量复核,
-        // 假阳性不会进入结果。
+        // 「索引里多出与原文不符的词元」这种漂移。
+        //
+        // 搜索决策单一化后,FTS MATCH 是唯一判定来源:这类假阳性会出现在结果里
+        // (展示定位为空),漂移本身由 check_integrity/rebuild 负责清除。
         let mut conn = crate::store::open_in_memory().unwrap();
         let id = save_doc(&mut conn, "/d/a.txt", "内容是正常的原文");
         conn.execute(
@@ -477,7 +478,11 @@ mod tests {
 
         let response = search::search(&conn, &request("垃圾词")).unwrap();
         assert_eq!(response.total_documents, 1);
-        assert!(response.documents.is_empty(), "字面量复核应把假阳性剔除");
+        assert_eq!(response.documents.len(), 1, "FTS 命中必须保留");
+        assert!(
+            response.documents[0].hits.is_empty(),
+            "原文里没有该词,展示定位为空"
+        );
 
         // 重建能把这类漂移一并清掉。
         rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
