@@ -15,6 +15,8 @@ const PREVIEW_WINDOW_BYTES: usize = 100 * 1024;
 const RESULT_PANE_HEIGHT: f32 = 620.0;
 /// 左右分栏阈值:低于该宽度时结果/预览上下排。
 const TWO_PANE_MIN_WIDTH: f32 = 900.0;
+/// 搜索埋点暂时显示在状态行下,避免占满宽窗口。
+const SEARCH_DIAGNOSTICS_MAX_WIDTH: f32 = 800.0;
 
 /// 全部文档类型(类型过滤的复选框顺序)。
 const FILE_TYPES: [FileType; 6] = [
@@ -236,6 +238,37 @@ impl RsouApp {
                     .size(13.0)
                     .color(Self::text_secondary()),
             );
+            let diagnostics = &response.diagnostics;
+            ui.scope(|ui| {
+                ui.set_max_width(SEARCH_DIAGNOSTICS_MAX_WIDTH);
+                let details = format!(
+                    "阶段：编译 {:.1} ms · FTS 计数 {:.1} ms · FTS 排名/候选 {:.1} ms · 元数据 {:.1} ms · 正文读取 {:.1} ms · 命中定位 {:.1} ms · 分块读取 {:.1} ms · 片段生成 {:.1} ms · 收尾 {:.1} ms\n规模：FTS {} 篇 / {} 组 · 候选 {} 组 / {} 个位置 · 正文 {} 字节 · 分块 {} · 命中区间 {}",
+                    diagnostics.compile_ms,
+                    diagnostics.fts_count_ms,
+                    diagnostics.fts_candidates_ms,
+                    diagnostics.metadata_ms,
+                    diagnostics.load_plain_text_ms,
+                    diagnostics.locate_literals_ms,
+                    diagnostics.load_chunks_ms,
+                    diagnostics.group_fragments_ms,
+                    diagnostics.finalize_ms,
+                    diagnostics.fts_documents,
+                    diagnostics.fts_groups,
+                    diagnostics.candidate_groups,
+                    diagnostics.candidate_locations,
+                    diagnostics.plain_text_bytes,
+                    diagnostics.chunk_count,
+                    diagnostics.literal_spans,
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(details)
+                            .size(11.0)
+                            .color(Self::text_secondary()),
+                    )
+                    .wrap(),
+                );
+            });
         }
         ui.add_space(8.0);
 

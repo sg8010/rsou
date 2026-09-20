@@ -842,6 +842,7 @@ mod tests {
             total_documents: ids.len(),
             total_groups: ids.len(),
             elapsed_ms: 0.0,
+            diagnostics: Default::default(),
             compiled: CompiledQuery {
                 match_expr: String::new(),
                 literals: Vec::new(),

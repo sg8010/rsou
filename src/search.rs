@@ -120,8 +120,40 @@ pub struct SearchResponse {
     /// FTS 内容组总数,与 total_documents 一样可能含标点假阳性。
     pub total_groups: usize,
     pub elapsed_ms: f64,
+    /// 本次检索的阶段耗时与处理规模,用于定位慢查询。
+    pub diagnostics: SearchDiagnostics,
     /// 编译产物(literals 供预览定位)
     pub compiled: CompiledQuery,
+}
+
+/// 检索埋点:阶段耗时与候选处理规模。
+///
+/// 这些数据只描述一次检索的实际执行路径,不改变检索结果。耗时单位均为毫秒。
+#[derive(Debug, Clone, Default)]
+pub struct SearchDiagnostics {
+    pub compile_ms: f64,
+    pub fts_count_ms: f64,
+    pub fts_candidates_ms: f64,
+    pub metadata_ms: f64,
+    pub load_plain_text_ms: f64,
+    pub locate_literals_ms: f64,
+    pub load_chunks_ms: f64,
+    pub group_fragments_ms: f64,
+    pub finalize_ms: f64,
+    /// FTS 匹配到的文档位置数(结构化过滤后)。
+    pub fts_documents: usize,
+    /// FTS 匹配到的内容组数(结构化过滤后)。
+    pub fts_groups: usize,
+    /// 实际进入精确复核的内容组数。
+    pub candidate_groups: usize,
+    /// 实际进入精确复核的文档位置数。
+    pub candidate_locations: usize,
+    /// 精确复核阶段从数据库读取的正文总字节数。
+    pub plain_text_bytes: usize,
+    /// 精确复核阶段读取的分块总数。
+    pub chunk_count: usize,
+    /// 定位出的字面量命中区间总数(正文与标题合计)。
+    pub literal_spans: usize,
 }
 
 impl SearchResponse {
@@ -287,13 +319,20 @@ fn group_into_fragments(
     let header_count = distinct_header_count(bounds);
     let header_count = if header_count <= 1 { 0 } else { header_count };
 
-    // 每个命中归到它起点所在的块。
-    let block_of = |byte: usize| -> usize {
-        bounds
-            .iter()
-            .position(|(start, end, _)| byte >= *start && byte < *end)
-            .unwrap_or_else(|| bounds.len().saturating_sub(1))
+    // 命中起点、终点分别单调递增,各用一个只向前移动的游标。
+    // 落在块间空隙时仍回退到最后一块,但不能因此推进实际游标。
+    let block_of = |byte: usize, cursor: &mut usize| -> usize {
+        while *cursor < bounds.len() && bounds[*cursor].1 <= byte {
+            *cursor += 1;
+        }
+        if *cursor < bounds.len() && bounds[*cursor].0 <= byte {
+            *cursor
+        } else {
+            bounds.len() - 1
+        }
     };
+    let mut start_block = 0;
+    let mut end_block = 0;
 
     // 把命中归组:同一个块内的命中合为一个片段;**相邻但不共享块的命中各自
     // 成段**(它们本来就是不同的「命中处」)。跨块短语(一个 span 横跨两个块)
@@ -302,9 +341,9 @@ fn group_into_fragments(
     // spans 已按 start 升序,所以只需与最后一组比较。
     let mut groups: Vec<(usize, usize)> = Vec::new();
     for span in spans {
-        let first = block_of(span.start);
+        let first = block_of(span.start, &mut start_block);
         // 末字节所在的块(span.end 是开区间,减 1 才落在片段内)。
-        let last = block_of(span.end.saturating_sub(1)).max(first);
+        let last = block_of(span.end.saturating_sub(1), &mut end_block).max(first);
         match groups.last_mut() {
             // first 落在上一段内 ⇔ 两处命中共享同一块 → 并段。
             Some(group) if first <= group.1 => group.1 = group.1.max(last),
@@ -313,6 +352,8 @@ fn group_into_fragments(
     }
 
     let mut hits = Vec::with_capacity(groups.len().min(limit));
+    let mut highlight_start = 0;
+    let mut highlight_end = 0;
     for (first, last) in groups {
         if hits.len() >= limit {
             break;
@@ -322,9 +363,16 @@ fn group_into_fragments(
         let Some(piece) = content.get(start..end) else {
             continue;
         };
-        let highlights: Vec<Span> = spans
+        // 按片段的实际边界确定命中切片,保留空隙回退时的原有筛选语义。
+        // 片段边界和命中区间均有序,无需为每个片段重新扫描全部命中。
+        while highlight_start < spans.len() && spans[highlight_start].start < start {
+            highlight_start += 1;
+        }
+        while highlight_end < spans.len() && spans[highlight_end].end <= end {
+            highlight_end += 1;
+        }
+        let highlights: Vec<Span> = spans[highlight_start..highlight_end.max(highlight_start)]
             .iter()
-            .filter(|span| span.start >= start && span.end <= end)
             .map(|span| Span {
                 start: span.start - start,
                 end: span.end - start,
@@ -377,8 +425,13 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
     let started = Instant::now();
+    let compile_started = Instant::now();
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
+    let mut diagnostics = SearchDiagnostics {
+        compile_ms: compile_started.elapsed().as_secs_f64() * 1000.0,
+        ..SearchDiagnostics::default()
+    };
 
     // WHERE 子句与参数只拼一次,给「取结果」与「数总数」两条 SQL 共用。
     let mut where_sql = String::from("WHERE documents_fts MATCH ?");
@@ -431,6 +484,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     let group_key = "CASE WHEN length(d.content_hash) = 64 \
         AND d.content_hash NOT GLOB '*[^0-9a-fA-F]*' \
         THEN lower(d.content_hash) ELSE 'id:' || d.id END";
+    let count_started = Instant::now();
     let (total_documents, total_groups): (usize, usize) = conn
         .query_row(
             &format!("SELECT COUNT(*), COUNT(DISTINCT {group_key}) {from_sql} {where_sql}"),
@@ -443,6 +497,9 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             },
         )
         .context("统计检索命中文档失败")?;
+    diagnostics.fts_count_ms = count_started.elapsed().as_secs_f64() * 1000.0;
+    diagnostics.fts_documents = total_documents;
+    diagnostics.fts_groups = total_groups;
 
     // 先在结构化过滤后的 FTS 结果中按哈希分组再限量,避免大量副本
     // 挤掉其他内容。这里只物化 ID/哈希/分数,不读取候选组以外的正文。
@@ -464,6 +521,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
          JOIN selected_groups g ON g.group_key = m.group_key \
          ORDER BY g.best_rank, g.first_id, m.score, m.id"
     );
+    let candidates_started = Instant::now();
     let candidates = conn
         .prepare(&candidate_sql)
         .context("准备检索语句失败")?
@@ -477,8 +535,20 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .context("执行检索失败")?
         .collect::<Result<Vec<_>, _>>()
         .context("读取检索候选失败")?;
+    diagnostics.fts_candidates_ms = candidates_started.elapsed().as_secs_f64() * 1000.0;
+    diagnostics.candidate_locations = candidates.len();
+    diagnostics.candidate_groups = if candidates.is_empty() {
+        0
+    } else {
+        1 + candidates
+            .windows(2)
+            .filter(|window| window[0].2 != window[1].2)
+            .count()
+    };
     let ids: Vec<i64> = candidates.iter().map(|(id, _, _)| *id).collect();
+    let metadata_started = Instant::now();
     let mut meta = repo::get_documents_by_ids(conn, &ids).context("读取文档元数据失败")?;
+    diagnostics.metadata_ms = metadata_started.elapsed().as_secs_f64() * 1000.0;
     let mut content_stmt =
         conn.prepare("SELECT plain_text FROM document_contents WHERE document_id = ?1")?;
 
@@ -495,26 +565,40 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             // 候选取回后文档已被删除——跳过。
             continue;
         };
+        let load_plain_text_started = Instant::now();
         let Some(content) = content_stmt
             .query_row([id], |row| row.get::<_, String>(0))
             .optional()
             .context("读取候选文档正文失败")?
         else {
+            diagnostics.load_plain_text_ms +=
+                load_plain_text_started.elapsed().as_secs_f64() * 1000.0;
             continue;
         };
+        diagnostics.load_plain_text_ms += load_plain_text_started.elapsed().as_secs_f64() * 1000.0;
+        diagnostics.plain_text_bytes += content.len();
         // 定位结果直接复用于精确复核与片段生成,不重复调用定位函数。
+        let locate_started = Instant::now();
         let content_highlights = locate_literals(&content, literals);
         let title_highlights = locate_literals(&document.title, literals);
+        diagnostics.locate_literals_ms += locate_started.elapsed().as_secs_f64() * 1000.0;
+        diagnostics.literal_spans += content_highlights.len() + title_highlights.len();
         if content_highlights.is_empty() && title_highlights.is_empty() {
             continue;
         }
+        let load_chunks_started = Instant::now();
+        let bounds = chunk_ranges(conn, id).unwrap_or_default();
+        diagnostics.load_chunks_ms += load_chunks_started.elapsed().as_secs_f64() * 1000.0;
+        diagnostics.chunk_count += bounds.len();
+        let group_fragments_started = Instant::now();
         let hits = group_into_fragments(
             &content,
             &content_highlights,
-            &chunk_ranges(conn, id).unwrap_or_default(),
+            &bounds,
             &document.title,
             request.max_fragments_per_document,
         );
+        diagnostics.group_fragments_ms += group_fragments_started.elapsed().as_secs_f64() * 1000.0;
         let total_for_doc = hits.len();
         documents.push(DocumentHit {
             group_id: *representative.get_or_insert(id),
@@ -526,6 +610,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         });
     }
 
+    let finalize_started = Instant::now();
     // 最高排名位置可能被精确复核剔除,用实际代表的位置重新确定组排序。
     let mut ranked_groups: Vec<_> = documents
         .iter()
@@ -548,6 +633,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .filter(|hit| hit.group_id == hit.document.id)
         .map(|doc| doc.hits.len())
         .sum();
+    diagnostics.finalize_ms = finalize_started.elapsed().as_secs_f64() * 1000.0;
 
     Ok(SearchResponse {
         documents,
@@ -555,6 +641,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         total_documents,
         total_groups,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+        diagnostics,
         compiled,
     })
 }
@@ -562,10 +649,192 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 优化前的实现,仅用于差分验证和手动运行的性能对照。
+    fn legacy_group_into_fragments(
+        content: &str,
+        spans: &[Span],
+        bounds: &[(usize, usize, String)],
+        document_title: &str,
+        limit: usize,
+    ) -> Vec<Hit> {
+        if spans.is_empty() {
+            return Vec::new();
+        }
+        // 无块信息:整篇一段。
+        let fallback;
+        let bounds: &[(usize, usize, String)] = if bounds.is_empty() {
+            fallback = vec![(0, content.len(), String::new())];
+            &fallback
+        } else {
+            bounds
+        };
+        // 有的文档根本没有标题(或标题没被识别出来),此时所有块共用同一个
+        // 路径。那种路径只是重复文档标题,没有导航价值,一律不展示。
+        let header_count = distinct_header_count(bounds);
+        let header_count = if header_count <= 1 { 0 } else { header_count };
+
+        // 每个命中归到它起点所在的块。
+        let block_of = |byte: usize| -> usize {
+            bounds
+                .iter()
+                .position(|(start, end, _)| byte >= *start && byte < *end)
+                .unwrap_or_else(|| bounds.len().saturating_sub(1))
+        };
+
+        // 把命中归组:同一个块内的命中合为一个片段;**相邻但不共享块的命中各自
+        // 成段**(它们本来就是不同的「命中处」)。跨块短语(一个 span 横跨两个块)
+        // 把两个块并进同一段,因为它是一处命中,不该被切断。
+        //
+        // spans 已按 start 升序,所以只需与最后一组比较。
+        let mut groups: Vec<(usize, usize)> = Vec::new();
+        for span in spans {
+            let first = block_of(span.start);
+            // 末字节所在的块(span.end 是开区间,减 1 才落在片段内)。
+            let last = block_of(span.end.saturating_sub(1)).max(first);
+            match groups.last_mut() {
+                // first 落在上一段内 ⇔ 两处命中共享同一块 → 并段。
+                Some(group) if first <= group.1 => group.1 = group.1.max(last),
+                _ => groups.push((first, last)),
+            }
+        }
+
+        let mut hits = Vec::with_capacity(groups.len().min(limit));
+        for (first, last) in groups {
+            if hits.len() >= limit {
+                break;
+            }
+            let start = bounds[first].0;
+            let end = bounds[last].1;
+            let Some(piece) = content.get(start..end) else {
+                continue;
+            };
+            let highlights: Vec<Span> = spans
+                .iter()
+                .filter(|span| span.start >= start && span.end <= end)
+                .map(|span| Span {
+                    start: span.start - start,
+                    end: span.end - start,
+                })
+                .collect();
+            hits.push(Hit {
+                start_offset: start,
+                end_offset: end,
+                content: piece.to_owned(),
+                context_header: fragment_header(&bounds[first].2, header_count, document_title),
+                highlights,
+            });
+        }
+        hits
+    }
+
     use crate::chunk::{self, Chunk};
     use crate::parse::FileType;
     use crate::repo::{FileMeta, ParsedDocument};
     use crate::text;
+
+    fn assert_same_fragments(actual: &[Hit], expected: &[Hit]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.start_offset, expected.start_offset);
+            assert_eq!(actual.end_offset, expected.end_offset);
+            assert_eq!(actual.content, expected.content);
+            assert_eq!(actual.context_header, expected.context_header);
+            assert_eq!(actual.highlights, expected.highlights);
+        }
+    }
+
+    #[test]
+    fn fragment_cursors_match_legacy() {
+        // 字符边界同时覆盖中文和 ASCII;包含空块表、块间空隙、跨块和密集命中。
+        let content = "甲a乙b丙c丁d戊e己f庚g辛h壬i癸j";
+        let offsets: Vec<_> = content
+            .char_indices()
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(content.len()))
+            .collect();
+        let mut seed = 42_u64;
+        let mut next = |max: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 32) as usize) % max
+        };
+        for case in 0..2000 {
+            let mut bounds = Vec::new();
+            let mut cursor = 0;
+            while cursor + 1 < offsets.len() && case % 10 != 0 {
+                cursor += next(3);
+                if cursor + 1 >= offsets.len() {
+                    break;
+                }
+                let end = (cursor + 1 + next(5)).min(offsets.len() - 1);
+                bounds.push((
+                    offsets[cursor],
+                    offsets[end],
+                    format!("文档 › 节{}", next(3)),
+                ));
+                cursor = end;
+            }
+            let mut spans = Vec::new();
+            cursor = 0;
+            while cursor + 1 < offsets.len() {
+                cursor += next(3);
+                if cursor + 1 >= offsets.len() {
+                    break;
+                }
+                let end = (cursor + 1 + next(6)).min(offsets.len() - 1);
+                spans.push(Span {
+                    start: offsets[cursor],
+                    end: offsets[end],
+                });
+                cursor = end;
+            }
+            if case % 17 == 0 {
+                spans.clear();
+            }
+            for limit in [0, 1, 2, 20, usize::MAX] {
+                assert_same_fragments(
+                    &group_into_fragments(content, &spans, &bounds, "文档", limit),
+                    &legacy_group_into_fragments(content, &spans, &bounds, "文档", limit),
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "手动性能对照：cargo test -p rsou --release fragment_cursor_benchmark -- --ignored --nocapture"]
+    fn fragment_cursor_benchmark() {
+        let content = "abcdefghij".repeat(100_000);
+        let bounds: Vec<_> = (0..10_000)
+            .map(|i| (i * 100, (i + 1) * 100, String::new()))
+            .collect();
+        let spans: Vec<_> = (0..100_000)
+            .map(|i| Span {
+                start: i * 10,
+                end: i * 10 + 1,
+            })
+            .collect();
+        type FragmentFn = fn(&str, &[Span], &[(usize, usize, String)], &str, usize) -> Vec<Hit>;
+        let implementations: [(&str, FragmentFn); 2] = [
+            ("优化前", legacy_group_into_fragments),
+            ("优化后", group_into_fragments),
+        ];
+        let expected = legacy_group_into_fragments(&content, &spans, &bounds, "文档", 20);
+        for round in 0..3 {
+            for (label, implementation) in implementations {
+                let started = Instant::now();
+                let hits = std::hint::black_box(implementation(
+                    std::hint::black_box(&content),
+                    &spans,
+                    &bounds,
+                    "文档",
+                    20,
+                ));
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                assert_same_fragments(&hits, &expected);
+                eprintln!("第 {} 轮 {label}: {elapsed:.3} ms", round + 1);
+            }
+        }
+    }
 
     fn save_doc(conn: &mut Connection, path: &str, file_type: FileType, markdown: &str) -> i64 {
         let meta = FileMeta {
