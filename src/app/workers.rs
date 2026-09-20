@@ -104,6 +104,35 @@ impl RsouApp {
 
     /// 启动一次导入(已在导入中或索引维护中则忽略;GUI 一次只跑一个导入)。
     pub(crate) fn start_import(&mut self, ctx: &egui::Context, inputs: Vec<PathBuf>, force: bool) {
+        self.start_import_with_options(
+            ctx,
+            inputs,
+            ImportOptions {
+                force,
+                preserve_source_root: force,
+                ..Default::default()
+            },
+        );
+    }
+
+    pub(crate) fn start_rescan(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.start_import_with_options(
+            ctx,
+            vec![path],
+            ImportOptions {
+                skip_unchanged_failed: true,
+                preserve_source_root: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    fn start_import_with_options(
+        &mut self,
+        ctx: &egui::Context,
+        inputs: Vec<PathBuf>,
+        options: ImportOptions,
+    ) {
         if self.import_active || self.maintenance_active || inputs.is_empty() || self.db.is_none() {
             return;
         }
@@ -132,7 +161,7 @@ impl RsouApp {
                     inputs,
                     ImportOptions {
                         max_file_bytes,
-                        force,
+                        ..options
                     },
                     cancel,
                     &mut |event| {

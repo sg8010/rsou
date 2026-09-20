@@ -16,14 +16,26 @@ fn run(
     inputs: Vec<PathBuf>,
     force: bool,
 ) -> (import::ImportCounts, Vec<(PathBuf, String)>) {
-    let mut outcomes = Vec::new();
-    let counts = import::run_import(
+    run_with_options(
         dir_db,
         inputs,
         ImportOptions {
             force,
-            ..ImportOptions::default()
+            ..Default::default()
         },
+    )
+}
+
+fn run_with_options(
+    dir_db: &Path,
+    inputs: Vec<PathBuf>,
+    options: ImportOptions,
+) -> (import::ImportCounts, Vec<(PathBuf, String)>) {
+    let mut outcomes = Vec::new();
+    let counts = import::run_import(
+        dir_db,
+        inputs,
+        options,
         Arc::new(AtomicBool::new(false)),
         &mut |event| {
             if let ImportEvent::FileDone {
@@ -343,4 +355,168 @@ fn import_skip_reimport_and_delete() {
     let (counts, _) = run(&db_path, vec![docs_dir.clone()], true);
     assert_eq!(counts.ok, 3, "剩 3 个可解析文件应全部重解析");
     assert_eq!(counts.skipped, 0);
+}
+
+#[test]
+fn rescan_skips_unchanged_failures_and_imports_new_or_changed_files() {
+    let dir = common::temp_dir("e2e-rescan");
+    let db = dir.join("index.sqlite3");
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    let good = docs.join("正常.txt");
+    let bad = docs.join("失败.txt");
+    std::fs::write(&good, "原始正文").unwrap();
+    std::fs::write(&bad, "").unwrap();
+    let (counts, _) = run(&db, vec![docs.clone()], false);
+    assert_eq!((counts.ok, counts.failed), (1, 1));
+    let options = ImportOptions {
+        skip_unchanged_failed: true,
+        ..Default::default()
+    };
+    let (counts, _) = run_with_options(&db, vec![docs.clone()], options.clone());
+    assert_eq!((counts.skipped, counts.ok, counts.failed), (2, 0, 0));
+
+    // 失败文件仅修改时间变化,哈希相同时仍跳过,并保留失败原因。
+    let conn = store::open(&db, OpenMode::ReadOnly).unwrap();
+    let before = repo::find_document_by_path(&conn, &bad.canonicalize().unwrap())
+        .unwrap()
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&bad)
+        .unwrap()
+        .set_modified(
+            std::time::SystemTime::UNIX_EPOCH
+                + std::time::Duration::from_millis((before.file_mtime_ms + 5000) as u64),
+        )
+        .unwrap();
+    let (counts, _) = run_with_options(&db, vec![bad.clone()], options.clone());
+    assert_eq!((counts.skipped, counts.failed), (1, 0));
+    let after = repo::find_document_by_path(&conn, &bad.canonicalize().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.parse_status, "failed");
+    assert_eq!(after.parse_error_message, before.parse_error_message);
+    assert_eq!(after.updated_at, before.updated_at);
+    assert_ne!(after.file_mtime_ms, before.file_mtime_ms);
+
+    // 普通导入仍重试失败文件;force 优先于重新扫描的跳过策略。
+    let (counts, _) = run(&db, vec![docs.clone()], false);
+    assert_eq!((counts.skipped, counts.failed), (1, 1));
+    let (counts, _) = run_with_options(
+        &db,
+        vec![docs.clone()],
+        ImportOptions {
+            force: true,
+            ..options.clone()
+        },
+    );
+    assert_eq!((counts.skipped, counts.ok, counts.failed), (0, 1, 1));
+
+    std::fs::write(&good, "已经修改的正文内容").unwrap();
+    std::fs::write(&bad, "修复后的正文").unwrap();
+    let sub = docs.join("子目录");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(sub.join("新增.txt"), "新增正文").unwrap();
+    let (counts, _) = run_with_options(&db, vec![docs.clone()], options.clone());
+    assert_eq!((counts.ok, counts.failed, counts.skipped), (3, 0, 0));
+    assert_fts_matches_plain(&conn);
+    let (counts, _) = run_with_options(&db, vec![docs], options);
+    assert_eq!((counts.ok, counts.failed, counts.skipped), (0, 0, 3));
+}
+
+#[test]
+fn rescan_skips_unchanged_read_failure_without_hash() {
+    let dir = common::temp_dir("e2e-rescan-no-hash");
+    let db = dir.join("index.sqlite3");
+    let file = dir.join("过大.txt");
+    std::fs::write(&file, "超过上限的正文").unwrap();
+    let options = ImportOptions {
+        max_file_bytes: 1,
+        skip_unchanged_failed: true,
+        ..Default::default()
+    };
+    let (counts, _) = run_with_options(&db, vec![file.clone()], options.clone());
+    assert_eq!(counts.failed, 1);
+    let (counts, _) = run_with_options(&db, vec![file.clone()], options.clone());
+    assert_eq!((counts.skipped, counts.failed), (1, 0));
+    std::fs::write(&file, "a").unwrap();
+    let (counts, _) = run_with_options(&db, vec![file], options);
+    assert_eq!((counts.ok, counts.skipped), (1, 0));
+}
+
+#[test]
+fn single_file_retry_preserves_folder_on_failure_and_success() {
+    let dir = common::temp_dir("e2e-retry-source-root");
+    let db = dir.join("index.sqlite3");
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    let file = docs.join("失败.txt");
+    std::fs::write(&file, "").unwrap();
+    let (counts, _) = run(&db, vec![docs.clone()], false);
+    assert_eq!(counts.failed, 1);
+    let conn = store::open(&db, OpenMode::ReadOnly).unwrap();
+    let path = dunce::canonicalize(&file).unwrap();
+    let before = repo::find_document_by_path(&conn, &path).unwrap().unwrap();
+    assert_eq!(
+        before.source_root,
+        Some(
+            dunce::canonicalize(&docs)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        )
+    );
+    let retry = ImportOptions {
+        force: true,
+        preserve_source_root: true,
+        ..Default::default()
+    };
+    let (counts, _) = run_with_options(&db, vec![file.clone()], retry.clone());
+    assert_eq!(counts.failed, 1);
+    let failed = repo::find_document_by_path(&conn, &path).unwrap().unwrap();
+    assert_eq!(failed.id, before.id);
+    assert_eq!(failed.source_root, before.source_root);
+    assert_eq!(failed.parse_status, "failed");
+
+    std::fs::write(&file, "修复后的正文").unwrap();
+    let (counts, _) = run_with_options(&db, vec![file.clone()], retry.clone());
+    assert_eq!(counts.ok, 1);
+    let parsed = repo::find_document_by_path(&conn, &path).unwrap().unwrap();
+    assert_eq!(parsed.id, before.id);
+    assert_eq!(parsed.source_root, before.source_root);
+    assert_eq!(parsed.parse_status, "parsed");
+    assert!(repo::list_standalone_documents(&conn).unwrap().is_empty());
+    assert_eq!(
+        repo::list_documents_by_source_root(&conn).unwrap()[0]
+            .1
+            .len(),
+        1
+    );
+    assert_fts_matches_plain(&conn);
+
+    // 单文件增量更新也保留归属;真正单独添加的文件仍为单独文件。
+    std::fs::write(&file, "再次修改后的正文内容").unwrap();
+    let (counts, _) = run_with_options(
+        &db,
+        vec![file],
+        ImportOptions {
+            skip_unchanged_failed: true,
+            preserve_source_root: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(counts.ok, 1);
+    assert_eq!(
+        repo::find_document_by_path(&conn, &path)
+            .unwrap()
+            .unwrap()
+            .source_root,
+        before.source_root
+    );
+    let standalone = dir.join("单独.txt");
+    std::fs::write(&standalone, "独立正文").unwrap();
+    let (counts, _) = run_with_options(&db, vec![standalone], retry);
+    assert_eq!(counts.ok, 1);
+    assert_eq!(repo::list_standalone_documents(&conn).unwrap().len(), 1);
 }

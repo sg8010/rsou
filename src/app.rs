@@ -282,6 +282,8 @@ pub struct RsouApp {
     folder_groups: Vec<FolderGroup>,
     /// 树形视图的折叠/选择状态(egui_ltreeview,跨帧保留)
     library_tree_state: egui_ltreeview::TreeViewState<LibraryNode>,
+    /// 从失败清单定位后,下一次绘制树时滚动到该来源文件夹。
+    pending_library_folder: Option<String>,
     /// 过滤期间被自动展开的文件夹节点;过滤清空后收回为关,
     /// 只记「原本没开」的节点,不覆盖用户手动展开的状态
     filter_auto_opened: Vec<LibraryNode>,
@@ -414,6 +416,7 @@ impl RsouApp {
             library_tab: LibraryTab::default(),
             folder_groups: Vec::new(),
             library_tree_state: egui_ltreeview::TreeViewState::default(),
+            pending_library_folder: None,
             filter_auto_opened: Vec::new(),
             show_failures: false,
             failure_filter: None,
@@ -515,7 +518,7 @@ impl eframe::App for RsouApp {
 
         if self.page == Page::Library && self.show_failures {
             egui::Panel::right("library_failures")
-                .default_size(360.0)
+                .default_size(480.0)
                 .min_size(240.0)
                 .max_size((ui.available_width() * 0.5).max(240.0))
                 .resizable(true)

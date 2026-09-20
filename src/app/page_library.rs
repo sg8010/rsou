@@ -78,6 +78,8 @@ enum RowAction {
     Reveal(PathBuf),
     /// 强制重解析该文件
     Reimport(PathBuf),
+    /// 只处理新增或修改的文件,未变化的失败文件也跳过。
+    Rescan(PathBuf),
     /// 请求移除单个文档(需二次确认)
     AskRemoveDocument(i64, String),
     /// 请求移除整个来源文件夹(需二次确认)
@@ -86,6 +88,8 @@ enum RowAction {
     ReimportFolder(String),
     /// 定位来源文件夹
     RevealFolder(String),
+    /// 在资料库内部选中并滚动到来源文件夹。
+    LocateFolder(String),
 }
 
 impl RsouApp {
@@ -347,7 +351,7 @@ impl RsouApp {
             .column(Column::exact(52.0))
             .column(Column::exact(80.0))
             .column(Column::exact(104.0))
-            .column(Column::exact(196.0))
+            .column(Column::exact(284.0))
             .header(Self::TABLE_HEADER_HEIGHT, |mut header| {
                 for title in [
                     "文件名",
@@ -450,7 +454,15 @@ impl RsouApp {
                                 action = Some(RowAction::Reveal(PathBuf::from(&doc.path)));
                             }
                             if ui
-                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重解析"))
+                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "增量更新"))
+                                .inner
+                                .on_hover_text("只处理新增或修改的文件，跳过未变化的成功及失败文件")
+                                .clicked()
+                            {
+                                action = Some(RowAction::Rescan(PathBuf::from(&doc.path)));
+                            }
+                            if ui
+                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "强制重解析"))
                                 .inner
                                 .clicked()
                             {
@@ -612,6 +624,7 @@ impl RsouApp {
             Self::empty_note(ui, "没有匹配的文件名。");
             return;
         }
+        let locate_folder = self.pending_library_folder.take();
         egui::ScrollArea::vertical()
             .id_salt("rsou_folder_tree")
             .max_height(Self::list_fill_height(ui, fill_bottom))
@@ -628,7 +641,7 @@ impl RsouApp {
                             let root_owned = root.clone();
                             let doc_count = documents.len();
                             let matched = *matched;
-                            // 文件夹行的四个操作:打开 / 定位 / 重解析 / 移除。
+                            // 文件夹行操作:打开 / 定位 / 增量更新 / 强制重解析 / 移除。
                             // 挂在 label_ui 上(行内右侧),与文档行一致;
                             // 点按钮不会触发树的选中/展开(已验证)。
                             let folder_slot: std::rc::Rc<
@@ -640,13 +653,14 @@ impl RsouApp {
                             let root_for_reveal = root.clone();
                             let root_for_remove = root.clone();
                             let busy_here = busy;
+                            let scroll_here = locate_folder.as_ref() == Some(root);
                             // 默认收起:文件多时一屏全是子项,反而看不出有哪几个
                             // 文件夹。用户展开过后由树自带的跨帧状态记住。
                             let folder_open = builder.node(
                                 NodeBuilder::dir(folder_id)
                                     .default_open(false)
                                     .label_ui(move |ui| {
-                                        ui.horizontal(|ui| {
+                                        let row = ui.horizontal(|ui| {
                                             // selectable(false):Label 默认可选中
                                             // (带 click_and_drag),会挡住树的整行
                                             // 点击——点文字不选中,点空白才选中。
@@ -660,7 +674,7 @@ impl RsouApp {
                                                 )
                                                 .selectable(false),
                                             );
-                                            // 右侧三个操作。宽度有限的窗口里
+                                            // 右侧操作。宽度有限的窗口里
                                             // 会挤,但树本身可横向滚动。
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(
@@ -685,7 +699,7 @@ impl RsouApp {
                                                     }
                                                     if ui
                                                         .add_enabled_ui(!busy_here, |ui| {
-                                                            RsouApp::link_button(ui, "重解析")
+                                                            RsouApp::link_button(ui, "强制重解析")
                                                         })
                                                         .inner
                                                         .on_hover_text(
@@ -697,6 +711,18 @@ impl RsouApp {
                                                             Some(RowAction::ReimportFolder(
                                                                 root_for_reimport.clone(),
                                                             ));
+                                                    }
+                                                    if ui
+                                                        .add_enabled_ui(!busy_here, |ui| {
+                                                            RsouApp::link_button(ui, "增量更新")
+                                                        })
+                                                        .inner
+                                                        .on_hover_text("递归扫描，只处理新增或修改的文件，跳过未变化的成功及失败文件")
+                                                        .clicked()
+                                                    {
+                                                        *folder_slot_in.borrow_mut() = Some(
+                                                            RowAction::Rescan(PathBuf::from(&root_for_reimport)),
+                                                        );
                                                     }
                                                     if RsouApp::link_button(ui, "定位").clicked() {
                                                         *folder_slot_in.borrow_mut() =
@@ -713,6 +739,9 @@ impl RsouApp {
                                                 },
                                             );
                                         });
+                                        if scroll_here {
+                                            row.response.scroll_to_me(Some(egui::Align::Center));
+                                        }
                                     }),
                             );
                             if folder_open {
@@ -851,6 +880,7 @@ impl RsouApp {
     fn apply_row_action(&mut self, ui: &egui::Ui, action: Option<RowAction>) {
         let ctx = ui.ctx().clone();
         match action {
+            Some(RowAction::LocateFolder(root)) => self.locate_library_folder(root),
             Some(RowAction::Open(path)) => {
                 if let Err(error) = platform::open_path(&path) {
                     self.library_notice = Some(error);
@@ -861,6 +891,7 @@ impl RsouApp {
                     self.library_notice = Some(error);
                 }
             }
+            Some(RowAction::Rescan(path)) => self.start_rescan(&ctx, path),
             Some(RowAction::Reimport(path)) => self.start_import(&ctx, vec![path], true),
             Some(RowAction::AskRemoveDocument(id, label)) => {
                 self.pending_confirm = Some(PendingConfirm::RemoveDocument { id, label });
@@ -878,6 +909,21 @@ impl RsouApp {
             }
             None => {}
         }
+    }
+
+    fn locate_library_folder(&mut self, root: String) {
+        if !self.folder_groups.iter().any(|group| group.root == root) {
+            self.library_notice = Some("所属文件夹已不在资料库列表中。".to_owned());
+            return;
+        }
+        self.library_tab = LibraryTab::Folders;
+        self.doc_filter.clear();
+        let node = LibraryNode::Folder(root.clone());
+        // 清空过滤时不要再把此次主动展开的目标收起。
+        self.filter_auto_opened.retain(|id| id != &node);
+        self.library_tree_state.set_openness(node.clone(), true);
+        self.library_tree_state.set_one_selected(node);
+        self.pending_library_folder = Some(root);
     }
 
     /// 顶部筛选固定,完整路径与错误在独立滚动区展示。
@@ -947,11 +993,19 @@ impl RsouApp {
                             .wrap(),
                     );
                     ui.horizontal_wrapped(|ui| {
-                        if Self::link_button(ui, "复制路径").clicked() {
-                            ui.ctx().copy_text(doc.path.clone());
+                        if ui
+                            .add_enabled_ui(doc.source_root.is_some(), |ui| {
+                                Self::link_button(ui, "定位所属文件夹")
+                            })
+                            .inner
+                            .on_disabled_hover_text("此文档为单独添加,没有所属入库文件夹。")
+                            .clicked()
+                            && let Some(root) = &doc.source_root
+                        {
+                            action = Some(RowAction::LocateFolder(root.clone()));
                         }
-                        if Self::link_button(ui, "复制错误信息").clicked() {
-                            ui.ctx().copy_text(message.to_owned());
+                        if Self::link_button(ui, "打开所在目录").clicked() {
+                            action = Some(RowAction::Reveal(PathBuf::from(&doc.path)));
                         }
                         if ui
                             .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重试"))
@@ -980,6 +1034,40 @@ impl RsouApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locate_folder_selects_expands_and_requests_scroll() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.folder_groups = vec![group("/a", &["失败.txt"])];
+        app.library_tab = LibraryTab::Files;
+        app.doc_filter = "不匹配".to_owned();
+        let target = LibraryNode::Folder("/a".to_owned());
+        let other = LibraryNode::Folder("/b".to_owned());
+        app.filter_auto_opened = vec![target.clone(), other.clone()];
+
+        app.locate_library_folder("/a".to_owned());
+
+        assert!(app.library_tab == LibraryTab::Folders);
+        assert!(app.doc_filter.is_empty());
+        assert_eq!(app.library_tree_state.selected(), &vec![target.clone()]);
+        assert_eq!(app.library_tree_state.is_open(&target), Some(true));
+        assert_eq!(app.pending_library_folder.as_deref(), Some("/a"));
+        assert_eq!(app.filter_auto_opened, vec![other]);
+    }
+
+    #[test]
+    fn locate_missing_folder_reports_without_changing_navigation() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.library_tab = LibraryTab::Files;
+        app.doc_filter = "保留".to_owned();
+
+        app.locate_library_folder("/missing".to_owned());
+
+        assert!(app.library_tab == LibraryTab::Files);
+        assert_eq!(app.doc_filter, "保留");
+        assert!(app.pending_library_folder.is_none());
+        assert!(app.library_notice.is_some());
+    }
 
     /// 无头渲染资料库页的树形视图。
     ///
@@ -1034,7 +1122,8 @@ mod tests {
                                                                     count,
                                                                 ));
                                                         }
-                                                        let _ = RsouApp::link_button(ui, "重解析");
+                                                        let _ =
+                                                            RsouApp::link_button(ui, "强制重解析");
                                                         let _ = RsouApp::link_button(ui, "定位");
                                                     },
                                                 );

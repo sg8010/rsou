@@ -33,6 +33,10 @@ pub struct ImportOptions {
     pub max_file_bytes: u64,
     /// true = 忽略 hash/mtime 跳过,全部重解析
     pub force: bool,
+    /// 重新扫描时也跳过未变化的失败文件;force 优先。
+    pub skip_unchanged_failed: bool,
+    /// 单文件重试/更新时保留已有文件夹归属,不把它改成单独文件。
+    pub preserve_source_root: bool,
 }
 
 impl Default for ImportOptions {
@@ -40,6 +44,8 @@ impl Default for ImportOptions {
         Self {
             max_file_bytes: 100 * 1024 * 1024,
             force: false,
+            skip_unchanged_failed: false,
+            preserve_source_root: false,
         }
     }
 }
@@ -140,6 +146,7 @@ struct Existing {
     file_mtime_ms: i64,
     content_hash: String,
     parsed: bool,
+    source_root: Option<String>,
 }
 
 /// worker 产出的单文件结果(内部消息;公开事件是 FileOutcome)。
@@ -305,7 +312,7 @@ fn seed_items(
 /// 一次读出 `canonical_path → 已有记录` 的映射(worker 的跳过判定用)。
 fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, Existing>> {
     let mut stmt = conn.prepare(
-        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status \
+        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root \
          FROM documents",
     )?;
     let map = stmt
@@ -318,6 +325,7 @@ fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, 
                     file_mtime_ms: row.get(3)?,
                     content_hash: row.get(4)?,
                     parsed: row.get::<_, String>(5)? == "parsed",
+                    source_root: row.get(6)?,
                 },
             ))
         })?
@@ -333,6 +341,17 @@ fn process_file(
     existing: &HashMap<String, Existing>,
     source_root: Option<&str>,
 ) -> FileResult {
+    // scan_paths 已统一为规范化路径。重试沿用原归属,显式目录输入仍优先。
+    let source_root = source_root.or_else(|| {
+        options
+            .preserve_source_root
+            .then(|| {
+                existing
+                    .get(path.to_string_lossy().as_ref())
+                    .and_then(|prior| prior.source_root.as_deref())
+            })
+            .flatten()
+    });
     let meta = match FileMeta::of(path) {
         Ok(Some(mut meta)) => {
             // 注入来源文件夹(FileMeta::of 只读文件本身,不知道这次是谁导入的)。
@@ -342,7 +361,7 @@ fn process_file(
         Ok(None) => {
             // 扫描与处理之间文件被改名/替换导致扩展名不再受支持。
             return FileResult::Done {
-                meta: dummy_meta(path),
+                meta: dummy_meta(path, source_root),
                 hash: String::new(),
                 result: Err(ParseError {
                     code: parse::ParseErrorCode::Unsupported,
@@ -353,7 +372,7 @@ fn process_file(
         }
         Err(error) => {
             return FileResult::Done {
-                meta: dummy_meta(path),
+                meta: dummy_meta(path, source_root),
                 hash: String::new(),
                 result: Err(ParseError {
                     code: parse::ParseErrorCode::Io,
@@ -369,7 +388,7 @@ fn process_file(
     // 一级跳过:size 与 mtime 都未变,不读文件。
     if !options.force
         && let Some(prior) = prior
-        && prior.parsed
+        && (prior.parsed || options.skip_unchanged_failed)
         && prior.file_size == meta.file_size as i64
         && prior.file_mtime_ms == meta.file_mtime_ms
     {
@@ -396,7 +415,7 @@ fn process_file(
     // 二级跳过:元数据变了但内容哈希相同 → 只更新 size/mtime。
     if !options.force
         && let Some(prior) = prior
-        && prior.parsed
+        && (prior.parsed || options.skip_unchanged_failed)
         && prior.content_hash == hash
     {
         return FileResult::Skipped {
@@ -411,7 +430,7 @@ fn process_file(
 }
 
 /// 元数据读取失败时的占位 FileMeta(只为把错误带回写库线程记 item)。
-fn dummy_meta(path: &Path) -> FileMeta {
+fn dummy_meta(path: &Path, source_root: Option<&str>) -> FileMeta {
     FileMeta {
         path: path.to_path_buf(),
         canonical_path: path.to_path_buf(),
@@ -423,7 +442,7 @@ fn dummy_meta(path: &Path) -> FileMeta {
         file_type: parse::FileType::Text,
         file_size: 0,
         file_mtime_ms: 0,
-        source_root: None,
+        source_root: source_root.map(str::to_owned),
     }
 }
 
