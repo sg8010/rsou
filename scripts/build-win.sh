@@ -12,6 +12,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 TOOLCHAIN="${RUST_TOOLCHAIN:-nightly}"
 TARGETS=(x86_64-win7-windows-gnu i686-win7-windows-gnu)
 
+# 发布产物统一放到 dist/，后缀区分架构（x64 / x32）。
+DIST_DIR="${DIST_DIR:-dist}"
+
 if ! command -v rustup >/dev/null 2>&1; then
     echo "❌ 未找到 rustup，请先安装 Rust" >&2
     exit 1
@@ -29,10 +32,12 @@ for TARGET in "${TARGETS[@]}"; do
         x86_64-*)
             LINKER=x86_64-w64-mingw32-gcc
             DEFAULT_WINDRES=x86_64-w64-mingw32-windres
+            ARCH_SUFFIX=x64
             ;;
         i686-*)
             LINKER=i686-w64-mingw32-gcc
             DEFAULT_WINDRES=i686-w64-mingw32-windres
+            ARCH_SUFFIX=x32
             ;;
         *)
             echo "❌ 不支持的 Windows 目标: $TARGET" >&2
@@ -55,14 +60,25 @@ for TARGET in "${TARGETS[@]}"; do
     WINDRES="$WINDRES_BIN" cargo +"$TOOLCHAIN" -Z build-std=std,panic_unwind \
         build --release --locked --target "$TARGET"
 
+    # 保留 Cargo 原始产物，另行复制带架构后缀的发布文件。
     EXE="target/$TARGET/release/rsou.exe"
     scripts/check-win7-imports.sh "$EXE" "$TARGET"
+
+    mkdir -p "$DIST_DIR"
+    OUT="$DIST_DIR/rsou-win-$ARCH_SUFFIX.exe"
+    cp -f "$EXE" "$OUT"
+    echo "📦 发布产物: $OUT ($(du -h "$OUT" | cut -f1))"
 done
 
 echo ""
 for TARGET in "${TARGETS[@]}"; do
+    case "$TARGET" in
+        x86_64-*) ARCH_SUFFIX=x64 ;;
+        i686-*) ARCH_SUFFIX=x32 ;;
+    esac
     EXE="target/$TARGET/release/rsou.exe"
     echo "✅ 构建完成: $EXE ($(du -h "$EXE" | cut -f1))"
+    echo "   发布产物: $DIST_DIR/rsou-win-$ARCH_SUFFIX.exe"
 done
-echo "   目标系统: Windows 7 及以上；架构: x64、x86"
+echo "   目标系统: Windows 7 及以上；架构: x64、x32(i686)"
 echo "   运行验证: 复制到 Windows 后双击"
