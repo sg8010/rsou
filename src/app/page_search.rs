@@ -414,10 +414,48 @@ impl RsouApp {
                                 if locations.len() > 1 {
                                     let mut open =
                                         self.location_popup_group == Some(current.group_id);
-                                    let trigger =
-                                        ui.button(format!("文件位置 · {} ▾", locations.len()));
+                                    let label = format!("文件位置 · {}", locations.len());
+                                    // 按钮右侧留 20px 给手绘下拉小三角(不依赖字体字形,
+                                    // CJK 字体缺 ▾ 会显示成方框)。
+                                    let label_w = ui
+                                        .painter()
+                                        .layout_no_wrap(
+                                            label.clone(),
+                                            egui::FontId::proportional(14.0),
+                                            Self::text_primary(),
+                                        )
+                                        .size()
+                                        .x;
+                                    let trigger = Self::small_secondary_button(
+                                        ui,
+                                        None,
+                                        &label,
+                                        label_w + 42.0,
+                                        true,
+                                    );
                                     if trigger.clicked() {
                                         open = !open;
+                                    }
+                                    if ui.is_rect_visible(trigger.rect) {
+                                        let tip = egui::pos2(
+                                            trigger.rect.right() - 12.0,
+                                            trigger.rect.center().y,
+                                        );
+                                        let stroke = Stroke::new(1.4, Self::text_secondary());
+                                        ui.painter().line_segment(
+                                            [
+                                                tip + egui::vec2(-3.5, -1.5),
+                                                tip + egui::vec2(0.0, 2.0),
+                                            ],
+                                            stroke,
+                                        );
+                                        ui.painter().line_segment(
+                                            [
+                                                tip + egui::vec2(0.0, 2.0),
+                                                tip + egui::vec2(3.5, -1.5),
+                                            ],
+                                            stroke,
+                                        );
                                     }
                                     let width = (ui.ctx().content_rect().width() - 48.0)
                                         .clamp(160.0, 520.0);
@@ -428,32 +466,34 @@ impl RsouApp {
                                             egui::PopupCloseBehavior::CloseOnClickOutside,
                                         )
                                         .width(width)
+                                        .frame(Self::popup_frame())
                                         .show(|ui| {
-                                            ui.label("选择文件位置");
-                                            ui.separator();
+                                            egui::Frame::new()
+                                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("选择文件位置")
+                                                            .size(13.0)
+                                                            .strong()
+                                                            .color(Self::text_primary()),
+                                                    );
+                                                });
+                                            Self::popup_divider(ui);
                                             egui::ScrollArea::vertical()
                                                 .id_salt(("location_list", current.group_id))
                                                 .max_height(240.0)
                                                 .show(ui, |ui| {
+                                                    ui.spacing_mut().item_spacing.y = 2.0;
                                                     for location in locations {
                                                         let selected =
                                                             location.document.id == doc.id;
-                                                        let label = if selected {
-                                                            format!(
-                                                                "✓ {}\n当前位置",
-                                                                location.document.path
-                                                            )
-                                                        } else {
-                                                            location.document.path.clone()
-                                                        };
-                                                        if ui
-                                                            .add_sized(
-                                                                [ui.available_width(), 0.0],
-                                                                egui::Button::new(label)
-                                                                    .selected(selected)
-                                                                    .wrap(),
-                                                            )
-                                                            .clicked()
+                                                        if Self::menu_row(
+                                                            ui,
+                                                            &location.document.path,
+                                                            selected.then_some("当前位置"),
+                                                            selected,
+                                                        )
+                                                        .clicked()
                                                         {
                                                             let offset = location
                                                                 .hits
@@ -468,8 +508,18 @@ impl RsouApp {
                                                         }
                                                     }
                                                 });
-                                            ui.separator();
-                                            ui.weak("点击路径切换 · Esc 关闭");
+                                            Self::popup_divider(ui);
+                                            egui::Frame::new()
+                                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "点击路径切换 · Esc 关闭",
+                                                        )
+                                                        .size(11.0)
+                                                        .color(Self::text_muted()),
+                                                    );
+                                                });
                                         });
                                     self.location_popup_group = open.then_some(current.group_id);
                                 }

@@ -240,6 +240,99 @@ impl RsouApp {
         });
     }
 
+    /// 浮层容器(下拉选择、路径列表等):白底 + 1px 边框 + 8px 圆角 + 浮层阴影,
+    /// 6px 内边距(条目自带行内 padding,hover 底色贴边)。
+    pub(crate) fn popup_frame() -> egui::Frame {
+        egui::Frame::new()
+            .fill(Self::surface())
+            .stroke(Stroke::new(1.0, Self::border()))
+            .corner_radius(CornerRadius::same(Self::MODAL_RADIUS))
+            .inner_margin(egui::Margin::same(6))
+            .shadow(Shadow {
+                offset: [0, 4],
+                blur: 16,
+                spread: 0,
+                color: Color32::from_black_alpha(18),
+            })
+    }
+
+    /// 浮层内 1px 分隔线(间距比 thin_divider 紧凑)。
+    pub(crate) fn popup_divider(ui: &mut egui::Ui) {
+        ui.add_space(3.0);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            rect.x_range(),
+            rect.center().y,
+            Stroke::new(1.0, Self::divider()),
+        );
+        ui.add_space(3.0);
+    }
+
+    /// 浮层可点行:整行可点、高度按内容自适应(允许换行)。
+    /// 选中 = 浅蓝底 + 蓝字;悬停 = 浅灰底。`note` 是第二行小字标注(如「当前位置」)。
+    pub(crate) fn menu_row(
+        ui: &mut egui::Ui,
+        text: &str,
+        note: Option<&str>,
+        selected: bool,
+    ) -> egui::Response {
+        const HPAD: f32 = 8.0;
+        const VPAD: f32 = 6.0;
+        const NOTE_GAP: f32 = 2.0;
+        let wrap = (ui.available_width() - HPAD * 2.0).max(40.0);
+        let text_color = if selected {
+            Self::accent()
+        } else {
+            Self::text_primary()
+        };
+        let galley = ui.painter().layout(
+            text.to_owned(),
+            egui::FontId::proportional(12.0),
+            text_color,
+            wrap,
+        );
+        let note_galley = note.map(|note| {
+            ui.painter().layout(
+                note.to_owned(),
+                egui::FontId::proportional(11.0),
+                Self::accent(),
+                wrap,
+            )
+        });
+        let note_h = note_galley.as_ref().map_or(0.0, |g| g.size().y + NOTE_GAP);
+        let size = egui::vec2(ui.available_width(), VPAD * 2.0 + galley.size().y + note_h);
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let fill = if selected {
+                Some(Self::accent_soft())
+            } else if response.hovered() {
+                Some(Self::nav_hover())
+            } else {
+                None
+            };
+            if let Some(fill) = fill {
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(Self::BUTTON_RADIUS), fill);
+            }
+            let x = rect.left() + HPAD;
+            let text_h = galley.size().y;
+            ui.painter()
+                .galley(egui::pos2(x, rect.top() + VPAD), galley, text_color);
+            if let Some(note_galley) = note_galley {
+                ui.painter().galley(
+                    egui::pos2(x, rect.top() + VPAD + text_h + NOTE_GAP),
+                    note_galley,
+                    Self::accent(),
+                );
+            }
+        }
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        response
+    }
+
     /// 卡片内标题(16px semibold)+ 与正文的间距。
     pub(crate) fn card_title(ui: &mut egui::Ui, title: &str) {
         ui.label(
