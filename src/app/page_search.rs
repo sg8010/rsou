@@ -217,23 +217,20 @@ impl RsouApp {
                     .color(Self::text_secondary()),
             );
         } else if let Some(response) = &self.search_result {
-            // 「N 处」是已展示文档的片段数之和(下界);被 max_documents 截断时
-            // 额外标出来,不把下界说成全量。
-            let truncated = response.total_documents > response.documents.len();
-            let summary = if truncated {
-                format!(
-                    "命中 {} 篇(展示前 {} 篇) · {} 处 · 耗时 {:.0} ms",
-                    response.total_documents,
-                    response.documents.len(),
-                    response.total_hits,
-                    response.elapsed_ms
-                )
-            } else {
-                format!(
-                    "命中 {} 篇 · {} 处 · 耗时 {:.0} ms",
-                    response.total_documents, response.total_hits, response.elapsed_ms
-                )
-            };
+            let summary = format!(
+                "展示 {} 组结果，共 {} 个文件位置 · 耗时 {:.0} ms{}",
+                response.representatives().count(),
+                response.documents.len(),
+                response.elapsed_ms,
+                if response.total_documents > response.documents.len() {
+                    format!(
+                        "（FTS 候选 {} 组、{} 个位置，部分未展示或未通过精确匹配）",
+                        response.total_groups, response.total_documents
+                    )
+                } else {
+                    String::new()
+                }
+            );
             ui.label(
                 egui::RichText::new(summary)
                     .size(13.0)
@@ -292,6 +289,7 @@ impl RsouApp {
     /// 左侧:按文档分组的命中卡片。
     fn ui_search_results(&mut self, ui: &mut egui::Ui) {
         let mut focus: Option<(i64, usize, usize)> = None;
+        let mut open_locations = None;
         Self::card_frame().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .id_salt("search_result_list")
@@ -315,9 +313,25 @@ impl RsouApp {
                                 );
                                 return;
                             }
-                            for doc_hit in &response.documents {
+                            for representative in response.representatives() {
+                                let locations: Vec<_> =
+                                    response.locations(representative.group_id).collect();
+                                let doc_hit = self
+                                    .search_locations
+                                    .get(&representative.group_id)
+                                    .and_then(|id| {
+                                        locations.iter().find(|hit| hit.document.id == *id).copied()
+                                    })
+                                    .unwrap_or(representative);
                                 let selected = self.preview_doc_id == Some(doc_hit.document.id);
-                                ui_doc_card(ui, doc_hit, selected, &mut focus);
+                                ui_doc_card(
+                                    ui,
+                                    doc_hit,
+                                    locations.len(),
+                                    selected,
+                                    &mut focus,
+                                    &mut open_locations,
+                                );
                                 ui.add_space(8.0);
                             }
                         });
@@ -325,6 +339,9 @@ impl RsouApp {
         });
         if let Some((doc_id, hit_index, offset)) = focus {
             self.focus_preview(doc_id, hit_index, offset);
+        }
+        if let Some(group_id) = open_locations {
+            self.location_popup_group = Some(group_id);
         }
     }
 
@@ -356,6 +373,7 @@ impl RsouApp {
 
         let mut action: Option<RowAction> = None;
         let mut navigation: Option<usize> = None;
+        let mut switch_location = None;
         Self::card_frame().show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::same(14))
@@ -385,6 +403,77 @@ impl RsouApp {
                             .wrap(),
                         );
                         ui.horizontal(|ui| {
+                            if let Some(response) = &self.search_result
+                                && let Some(current) = response
+                                    .documents
+                                    .iter()
+                                    .find(|hit| hit.document.id == doc.id)
+                            {
+                                let locations: Vec<_> =
+                                    response.locations(current.group_id).collect();
+                                if locations.len() > 1 {
+                                    let mut open =
+                                        self.location_popup_group == Some(current.group_id);
+                                    let trigger =
+                                        ui.button(format!("文件位置 · {} ▾", locations.len()));
+                                    if trigger.clicked() {
+                                        open = !open;
+                                    }
+                                    let width = (ui.ctx().content_rect().width() - 48.0)
+                                        .clamp(160.0, 520.0);
+                                    egui::Popup::from_response(&trigger)
+                                        .id(egui::Id::new(("search_locations", current.group_id)))
+                                        .open_bool(&mut open)
+                                        .close_behavior(
+                                            egui::PopupCloseBehavior::CloseOnClickOutside,
+                                        )
+                                        .width(width)
+                                        .show(|ui| {
+                                            ui.label("选择文件位置");
+                                            ui.separator();
+                                            egui::ScrollArea::vertical()
+                                                .id_salt(("location_list", current.group_id))
+                                                .max_height(240.0)
+                                                .show(ui, |ui| {
+                                                    for location in locations {
+                                                        let selected =
+                                                            location.document.id == doc.id;
+                                                        let label = if selected {
+                                                            format!(
+                                                                "✓ {}\n当前位置",
+                                                                location.document.path
+                                                            )
+                                                        } else {
+                                                            location.document.path.clone()
+                                                        };
+                                                        if ui
+                                                            .add_sized(
+                                                                [ui.available_width(), 0.0],
+                                                                egui::Button::new(label)
+                                                                    .selected(selected)
+                                                                    .wrap(),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            let offset = location
+                                                                .hits
+                                                                .first()
+                                                                .map(hit_offset)
+                                                                .unwrap_or(0);
+                                                            switch_location = Some((
+                                                                location.document.id,
+                                                                offset,
+                                                            ));
+                                                            ui.close();
+                                                        }
+                                                    }
+                                                });
+                                            ui.separator();
+                                            ui.weak("点击路径切换 · Esc 关闭");
+                                        });
+                                    self.location_popup_group = open.then_some(current.group_id);
+                                }
+                            }
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -534,6 +623,10 @@ impl RsouApp {
                     }
                 });
         });
+        if let Some((id, offset)) = switch_location {
+            self.location_popup_group = None;
+            self.focus_preview(id, 0, offset);
+        }
         if let Some(hit_index) = navigation
             && let Some(document_id) = document.as_ref().map(|doc| doc.id)
             && let Some(&offset) = hit_offsets.get(hit_index)
@@ -580,8 +673,10 @@ fn preview_window(text: &str, anchor: usize) -> (&str, usize) {
 fn ui_doc_card(
     ui: &mut egui::Ui,
     doc_hit: &DocumentHit,
+    location_count: usize,
     selected: bool,
     focus: &mut Option<(i64, usize, usize)>,
+    open_locations: &mut Option<i64>,
 ) {
     let doc = &doc_hit.document;
     let first_hit_offset = doc_hit.hits.iter().map(hit_offset).min().unwrap_or(0);
@@ -639,6 +734,13 @@ fn ui_doc_card(
                         )
                         .truncate(),
                     );
+                    if location_count > 1
+                        && RsouApp::link_button(ui, &format!("相同内容 · {location_count} 个位置"))
+                            .clicked()
+                    {
+                        *focus = Some((doc.id, 0, first_hit_offset));
+                        *open_locations = Some(doc_hit.group_id);
+                    }
                 });
             });
         });

@@ -326,6 +326,10 @@ pub struct RsouApp {
     search_gen: u64,
     /// 预览面板的文档 id
     preview_doc_id: Option<i64>,
+    /// 当前搜索内每个内容组手动选择的位置。
+    search_locations: std::collections::HashMap<i64, i64>,
+    /// 正在展开路径选择浮层的内容组。
+    location_popup_group: Option<i64>,
     /// 当前预览的命中批次(对应检索结果中保存的命中片段)
     preview_hit_index: usize,
     /// 预览文本(plain_text;大文档渲染时按命中窗口截断)
@@ -432,6 +436,8 @@ impl RsouApp {
             search_rx: None,
             search_gen: 0,
             preview_doc_id: None,
+            search_locations: std::collections::HashMap::new(),
+            location_popup_group: None,
             preview_hit_index: 0,
             preview_text: None,
             preview_rx: None,

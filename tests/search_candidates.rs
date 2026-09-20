@@ -239,3 +239,143 @@ fn weighted_rank_and_title_body_byte_offsets_are_preserved() {
         }
     }
 }
+
+fn set_hash(conn: &Connection, id: i64, hash: &str) {
+    conn.execute(
+        "UPDATE documents SET content_hash = ?1 WHERE id = ?2",
+        (hash, id),
+    )
+    .unwrap();
+}
+
+#[test]
+fn duplicate_locations_do_not_consume_candidate_or_result_slots() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    let hash = "a".repeat(64);
+    for index in 0..205 {
+        let id = save(
+            &mut conn,
+            &format!("/copies/{index}.txt"),
+            "说明",
+            &["文档"],
+        );
+        set_hash(&conn, id, &hash);
+    }
+    let unique = save(
+        &mut conn,
+        "/unique.txt",
+        "说明",
+        &[&format!("{}文档", "余文 ".repeat(500))],
+    );
+    let response = search::search(
+        &conn,
+        &SearchRequest {
+            max_documents: 2,
+            ..request()
+        },
+    )
+    .unwrap();
+    assert_eq!(response.total_documents, 206);
+    assert_eq!(response.total_groups, 2);
+    assert_eq!(response.representatives().count(), 2);
+    assert_eq!(response.documents.len(), 206);
+    assert_eq!(
+        response.locations(response.documents[0].group_id).count(),
+        205
+    );
+    assert!(
+        response
+            .representatives()
+            .any(|hit| hit.document.id == unique)
+    );
+    assert_eq!(response.total_hits, 2, "副本不累加展示命中数");
+
+    let limited = search::search(
+        &conn,
+        &SearchRequest {
+            max_documents: 1,
+            ..request()
+        },
+    )
+    .unwrap();
+    assert_eq!(limited.representatives().count(), 1);
+    assert_eq!(limited.documents.len(), 205, "结果限制不能截掉组内位置");
+}
+
+#[test]
+fn grouping_preserves_each_locations_title_and_offsets_and_respects_scope() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    let title = save(&mut conn, "/outside/title.txt", "文档", &["前言只有正文"]);
+    let body = save(
+        &mut conn,
+        "/inside/body.txt",
+        "说明",
+        &["序言🙂", "文档正文"],
+    );
+    // 相同字节的文件可因文件名、扩展名或解析版本产生不同的标题与解析结果。
+    for id in [title, body] {
+        set_hash(&conn, id, &"b".repeat(64));
+    }
+    let response = search::search(&conn, &request()).unwrap();
+    assert_eq!(response.total_groups, 1);
+    assert_eq!(response.documents.len(), 2);
+    let representative = response.representatives().next().unwrap();
+    assert_eq!(representative.document.id, title);
+    assert!(!representative.title_highlights.is_empty());
+    let copy = response
+        .locations(representative.group_id)
+        .find(|hit| hit.document.id == body)
+        .unwrap();
+    assert!(copy.title_highlights.is_empty());
+    assert_eq!(copy.hits[0].start_offset, "序言🙂".len());
+
+    let scoped = search::search(
+        &conn,
+        &SearchRequest {
+            filters: Filters {
+                path_prefix: Some("/inside/".into()),
+                ..Filters::default()
+            },
+            ..request()
+        },
+    )
+    .unwrap();
+    assert_eq!(scoped.total_documents, 1);
+    assert_eq!(scoped.total_groups, 1);
+    assert_eq!(scoped.documents.len(), 1);
+    assert_eq!(scoped.documents[0].document.id, body);
+
+    repo::delete_document(&mut conn, title).unwrap();
+    let remaining = search::search(&conn, &request()).unwrap();
+    assert_eq!(remaining.documents.len(), 1);
+    assert_eq!(remaining.documents[0].group_id, body);
+}
+
+#[test]
+fn invalid_hashes_are_not_merged_and_different_hashes_keep_separate_results() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    for (index, hash) in [String::new(), String::new(), "a".repeat(64), "b".repeat(64)]
+        .iter()
+        .enumerate()
+    {
+        let id = save(&mut conn, &format!("/{index}.txt"), "说明", &["文档"]);
+        set_hash(&conn, id, hash);
+    }
+    let response = search::search(&conn, &request()).unwrap();
+    assert_eq!(response.total_groups, 4);
+    assert_eq!(response.representatives().count(), 4);
+}
+
+#[test]
+fn a_false_positive_copy_does_not_hide_a_valid_location() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    let false_id = save(&mut conn, "/false.txt", "文、档", &["无关"]);
+    let valid = save(&mut conn, "/valid.txt", "说明", &["文档正文"]);
+    for id in [false_id, valid] {
+        set_hash(&conn, id, &"c".repeat(64));
+    }
+    let response = search::search(&conn, &request()).unwrap();
+    assert_eq!(response.total_groups, 1);
+    assert_eq!(response.documents.len(), 1);
+    assert_eq!(response.documents[0].group_id, valid);
+}

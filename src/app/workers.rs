@@ -359,6 +359,17 @@ impl RsouApp {
 
     /// 切到该文档预览的指定命中批次,并记录滚动目标(plain_text 字节偏移)。
     pub(crate) fn focus_preview(&mut self, document_id: i64, hit_index: usize, byte_offset: usize) {
+        if let Some(hit) = self.search_result.as_ref().and_then(|result| {
+            result
+                .documents
+                .iter()
+                .find(|hit| hit.document.id == document_id)
+        }) {
+            self.search_locations.insert(hit.group_id, document_id);
+            if self.location_popup_group != Some(hit.group_id) {
+                self.location_popup_group = None;
+            }
+        }
         self.preview_hit_index = hit_index;
         self.pending_scroll = Some(byte_offset);
         self.preview_anchor = byte_offset;
@@ -374,6 +385,7 @@ impl RsouApp {
 
     /// 清空预览窗格(文档/文本/导航/缓存);世代+1,在途的预览响应按过期丢弃。
     fn clear_preview(&mut self) {
+        self.location_popup_group = None;
         self.preview_doc_id = None;
         self.preview_hit_index = 0;
         self.preview_anchor = 0;
@@ -563,6 +575,15 @@ impl RsouApp {
                 match result {
                     Ok(response) => {
                         self.search_error = None;
+                        self.search_locations.clear();
+                        self.location_popup_group = None;
+                        if let Some(hit) = response
+                            .documents
+                            .iter()
+                            .find(|hit| Some(hit.document.id) == self.preview_doc_id)
+                        {
+                            self.search_locations.insert(hit.group_id, hit.document.id);
+                        }
                         // 预览属于结果集:选中的文档不在新结果里就整体清掉,
                         // 否则上一次搜索的预览文本会挂在空结果旁边。
                         let still_hit = self.preview_doc_id.is_some_and(|id| {
@@ -759,6 +780,7 @@ mod tests {
 
     fn doc(id: i64) -> DocumentHit {
         DocumentHit {
+            group_id: id,
             document: DocumentRow {
                 id,
                 path: format!("/doc{id}.txt"),
@@ -789,6 +811,7 @@ mod tests {
             documents: ids.iter().map(|&id| doc(id)).collect(),
             total_hits: 0,
             total_documents: ids.len(),
+            total_groups: ids.len(),
             elapsed_ms: 0.0,
             compiled: CompiledQuery {
                 match_expr: String::new(),
@@ -855,5 +878,40 @@ mod tests {
         assert_eq!(app.preview_doc_id, Some(2));
         assert_eq!(app.preview_text.as_deref(), Some("原文"));
         assert_eq!(app.preview_gen, old_gen);
+    }
+
+    #[test]
+    fn selected_duplicate_is_remembered_and_disappearing_location_clears_preview() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        let mut grouped = response(&[1, 2, 3]);
+        grouped.documents[1].group_id = 1;
+        grouped.total_groups = 2;
+        push_result(&mut app, grouped);
+        // 文本已加载时聚焦不需要启动读取线程。
+        app.preview_doc_id = Some(2);
+        app.preview_text = Some("副本的正文".to_owned());
+        app.focus_preview(2, 0, 6);
+        assert_eq!(app.search_locations.get(&1), Some(&2));
+        assert_eq!(app.pending_scroll, Some(6));
+
+        app.preview_doc_id = Some(3);
+        app.focus_preview(3, 0, 0);
+        assert_eq!(
+            app.search_locations.get(&1),
+            Some(&2),
+            "查看别组不丢失位置选择"
+        );
+
+        app.preview_doc_id = Some(2);
+        app.location_popup_group = Some(1);
+        push_result(&mut app, response(&[1, 3]));
+        assert!(
+            app.preview_doc_id.is_none(),
+            "代表位置仍存在也不能保留已消失副本的预览"
+        );
+        assert!(app.preview_text.is_none());
+        assert!(app.search_locations.is_empty());
+        assert!(app.location_popup_group.is_none());
     }
 }

@@ -39,7 +39,7 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   --loose     search:宽松模式(jieba 切词;无该 feature 时等同精确)
   --scope S   search:检索范围 all|title|content(缺省 all)
   --type T    search:限定类型,逗号分隔(如 word,pdf 或扩展名)
-  --limit N   search:最多返回 N 篇文档(缺省 100,仅复核前 200 个候选)
+  --limit N   search:最多返回 N 组内容(缺省 100,仅复核前 200 组,保留组内文件位置)
   --yes       clear:确认清空(不可恢复)";
 
 fn main() -> ExitCode {
@@ -376,11 +376,14 @@ fn cmd_search(
             max_fragments_per_document: search::DEFAULT_MAX_FRAGMENTS,
         },
     )?;
-    for doc_hit in &response.documents {
+    for doc_hit in response.representatives() {
         println!(
             "{} | {} | 命中 {} 处",
             doc_hit.document.file_name, doc_hit.document.path, doc_hit.total_hits
         );
+        for location in response.locations(doc_hit.group_id).skip(1) {
+            println!("  相同内容位置: {}", location.document.path);
+        }
         for hit in &doc_hit.hits {
             if !hit.context_header.is_empty() {
                 println!("  〔{}〕", hit.context_header);
@@ -391,8 +394,8 @@ fn cmd_search(
     // 被 max_documents 截断时说明一下,避免把下界当成全量。
     let truncated = response.total_documents > response.documents.len();
     println!(
-        "命中 {} 篇 · 展示 {} 篇 · {} 处 · 耗时 {:.0} ms{}",
-        response.total_documents,
+        "展示 {} 组 · {} 个文件位置 · {} 处 · 耗时 {:.0} ms{}",
+        response.representatives().count(),
         response.documents.len(),
         response.total_hits,
         response.elapsed_ms,

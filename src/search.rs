@@ -38,7 +38,7 @@ pub struct SearchRequest {
     /// true = 宽松模式(jieba 切词);无 jieba feature 时退化为精确
     pub loose: bool,
     pub filters: Filters,
-    /// 返回文档数上限;最多从前 200 个 FTS 候选中精确复核,默认展示 100 篇。
+    /// 返回内容组数上限;最多复核前 200 个 FTS 内容组,默认展示 100 组。
     pub max_documents: usize,
     /// 每篇最多返回几个展示片段(`chunks` 中命中块 + 相邻块,按命中位置取前 N)
     pub max_fragments_per_document: usize,
@@ -63,7 +63,7 @@ impl Default for SearchRequest {
 /// 一篇长文档可能命中几百个块,右侧预览的「上一批/下一批」就失去意义了。
 pub const DEFAULT_MAX_FRAGMENTS: usize = 20;
 
-/// 每次最多读取正文并精确复核的 FTS 候选数,不继续补页。
+/// 每次最多精确复核的 FTS 内容组数,同组的位置不占额外名额,不继续补页。
 const MAX_CANDIDATES: usize = 200;
 
 /// 字节区间(content 内 / 列文本内)。
@@ -95,6 +95,8 @@ pub struct Hit {
 /// 一篇文档的聚合结果。
 #[derive(Debug)]
 pub struct DocumentHit {
+    /// 所属内容组的代表文档 ID(组内相关度最高且通过精确复核的位置)。
+    pub group_id: i64,
     pub document: DocumentRow,
     /// 文档标题内的高亮区间
     pub title_highlights: Vec<Span>,
@@ -109,15 +111,32 @@ pub struct DocumentHit {
 /// 检索结果。
 #[derive(Debug)]
 pub struct SearchResponse {
+    /// 已展示组的全部匹配位置,按组及位置相关度排序。
     pub documents: Vec<DocumentHit>,
-    /// 已展示文档的命中片段总数;文档被 `max_documents` 截断时是下界
-    /// (完整总数需要为每篇都切片段,不值得)
+    /// 已展示组的代表文档命中片段总数,不累加副本的片段。
     pub total_hits: usize,
     /// FTS 命中文档总数(含结构化过滤,不受候选/展示上限影响,可能含少量假阳性)。
     pub total_documents: usize,
+    /// FTS 内容组总数,与 total_documents 一样可能含标点假阳性。
+    pub total_groups: usize,
     pub elapsed_ms: f64,
     /// 编译产物(literals 供预览定位)
     pub compiled: CompiledQuery,
+}
+
+impl SearchResponse {
+    /// 每组的默认位置;副本数量不参与相关度排序。
+    pub fn representatives(&self) -> impl Iterator<Item = &DocumentHit> {
+        self.documents
+            .iter()
+            .filter(|hit| hit.document.id == hit.group_id)
+    }
+
+    pub fn locations(&self, group_id: i64) -> impl Iterator<Item = &DocumentHit> {
+        self.documents
+            .iter()
+            .filter(move |hit| hit.group_id == group_id)
+    }
 }
 
 /// 预览用:在全文里定位所有字面量(ASCII 大小写不敏感子串),合并重叠区间。
@@ -352,7 +371,7 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
     without_title.to_owned()
 }
 
-/// 执行检索:编译查询 → FTS 计数与相关度前 200 个候选 → 按 ID 读取正文
+/// 执行检索:编译查询 → 过滤并按 SHA-256 分组 → 相关度前 200 组 → 按 ID 读取正文
 /// → 定位并精确复核 → 按展示分块切片段。
 ///
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
@@ -408,40 +427,69 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     // 总数只统计 FTS 候选,接受逐字 tokenizer 的少量标点假阳性。
     // 与候选查询共用 JOIN、WHERE 和参数,保证结构化过滤口径一致。
     let from_sql = "FROM documents_fts JOIN documents d ON d.id = documents_fts.rowid";
-    let total_documents: usize = conn
+    // 缺失或无效哈希独立成组,避免旧数据/失败占位值误合并。
+    let group_key = "CASE WHEN length(d.content_hash) = 64 \
+        AND d.content_hash NOT GLOB '*[^0-9a-fA-F]*' \
+        THEN lower(d.content_hash) ELSE 'id:' || d.id END";
+    let (total_documents, total_groups): (usize, usize) = conn
         .query_row(
-            &format!("SELECT COUNT(*) {from_sql} {where_sql}"),
+            &format!("SELECT COUNT(*), COUNT(DISTINCT {group_key}) {from_sql} {where_sql}"),
             params_from_iter(params.iter()),
-            |row| row.get::<_, i64>(0),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                ))
+            },
         )
-        .context("统计检索命中文档失败")? as usize;
+        .context("统计检索命中文档失败")?;
 
-    // 隐藏 rank 让 FTS5 按相关度输出有限候选;此阶段不返回标题/正文。
-    // 不增加 rowid 次排序,避免 SQLite 为多列排序建立临时排序表。
+    // 先在结构化过滤后的 FTS 结果中按哈希分组再限量,避免大量副本
+    // 挤掉其他内容。这里只物化 ID/哈希/分数,不读取候选组以外的正文。
+    let candidate_limit = if request.max_documents == 0 {
+        0
+    } else {
+        MAX_CANDIDATES
+    };
     let candidate_sql = format!(
-        "SELECT documents_fts.rowid, documents_fts.rank \
-         {from_sql} {where_sql} AND rank MATCH 'bm25(5.0, 1.0)' \
-         ORDER BY rank LIMIT {MAX_CANDIDATES}"
+        "WITH matches AS MATERIALIZED (\
+           SELECT d.id, documents_fts.rank AS score, {group_key} AS group_key \
+           {from_sql} {where_sql} AND rank MATCH 'bm25(5.0, 1.0)'\
+         ), selected_groups AS (\
+           SELECT group_key, MIN(score) AS best_rank, MIN(id) AS first_id \
+           FROM matches GROUP BY group_key \
+           ORDER BY best_rank, first_id LIMIT {candidate_limit}\
+         ) \
+         SELECT m.id, m.score, m.group_key FROM matches m \
+         JOIN selected_groups g ON g.group_key = m.group_key \
+         ORDER BY g.best_rank, g.first_id, m.score, m.id"
     );
     let candidates = conn
         .prepare(&candidate_sql)
         .context("准备检索语句失败")?
         .query_map(params_from_iter(params.iter()), |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })
         .context("执行检索失败")?
         .collect::<Result<Vec<_>, _>>()
         .context("读取检索候选失败")?;
-    let ids: Vec<i64> = candidates.iter().map(|(id, _)| *id).collect();
+    let ids: Vec<i64> = candidates.iter().map(|(id, _, _)| *id).collect();
     let mut meta = repo::get_documents_by_ids(conn, &ids).context("读取文档元数据失败")?;
     let mut content_stmt =
         conn.prepare("SELECT plain_text FROM document_contents WHERE document_id = ?1")?;
 
     let literals = &compiled.literals;
     let mut documents = Vec::with_capacity(candidates.len().min(request.max_documents));
-    for (id, rank) in candidates {
-        if documents.len() >= request.max_documents {
-            break;
+    let mut current_key = None;
+    let mut representative = None;
+    for (id, rank, key) in candidates {
+        if current_key.as_ref() != Some(&key) {
+            current_key = Some(key);
+            representative = None;
         }
         let Some(document) = meta.remove(&id) else {
             // 候选取回后文档已被删除——跳过。
@@ -469,6 +517,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         );
         let total_for_doc = hits.len();
         documents.push(DocumentHit {
+            group_id: *representative.get_or_insert(id),
             document,
             title_highlights,
             hits,
@@ -477,14 +526,34 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         });
     }
 
-    // 「命中处数」= 所有**已展示**文档的片段数之和。文档被 max_documents 截断时
-    // 它是个下界,调用方可以用 `total_documents > documents.len()` 判断并说明。
-    let total_hits = documents.iter().map(|doc| doc.hits.len()).sum();
+    // 最高排名位置可能被精确复核剔除,用实际代表的位置重新确定组排序。
+    let mut ranked_groups: Vec<_> = documents
+        .iter()
+        .filter(|hit| hit.group_id == hit.document.id)
+        .map(|hit| (hit.group_id, hit.best_rank))
+        .collect();
+    ranked_groups.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let group_order: std::collections::HashMap<_, _> = ranked_groups
+        .into_iter()
+        .take(request.max_documents)
+        .enumerate()
+        .map(|(index, (id, _))| (id, index))
+        .collect();
+    documents.retain(|hit| group_order.contains_key(&hit.group_id));
+    documents.sort_by_key(|hit| group_order[&hit.group_id]);
+
+    // 「命中处数」只累计已展示组的默认位置,避免副本重复计数。
+    let total_hits = documents
+        .iter()
+        .filter(|hit| hit.group_id == hit.document.id)
+        .map(|doc| doc.hits.len())
+        .sum();
 
     Ok(SearchResponse {
         documents,
         total_hits,
         total_documents,
+        total_groups,
         elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         compiled,
     })
