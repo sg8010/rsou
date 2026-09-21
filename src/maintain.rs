@@ -188,7 +188,9 @@ fn fts_row_mismatch(conn: &Connection) -> anyhow::Result<(i64, i64)> {
 /// 中断,随后又有新文档写入索引,使索引从「空」变成「部分有内容」的遗留库。
 /// `rebuild_fts` 提交时清标志。
 pub fn needs_fts_rebuild(conn: &Connection) -> anyhow::Result<bool> {
-    if repo::get_setting(conn, crate::store::FTS_REBUILD_PENDING_KEY)?.as_deref() == Some("1") {
+    if repo::get_setting(conn, "schema_version")?.as_deref() != Some(crate::store::SCHEMA_VERSION)
+        || repo::get_setting(conn, crate::store::FTS_REBUILD_PENDING_KEY)?.as_deref() == Some("1")
+    {
         return Ok(true);
     }
     // 行集合必须与已解析文档严格对齐:空索引、部分索引、以及 failed 文档
@@ -774,13 +776,29 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'injected rebuild failure'); END;",
         )
         .unwrap();
-        let before = search::search(&conn, &request("正文")).unwrap();
+        let count = || {
+            conn.query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '正文'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        let before = count();
+        assert_eq!(before, 1);
+        assert!(search::search(&conn, &request("正文")).is_err());
         assert!(rebuild_fts(&mut conn, &mut |_, _| {}).is_err());
         assert!(needs_fts_rebuild(&conn).unwrap());
         assert!(check_integrity(&conn).unwrap().is_consistent());
+        assert!(search::search(&conn, &request("正文")).is_err());
         assert_eq!(
-            signature(&search::search(&conn, &request("正文")).unwrap()),
-            signature(&before)
+            conn.query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '正文'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            before
         );
         conn.execute_batch("DROP TRIGGER fail_rebuild").unwrap();
         assert_eq!(rebuild_fts(&mut conn, &mut |_, _| {}).unwrap(), 1);

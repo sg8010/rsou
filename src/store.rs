@@ -27,7 +27,8 @@ use crate::tokenize;
 /// 全文只在 `document_contents.plain_text` 存一份,FTS 不再重复存约一倍体积。
 /// 旧表整个丢弃(索引由启动后的维护任务重灌,不在 open 里做全量重建),
 /// 检索语义不变。
-pub const SCHEMA_VERSION: &str = "4";
+/// 版本 5 合并 ASCII 字母数字词元;旧索引清空后由维护任务重建。
+pub const SCHEMA_VERSION: &str = "5";
 
 /// 待重建标志:迁移丢弃旧 FTS 表时置 '1',`maintain::rebuild_fts` 提交时清掉。
 /// GUI 启动读到它即自动发起重建;CLI 各命令打印提示。
@@ -156,8 +157,8 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
     // “no such column”。所以先把缺的列补上,再跑 SCHEMA_SQL(CREATE TABLE/INDEX
     // 都是 IF NOT EXISTS,对新库和已升上来的旧库都幂等)。
     add_missing_columns(connection)?;
-    // v3 及以前:documents_fts 是普通表(整存一份全文)。先把它丢掉,SCHEMA_SQL
-    // 的 CREATE IF NOT EXISTS 才会建出新的 contentless-delete 表。
+    // v3 及以前更换普通 FTS 表,v4 更换旧分词规则。先丢弃旧索引,
+    // SCHEMA_SQL 再创建新表;正文保留,由维护任务重建。
     drop_legacy_fts(connection)?;
     connection
         .execute_batch(SCHEMA_SQL)
@@ -193,18 +194,19 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
 
 /// 能否从 `from` 就地升级到当前版本。
 ///
-/// - v2 → v4:补 `source_root` 列(v3 那一步)+ 换 contentless-delete FTS 表;
-/// - v3 → v4:只换 FTS 表结构。
+/// - v2 → v5:补 `source_root` 列并更换 FTS 表;
+/// - v3 → v5:更换 FTS 表结构与分词规则;
+/// - v4 → v5:更换分词规则,丢弃旧索引等待重建。
 ///
 /// 都不丢文档数据;旧 FTS 表丢弃后索引由维护任务重建(见 `drop_legacy_fts`)。
 /// v1 的 chunks_fts 是每分块一行的另一套结构,继续拒绝并提示重建。
 fn can_upgrade_from(from: &str) -> bool {
-    matches!(from, "2" | "3")
+    matches!(from, "2" | "3" | "4")
 }
 
 /// v4 迁移:旧 documents_fts 是普通 FTS5 表(带 %_content 影子表,整存一份
 /// 全文);contentless-delete 表没有 %_content——以影子表是否存在判定旧格式,
-/// 与 schema_version 无关。
+/// 同时识别 v4 的旧分词规则并丢弃对应索引。
 ///
 /// 发现旧表即 DROP(影子表随主表一起删),新表交给 SCHEMA_SQL 的
 /// CREATE IF NOT EXISTS;同时置 `fts_rebuild_pending`,索引由启动后的维护
@@ -219,7 +221,8 @@ fn drop_legacy_fts(connection: &Connection) -> anyhow::Result<()> {
             |row| row.get(0),
         )
         .context("检查旧全文索引表结构失败")?;
-    if !legacy {
+    let old_tokens = stored_schema_version(connection)?.as_deref() == Some("4");
+    if !legacy && !old_tokens {
         return Ok(());
     }
     connection
@@ -232,7 +235,7 @@ fn drop_legacy_fts(connection: &Connection) -> anyhow::Result<()> {
             [FTS_REBUILD_PENDING_KEY],
         )
         .context("写入重建标志失败")?;
-    log::info!("documents_fts 已升级为 contentless-delete 格式,等待重建全文索引");
+    log::info!("documents_fts 已升级表结构或分词规则,等待重建全文索引");
     Ok(())
 }
 
@@ -347,7 +350,7 @@ CREATE TABLE IF NOT EXISTS chunks (
 -- 全文只在 document_contents.plain_text 存一份(省约一倍体积);列值读回恒为
 -- NULL,检索只用 MATCH/rank/rowid。删除按 rowid 直接回收词元,不需要像外部
 -- 内容表那样先回读旧值——任何顺序都不会留残留。
--- tokenizer 'rsou' 由本程序注册(参数 '0' = 关闭拼音,与 wsou 的 simple 0 对齐)。
+-- tokenizer 'rsou' 由本程序注册(参数 '0' = 关闭拼音)。
 CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
   title, content,
   content = '',
@@ -700,6 +703,63 @@ mod tests {
     }
 
     #[test]
+    fn v4_tokenizer_upgrade_blocks_search_until_rebuild() {
+        let path = temp_db("tokenizer-v4");
+        let mut conn = open(&path, OpenMode::ReadWrite).unwrap();
+        conn.execute_batch(
+            "UPDATE settings SET value='4' WHERE key='schema_version';
+            INSERT INTO documents(path,canonical_path,file_name,title,ext,file_type,
+                file_size,file_mtime_ms,content_hash,parse_status,created_at,updated_at)
+                VALUES('/a.txt','/a.txt','a.txt','型号','txt','text',1,1,'h','parsed',1,1);
+            INSERT INTO document_contents(document_id,markdown,plain_text) VALUES(1,'A4','A4');
+            INSERT INTO documents_fts(rowid,title,content) VALUES(1,'型号','A 4');
+            CREATE TRIGGER abort_upgrade BEFORE UPDATE OF value ON settings
+            WHEN NEW.key='schema_version' BEGIN SELECT RAISE(ABORT,'upgrade failure'); END;",
+        )
+        .unwrap();
+        let ro = open(&path, OpenMode::ReadOnly).unwrap();
+        assert!(crate::maintain::needs_fts_rebuild(&ro).unwrap());
+        let req = crate::search::SearchRequest {
+            query: "A4".into(),
+            ..Default::default()
+        };
+        assert!(crate::search::search(&ro, &req).is_err());
+        assert!(open(&path, OpenMode::ReadWrite).is_err());
+        assert_eq!(stored_schema_version(&ro).unwrap().as_deref(), Some("4"));
+        let old_count: i64 = ro
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"A 4\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 1);
+        conn.execute_batch("DROP TRIGGER abort_upgrade").unwrap();
+        ensure_schema(&conn).unwrap();
+        assert!(crate::search::search_for_listing(&ro, &req).is_err());
+        assert!(crate::maintain::needs_fts_rebuild(&conn).unwrap());
+        // 重复开库不能清掉重建状态。
+        ensure_schema(&conn).unwrap();
+        assert!(crate::maintain::needs_fts_rebuild(&conn).unwrap());
+        crate::maintain::rebuild_fts(&mut conn, &mut |_, _| {}).unwrap();
+        assert!(!crate::maintain::needs_fts_rebuild(&conn).unwrap());
+        assert_eq!(crate::search::search(&ro, &req).unwrap().documents.len(), 1);
+        let old_count: i64 = ro
+            .query_row(
+                "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"A 4\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_count, 0);
+        ensure_schema(&conn).unwrap();
+        assert!(!crate::maintain::needs_fts_rebuild(&conn).unwrap());
+        drop(ro);
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn v3_database_migrates_fts_to_contentless_and_flags_rebuild() {
         // 模拟 v3:documents_fts 是普通表(带 _content 影子表、另存一份全文)。
         let path = temp_db("migrate-v3");
@@ -732,7 +792,7 @@ mod tests {
             assert!(shadow, "模拟的普通表应有 %_content 影子表");
         }
 
-        // 重新打开:旧表被丢弃、新表为空、置重建标志、版本升到 4。
+        // 重新打开:旧表被丢弃、新表为空、置重建标志、升级到当前版本。
         let connection = open(&path, OpenMode::ReadWrite).unwrap();
         assert_eq!(
             stored_schema_version(&connection).unwrap().as_deref(),

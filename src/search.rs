@@ -625,6 +625,17 @@ fn search_with(
     quick: bool,
 ) -> anyhow::Result<SearchResponse> {
     let started = Instant::now();
+    // 只查版本和持久化标志,不在每次搜索时扫描整库行集合。
+    let ready: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM settings WHERE key = 'schema_version' AND value = ?1)
+         AND NOT EXISTS(SELECT 1 FROM settings WHERE key = 'fts_rebuild_pending' AND value = '1')",
+        [crate::store::SCHEMA_VERSION],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        ready,
+        "全文索引待升级或重建，暂不能检索；请打开资料库完成升级并重建索引，或运行 rsou-cli --db <数据库路径> rebuild"
+    );
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
 

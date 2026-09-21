@@ -902,6 +902,28 @@ mod tests {
         }
 
         #[test]
+        fn alphanumeric_identifiers_keep_case_and_boundaries() {
+            for jieba in [
+                jieba_rs::Jieba::new(),
+                build_jieba(&[word("打印纸"), word("Win7系统")]),
+            ] {
+                for text in ["a4", "A4", "gb2024", "GB2024", "win7", "Win7"] {
+                    assert_eq!(words(&jieba, text), [text]);
+                }
+                assert_eq!(words(&jieba, "A4打印纸"), ["A4", "打印纸"]);
+            }
+            let custom = build_jieba(&[word("Win7系统")]);
+            assert_eq!(words(&custom, "Win7系统"), ["Win7系统"]);
+            assert_eq!(
+                crate::tokenize::token_spans("Win7系统")
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>(),
+                ["win7", "系", "统"]
+            );
+        }
+
+        #[test]
         fn omitted_frequency_still_joins_the_user_word() {
             let jieba = build_jieba(&[word("深度检索")]);
             assert!(

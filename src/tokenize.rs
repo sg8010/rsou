@@ -1,10 +1,9 @@
-//! `rsou` FTS5 自定义 tokenizer(逐字索引,与 wsou 的 `simple 0` 同语义)。
+//! `rsou` FTS5 自定义 tokenizer(中文逐字索引,ASCII 字母数字连续成词)。
 //!
 //! 规则:
 //! - 非 ASCII 的字母数字字符(含全部 CJK 与中文标点之外的 Unicode 字符)
 //!   逐码点成词元;
-//! - ASCII 字母连续段小写后成一个词元,ASCII 数字连续段成一个词元,
-//!   字母与数字之间切开("A4" → "a","4");
+//! - ASCII 字母数字连续段小写后成一个词元("A4" → "a4");
 //! - 空白、标点与其余符号是分隔符,不产生词元。
 //!
 //! 上报给 FTS5 的每个词元都带着它在原文中的字节区间,因此 `highlight()`
@@ -27,7 +26,7 @@ pub struct TokenSpan {
 
 /// 分词核心:按模块头规则逐词元回调,不为每个词元建 String。
 ///
-/// 数字段与非 ASCII 码点直接传原文字节切片(零拷贝);ASCII 字母段经一个
+/// 不含 ASCII 大写字母的片段与非 ASCII 码点直接传原文字节切片(零拷贝);含 ASCII 大写字母的片段经一个
 /// 复用缓冲小写化后传出。词元区间始终指向原始字符串。
 fn for_each_token<E>(
     text: &str,
@@ -38,30 +37,24 @@ fn for_each_token<E>(
     let mut iter = text.char_indices().peekable();
 
     while let Some((start, ch)) = iter.next() {
-        if ch.is_ascii_alphabetic() {
+        if ch.is_ascii_alphanumeric() {
             let mut end = start + ch.len_utf8();
             while let Some(&(next_start, next)) = iter.peek() {
-                if next.is_ascii_alphabetic() {
+                if next.is_ascii_alphanumeric() {
                     iter.next();
                     end = next_start + next.len_utf8();
                 } else {
                     break;
                 }
             }
-            lowered.clear();
-            lowered.extend(bytes[start..end].iter().map(u8::to_ascii_lowercase));
-            f(&lowered, start..end)?;
-        } else if ch.is_ascii_digit() {
-            let mut end = start + ch.len_utf8();
-            while let Some(&(next_start, next)) = iter.peek() {
-                if next.is_ascii_digit() {
-                    iter.next();
-                    end = next_start + next.len_utf8();
-                } else {
-                    break;
-                }
+            let token = &bytes[start..end];
+            if token.iter().any(u8::is_ascii_uppercase) {
+                lowered.clear();
+                lowered.extend(token.iter().map(u8::to_ascii_lowercase));
+                f(&lowered, start..end)?;
+            } else {
+                f(token, start..end)?;
             }
-            f(&bytes[start..end], start..end)?;
         } else if !ch.is_ascii() && ch.is_alphanumeric() {
             let end = start + ch.len_utf8();
             f(&bytes[start..end], start..end)?;
@@ -104,7 +97,7 @@ impl Tokenizer for RsouTokenizer {
     }
 
     fn new(_global: &Self::Global, args: Vec<String>) -> Result<Self, rusqlite::Error> {
-        // `0` 是当前模式(逐字索引,关闭拼音,对齐 wsou 的 `simple 0`)。
+        // `0` 是当前模式(逐字索引,关闭拼音)。
         // `1` 是预留参数位:将来做拼音搜索时表示「汉字词元 + COLOCATED 拼音词元」。
         if args.iter().any(|arg| arg != "0" && arg != "1") {
             return Err(rusqlite::Error::InvalidParameterName(
@@ -146,10 +139,16 @@ mod tests {
 
     #[test]
     fn token_spans_preserve_source_ranges() {
-        let text = "A4 foo中文，文、档 😀";
+        let text = "A4 foo中文，文、档 😀 GB2024 Win7 123 abc A-4 A_4 Ａ４";
         let tokens = token_spans(text);
         let values: Vec<_> = tokens.iter().map(|token| token.text.as_str()).collect();
-        assert_eq!(values, ["a", "4", "foo", "中", "文", "文", "档"]);
+        assert_eq!(
+            values,
+            [
+                "a4", "foo", "中", "文", "文", "档", "gb2024", "win7", "123", "abc", "a", "4", "a",
+                "4", "Ａ", "４"
+            ]
+        );
         for token in tokens {
             assert_eq!(text[token.range.clone()].to_ascii_lowercase(), token.text);
             assert!(token.range.end <= text.len());

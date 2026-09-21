@@ -884,6 +884,59 @@ mod tests {
     }
 
     #[test]
+    fn alphanumeric_terms_use_whole_tokens_in_both_modes() {
+        let conn = crate::store::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents_fts(rowid,title,content) VALUES
+            (1,'','A4打印纸 GB2024 Win7'), (2,'','A 4打印纸 GB 2024 Win 7'),
+            (3,'','a4打印纸 gb2024 win7'), (4,'','A40 GB20240 Win70')",
+        )
+        .unwrap();
+        for loose in [false, true] {
+            for (input, expected) in [
+                ("A4", vec![1, 3]),
+                ("a4打印纸", vec![1, 3]),
+                ("gb2024", vec![1, 3]),
+                ("WIN7", vec![1, 3]),
+                ("A", vec![2]),
+                ("4", vec![2]),
+                ("Win", vec![2]),
+                ("打印纸 -A4", vec![2]),
+                ("\"A 4\"", vec![2]),
+            ] {
+                let query = compile_with(input, Scope::All, loose, identity).unwrap();
+                let ids: Vec<i64> = conn.prepare("SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY rowid")
+                    .unwrap().query_map([&query.match_expr], |r| r.get(0)).unwrap()
+                    .collect::<Result<_,_>>().unwrap();
+                assert_eq!(
+                    ids, expected,
+                    "{input}, loose={loose}: {}",
+                    query.match_expr
+                );
+            }
+            let query = compile_with("纸张", Scope::All, loose, |s| {
+                if s == "纸张" {
+                    vec!["纸张".into(), "A4".into()]
+                } else {
+                    identity(s)
+                }
+            })
+            .unwrap();
+            let count: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
+                    [&query.match_expr],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 2);
+            assert!(query.literals.contains(&"A4".to_owned()));
+        }
+        let spans = crate::search::locate_literals("型号 a4 打印纸", &["A4".into()]);
+        assert_eq!(spans, [crate::search::Span { start: 7, end: 9 }]);
+    }
+
+    #[test]
     fn tokenless_terms_are_errors_even_in_boolean_conditions() {
         for input in ["、！", "🙂", "合同 、", "合同 OR 🙂", "合同 -🙂"] {
             for loose in [false, true] {
