@@ -71,6 +71,11 @@ fn for_each_token<E>(
     Ok(())
 }
 
+/// 与索引共用分词核心,遇到首个词元即停止,不物化词元列表。
+pub(crate) fn has_tokens(text: &str) -> bool {
+    for_each_token(text, |_, _| Err(())).is_err()
+}
+
 /// 不走 SQLite,直接返回 `rsou 0` 的词元序列(便于单测与调试)。
 ///
 /// 词元区间始终指向原始字符串,而不是归一化后的副本。

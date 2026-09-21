@@ -5,6 +5,8 @@
 //! - 空白分隔;`( ) : , -` 单字符 token;`'`/`"` 引号短语(未闭合/空短语报错);
 //! - 单词在 `\s():,'"-` 处结束;纯数字是 number;AND/OR/NOT 大小写不敏感;
 //! - `title:`/`content:` 字段前缀(未知字段报错);相邻条件隐式 AND;
+//! - 字段分组内禁止再次指定字段(同字段也拒绝);组外可自由组合字段条件;
+//! - 禁止双否定与嵌套排除;字段后的否定请写为 `-title:x`;
 //! - `-x`/`NOT x` 排除;OR 两侧都必须有正向条件;整体必须有正向条件;
 //! - 词/短语里出现 `*` 或 `"` 报错;超过 MAX_QUERY_CHARS 报错。
 //!
@@ -78,6 +80,34 @@ enum Node {
 }
 
 impl Node {
+    fn validate_negation(&self, excluded: bool) -> Result<(), QueryError> {
+        match self {
+            Node::Not(_) if excluded => syntax("不支持双否定或嵌套排除"),
+            Node::Not(child) => child.validate_negation(true),
+            Node::And(left, right) | Node::Or(left, right) => {
+                left.validate_negation(excluded)?;
+                right.validate_negation(excluded)?;
+                if matches!(self, Node::Or(..)) && (!left.has_positive() || !right.has_positive()) {
+                    return syntax("OR 的每个分支都必须包含正向条件");
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 只展开 AND,保留 OR 和被排除的括号作为完整条件。
+    fn conjunction_parts<'a>(&'a self, positive: &mut Vec<&'a Node>, excluded: &mut Vec<&'a Node>) {
+        match self {
+            Node::And(left, right) => {
+                left.conjunction_parts(positive, excluded);
+                right.conjunction_parts(positive, excluded);
+            }
+            Node::Not(child) => excluded.push(child),
+            _ => positive.push(self),
+        }
+    }
+
     fn has_positive(&self) -> bool {
         match self {
             Node::Not(_) => false,
@@ -215,6 +245,7 @@ impl<'a> Parser<'a> {
         if self.peek().is_some() {
             return syntax("存在无法识别的尾部条件");
         }
+        result.validate_negation(false)?;
         if !result.has_positive() {
             return syntax("查询必须包含至少一个正向条件");
         }
@@ -270,6 +301,9 @@ impl<'a> Parser<'a> {
         {
             match value.as_str() {
                 "title" | "content" => {
+                    if field.is_some() {
+                        return syntax("字段条件内不能再次指定字段，请将字段条件移到分组外");
+                    }
                     self.index += 2;
                     let field = if value == "title" {
                         Field::Title
@@ -288,10 +322,10 @@ impl<'a> Parser<'a> {
                 if !matches!(self.take()?, Token::RParen) {
                     return syntax("括号不匹配");
                 }
-                Ok(match field {
-                    None => nested,
+                match field {
+                    None => Ok(nested),
                     Some(field) => Self::apply_field(nested, field),
-                })
+                }
             }
             Some(Token::Word(_)) | Some(Token::Number(_)) => {
                 let text = match self.take()? {
@@ -318,9 +352,12 @@ impl<'a> Parser<'a> {
         )
     }
 
-    /// `field:(...)` 把字段下推到括号内所有叶子。
-    fn apply_field(node: Node, field: Field) -> Node {
-        match node {
+    /// `field:(...)` 把字段下推到所有叶子,拒绝覆盖已有字段。
+    fn apply_field(node: Node, field: Field) -> Result<Node, QueryError> {
+        Ok(match node {
+            Node::Term { field: Some(_), .. } | Node::Phrase { field: Some(_), .. } => {
+                return syntax("字段分组内不能再次指定字段，请将字段条件移到分组外");
+            }
             Node::Term { text, .. } => Node::Term {
                 text,
                 field: Some(field),
@@ -329,16 +366,16 @@ impl<'a> Parser<'a> {
                 text,
                 field: Some(field),
             },
-            Node::Not(child) => Node::Not(Box::new(Self::apply_field(*child, field))),
+            Node::Not(child) => Node::Not(Box::new(Self::apply_field(*child, field)?)),
             Node::And(l, r) => Node::And(
-                Box::new(Self::apply_field(*l, field)),
-                Box::new(Self::apply_field(*r, field)),
+                Box::new(Self::apply_field(*l, field)?),
+                Box::new(Self::apply_field(*r, field)?),
             ),
             Node::Or(l, r) => Node::Or(
-                Box::new(Self::apply_field(*l, field)),
-                Box::new(Self::apply_field(*r, field)),
+                Box::new(Self::apply_field(*l, field)?),
+                Box::new(Self::apply_field(*r, field)?),
             ),
-        }
+        })
     }
 }
 
@@ -368,7 +405,7 @@ pub fn cut_loose(term: &str) -> Vec<String> {
 struct TermCut {
     /// 精确 = 整词一段;宽松 = jieba 切段
     cut: fn(&str) -> Vec<String>,
-    /// 正向展开同义词;[`Self::excluding`] 将排除侧设为 [`identity`]
+    /// 正向展开同义词;排除侧换成 [`identity`],不展开
     expand: fn(&str) -> Vec<String>,
 }
 
@@ -381,6 +418,7 @@ impl TermCut {
     /// 排除侧策略:切词照旧,同义词不展开。
     ///
     /// 正向漏召回只是少几条结果,负向误杀却更难察觉,所以宁可保守。
+    /// 双否定与嵌套排除已在解析阶段拒绝,排除子树整棵沿用此策略。
     fn excluding(self) -> Self {
         Self {
             expand: identity,
@@ -484,35 +522,50 @@ fn compile_node(
     accumulator: &mut Accumulator,
 ) -> Result<String, QueryError> {
     match node {
-        Node::Not(child) => Ok(format!(
-            "NOT {}",
-            compile_node(
-                child,
+        Node::Not(_) => syntax("排除条件必须与正向条件组合"),
+        Node::And(..) => {
+            let mut positive = Vec::new();
+            let mut excluded = Vec::new();
+            node.conjunction_parts(&mut positive, &mut excluded);
+            let mut parts = positive.into_iter();
+            let Some(first) = parts.next() else {
+                return syntax("排除条件必须与正向条件组合");
+            };
+            let mut expression = compile_node(
+                first,
                 inherited,
                 default_field,
-                term_cut.excluding(),
-                false,
-                accumulator
-            )?
-        )),
-        Node::And(left, right) | Node::Or(left, right) => {
-            if matches!(node, Node::Or(..)) && (!left.has_positive() || !right.has_positive()) {
-                return syntax("OR 的每个分支都必须包含正向条件");
-            }
-            // 左侧没有正向条件时,AND 编译为「右 NOT 左」(与 ts 一致)。
-            if matches!(node, Node::And(..)) && !left.has_positive() && right.has_positive() {
-                let right_expr = compile_node(
-                    right,
+                term_cut,
+                positive_ctx,
+                accumulator,
+            )?;
+            for part in parts {
+                let next = compile_node(
+                    part,
                     inherited,
                     default_field,
                     term_cut,
                     positive_ctx,
                     accumulator,
                 )?;
-                let excluded = compile_exclusion(left, inherited, default_field, term_cut)?;
-                return Ok(format!("({right_expr} NOT {excluded})"));
+                expression = format!("({expression} AND {next})");
             }
-            let left_expr = compile_node(
+            // 每个排除条件分别做差集,与输入顺序、AND 括号位置无关。
+            for part in excluded {
+                let next = compile_node(
+                    part,
+                    inherited,
+                    default_field,
+                    term_cut.excluding(),
+                    false,
+                    accumulator,
+                )?;
+                expression = format!("({expression} NOT {next})");
+            }
+            Ok(expression)
+        }
+        Node::Or(left, right) => {
+            let left = compile_node(
                 left,
                 inherited,
                 default_field,
@@ -520,23 +573,7 @@ fn compile_node(
                 positive_ctx,
                 accumulator,
             )?;
-            // `x AND NOT y` → `(x NOT y)`。
-            //
-            // 这条分支不走 `compile_exclusion`,所以要自己把排除侧策略换掉。
-            if let Node::Not(child) = right.as_ref()
-                && matches!(node, Node::And(..))
-            {
-                let right_expr = compile_node(
-                    child,
-                    inherited,
-                    default_field,
-                    term_cut.excluding(),
-                    false,
-                    accumulator,
-                )?;
-                return Ok(format!("({left_expr} NOT {right_expr})"));
-            }
-            let right_expr = compile_node(
+            let right = compile_node(
                 right,
                 inherited,
                 default_field,
@@ -544,12 +581,7 @@ fn compile_node(
                 positive_ctx,
                 accumulator,
             )?;
-            let op = if matches!(node, Node::Or(..)) {
-                "OR"
-            } else {
-                "AND"
-            };
-            Ok(format!("({left_expr} {op} {right_expr})"))
+            Ok(format!("({left} OR {right})"))
         }
         Node::Phrase { text, field } => {
             let field = field.or(inherited).or(default_field);
@@ -568,10 +600,17 @@ fn compile_node(
         }
         Node::Term { text, field } => {
             let field = field.or(inherited).or(default_field);
+            // 切词过滤之前检查语法,避免星号被当作无效标点丢弃。
+            if text.contains(['*', '"']) {
+                return syntax("词语包含不支持的查询字符");
+            }
+            if !crate::tokenize::has_tokens(text) {
+                return syntax("普通词不包含可检索的文字或数字");
+            }
             let mut pieces = (term_cut.cut)(text);
             pieces.retain(|part| !part.is_empty());
             if pieces.is_empty() {
-                return syntax("普通词无法分词");
+                return syntax("普通词不包含可检索的文字或数字");
             }
             // 段内是「同义词 OR」,段间是 AND:多段时整体仍要套一层括号。
             let mut parts = Vec::with_capacity(pieces.len());
@@ -594,46 +633,6 @@ fn compile_node(
                 field.map(Field::prefix).unwrap_or(""),
                 body
             ))
-        }
-    }
-}
-
-/// 排除侧(AND NOT 的右侧)编译:内部不再区分正负,按原样结构展开。
-///
-/// 同义词在排除侧**不展开**(换成 [`TermCut::excluding`]),宽松模式的 jieba
-/// 切词保持原样。
-fn compile_exclusion(
-    node: &Node,
-    inherited: Option<Field>,
-    default_field: Option<Field>,
-    term_cut: TermCut,
-) -> Result<String, QueryError> {
-    let term_cut = term_cut.excluding();
-    match node {
-        Node::Not(child) => compile_exclusion(child, inherited, default_field, term_cut),
-        Node::And(left, right) | Node::Or(left, right) => {
-            let op = if matches!(node, Node::Or(..)) {
-                "OR"
-            } else {
-                "AND"
-            };
-            Ok(format!(
-                "({} {op} {})",
-                compile_exclusion(left, inherited, default_field, term_cut)?,
-                compile_exclusion(right, inherited, default_field, term_cut)?
-            ))
-        }
-        leaf => {
-            // 排除侧不收集字面量,这里的累积器只是 `compile_node` 需要的载体。
-            let mut accumulator = Accumulator::default();
-            compile_node(
-                leaf,
-                inherited,
-                default_field,
-                term_cut,
-                false,
-                &mut accumulator,
-            )
         }
     }
 }
@@ -714,6 +713,90 @@ mod tests {
     }
 
     #[test]
+    fn nested_fields_are_rejected() {
+        for input in [
+            "title:(content:合同)",
+            "content:(title:合同)",
+            "title:(title:合同)",
+            "content:(content:\"合同\")",
+            "title:(合同 OR (发票 content:草稿))",
+            "title:(合同 -content:草稿)",
+            "title:(content:(合同 OR 发票))",
+            "title:content:合同",
+        ] {
+            for scope in [Scope::All, Scope::Title, Scope::Content] {
+                for loose in [false, true] {
+                    let error = compile(input, scope, loose).unwrap_err();
+                    assert!(error.0.contains("不能再次指定字段"), "{input}: {error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nested_negations_are_rejected() {
+        for input in [
+            "合同 - -文档",
+            "合同 NOT NOT 文档",
+            "--电脑",
+            "合同 -(文档 -草稿)",
+            "合同 NOT (文档 NOT 草稿)",
+            "合同 -((文档 OR (-草稿)))",
+            "合同 -(-文档 -草稿)",
+        ] {
+            let error = compile(input, Scope::All, false).unwrap_err();
+            assert!(
+                error.0.contains("不支持双否定或嵌套排除"),
+                "{input}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn exclusions_match_boolean_results_in_fts() {
+        let conn = crate::store::open_in_memory().unwrap();
+        for (index, text) in [
+            "合同",
+            "合同 文档",
+            "合同 草稿",
+            "合同 文档 草稿",
+            "无关",
+            "文档",
+            "草稿",
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO documents_fts(rowid, title, content) VALUES (?1, '', ?2)",
+                rusqlite::params![index as i64 + 1, text],
+            )
+            .unwrap();
+        }
+        for (input, expected) in [
+            ("-文档 -草稿 合同", vec![1]),
+            ("合同 -文档 -草稿", vec![1]),
+            ("NOT 文档 NOT 草稿 合同", vec![1]),
+            ("合同 (-文档 -草稿)", vec![1]),
+            ("-文档 (合同 -草稿)", vec![1]),
+            ("content:(-文档 -草稿 合同)", vec![1]),
+            ("合同 -content:文档 -content:草稿", vec![1]),
+            ("合同 -title:文档", vec![1, 2, 3, 4]),
+            ("(-文档 合同) -草稿", vec![1]),
+            ("合同 -(文档 OR 草稿)", vec![1]),
+            ("合同 -(文档 草稿)", vec![1, 2, 3]),
+            ("(合同 -文档) OR (合同 -草稿)", vec![1, 2, 3]),
+        ] {
+            for loose in [false, true] {
+                let query = compile_with(input, Scope::Content, loose, identity).unwrap();
+                let actual: Vec<i64> = conn.prepare("SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY rowid").unwrap()
+                    .query_map([&query.match_expr], |row| row.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+                assert_eq!(actual, expected, "{input}: {}", query.match_expr);
+            }
+        }
+    }
+
+    #[test]
     fn literals_follow_positive_order_and_dedup() {
         let query = compile("文档 管理 文档 -草稿", Scope::All, false).unwrap();
         assert_eq!(query.literals, ["文档", "管理"]);
@@ -725,6 +808,8 @@ mod tests {
             ("\"未闭合", "引号没有闭合"),
             ("文档*", "词语包含不支持的查询字符"),
             ("foo:x", "未知字段"),
+            ("title:-合同", "缺少词语、短语或括号条件"),
+            ("title:-(合同 OR 发票)", "缺少词语、短语或括号条件"),
             ("", "查询不能为空"),
             ("-草稿", "查询必须包含至少一个正向条件"),
             ("a OR -b", "OR 的每个分支都必须包含正向条件"),
@@ -755,6 +840,77 @@ mod tests {
         // 精确模式不切段。
         let exact = compile("文档管理系统", Scope::All, false).unwrap();
         assert_eq!(exact.match_expr, "\"文档管理系统\"");
+    }
+
+    #[cfg(feature = "jieba")]
+    #[test]
+    fn loose_punctuation_uses_real_fts_tokens() {
+        let conn = crate::store::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents_fts(rowid, title, content) VALUES
+            (1, '', '文档'), (2, '', '文、档'), (3, '', '文 档'),
+            (4, '', '文其他档'), (5, '', '无关')",
+        )
+        .unwrap();
+        for input in ["文、档", "文🙂档", "文！档"] {
+            let query = compile_with(input, Scope::All, true, identity).unwrap();
+            let actual: Vec<i64> = conn
+                .prepare(
+                    "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([&query.match_expr], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(actual, [1, 2, 3, 4], "{input}: {}", query.match_expr);
+            assert_eq!(query.literals, ["文", "档"]);
+        }
+        for (input, loose) in [("文、档", false), ("\"文、档\"", true)] {
+            let query = compile_with(input, Scope::All, loose, identity).unwrap();
+            assert_eq!(query.match_expr, "\"文、档\"");
+            assert_eq!(query.literals, ["文、档"]);
+            let actual: Vec<i64> = conn
+                .prepare(
+                    "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([&query.match_expr], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(actual, [1, 2, 3]);
+        }
+    }
+
+    #[test]
+    fn tokenless_terms_are_errors_even_in_boolean_conditions() {
+        for input in ["、！", "🙂", "合同 、", "合同 OR 🙂", "合同 -🙂"] {
+            for loose in [false, true] {
+                let error = compile(input, Scope::All, loose).unwrap_err();
+                assert!(
+                    error.0.contains("普通词不包含可检索的文字或数字"),
+                    "{input}: {error}"
+                );
+            }
+        }
+        // 标点过滤不能让原本不支持的通配符悄悄变成合法输入。
+        for input in ["文*档", "合同*"] {
+            assert!(compile(input, Scope::All, true).is_err());
+        }
+        let phrase = compile("\"、！\"", Scope::All, true).unwrap();
+        assert_eq!(phrase.match_expr, "\"、！\"");
+    }
+
+    #[cfg(not(feature = "jieba"))]
+    #[test]
+    fn loose_without_jieba_keeps_exact_semantics() {
+        for input in ["文、档", "文🙂档", "A4", "\"文、档\""] {
+            let loose = compile(input, Scope::All, true).unwrap();
+            let exact = compile(input, Scope::All, false).unwrap();
+            assert_eq!(loose.match_expr, exact.match_expr);
+            assert_eq!(loose.literals, exact.literals);
+        }
     }
 
     // ---------- 同义词展开 ----------
@@ -820,6 +976,35 @@ mod tests {
         // 排除侧只排字面「电脑」,不排「计算机」/「PC」。
         assert_eq!(query.match_expr, "((\"文档\" OR \"文件\") NOT \"电脑\")");
         assert_eq!(query.literals, ["文档", "文件"]);
+    }
+
+    #[test]
+    fn consecutive_exclusions_keep_synonyms_and_literals_separate() {
+        let conn = crate::store::open_in_memory().unwrap();
+        conn.execute_batch(
+            "INSERT INTO documents_fts(rowid, title, content) VALUES
+            (1, '', '文件 计算机'), (2, '', '文档 PC'),
+            (3, '', '文档 电脑'), (4, '', '文件 草稿'), (5, '', '无关')",
+        )
+        .unwrap();
+        for input in [
+            "-电脑 -草稿 文档",
+            "文档 (-电脑 -草稿)",
+            "文档 -(电脑 OR 草稿)",
+        ] {
+            let query = compile_with(input, Scope::All, false, test_expand).unwrap();
+            assert_eq!(query.literals, ["文档", "文件"]);
+            let actual: Vec<i64> = conn
+                .prepare(
+                    "SELECT rowid FROM documents_fts WHERE documents_fts MATCH ?1 ORDER BY rowid",
+                )
+                .unwrap()
+                .query_map([&query.match_expr], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(actual, [1, 2], "{input}: {}", query.match_expr);
+        }
     }
 
     #[test]

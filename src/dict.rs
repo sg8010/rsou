@@ -212,15 +212,15 @@ fn jieba_lock() -> &'static RwLock<jieba_rs::Jieba> {
     JIEBA.get_or_init(|| RwLock::new(jieba_rs::Jieba::new()))
 }
 
-/// 用当前词典做 jieba 切词(检索的「宽松」模式)。
+/// 用当前词典做 jieba 切词,只保留索引 tokenizer 能产生词元的片段。
 #[cfg(feature = "jieba")]
 pub fn cut_loose(term: &str) -> Vec<String> {
     let jieba = jieba_lock().read().unwrap_or_else(PoisonError::into_inner);
     jieba
         .cut(term, false)
         .into_iter()
+        .filter(|token| crate::tokenize::has_tokens(token.word))
         .map(|token| token.word.to_owned())
-        .filter(|part| !part.trim().is_empty())
         .collect()
 }
 

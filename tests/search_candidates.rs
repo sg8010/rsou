@@ -1,5 +1,6 @@
 use rsou_lib::chunk::Chunk;
 use rsou_lib::parse::FileType;
+use rsou_lib::query::Scope;
 use rsou_lib::repo::{self, FileMeta, ParsedDocument};
 use rsou_lib::search::{self, Filters, SearchRequest};
 use rsou_lib::text::PlainText;
@@ -47,6 +48,57 @@ fn request() -> SearchRequest {
     SearchRequest {
         query: "文档".into(),
         ..SearchRequest::default()
+    }
+}
+
+#[test]
+fn field_groups_and_mixed_fields_preserve_search_scope() {
+    let mut conn = rsou_lib::store::open_in_memory().unwrap();
+    let contract = save(&mut conn, "/contract.txt", "合同", &["发票正文"]);
+    let invoice = save(&mut conn, "/invoice.txt", "发票", &["合同正文"]);
+    let draft = save(&mut conn, "/draft.txt", "合同草稿", &["其他正文"]);
+    for (query, expected) in [
+        ("title:合同", vec![contract, draft]),
+        ("content:合同", vec![invoice]),
+        ("title:(合同 OR 发票)", vec![contract, invoice, draft]),
+        ("title:((合同 OR 发票) -草稿)", vec![contract, invoice]),
+        ("title:合同 content:发票", vec![contract]),
+        ("(title:发票 OR content:发票)", vec![contract, invoice]),
+        (
+            "title:(合同) OR content:(合同)",
+            vec![contract, invoice, draft],
+        ),
+        ("content:\"合同正文\"", vec![invoice]),
+    ] {
+        for scope in [Scope::All, Scope::Title, Scope::Content] {
+            let response = search::search(
+                &conn,
+                &SearchRequest {
+                    query: query.into(),
+                    scope,
+                    ..SearchRequest::default()
+                },
+            )
+            .unwrap();
+            let mut actual: Vec<_> = response
+                .documents
+                .iter()
+                .map(|doc| doc.document.id)
+                .collect();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "{query}, scope={scope:?}");
+        }
+    }
+    for query in ["title:(content:合同)", "title:(title:合同)"] {
+        let error = search::search(
+            &conn,
+            &SearchRequest {
+                query: query.into(),
+                ..SearchRequest::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("不能再次指定字段"));
     }
 }
 
