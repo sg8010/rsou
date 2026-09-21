@@ -156,19 +156,59 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
         if needle.is_empty() {
             continue;
         }
+        let direct_start = spans.len();
         for (start, part) in hay.match_indices(&needle) {
             spans.push(Span {
                 start,
                 end: start + part.len(),
             });
         }
-        // 逐字索引把空白也当分隔符,所以字面量可能跨空白:`document 管理`
-        // 对 `document\n管理` 也应命中。补全去空白后的非重叠匹配,
-        // 与直接匹配相同的区间无需再次保存。
-        spans.extend(
-            find_ignoring_whitespace(text, literal)
-                .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
-        );
+        // 无空白字面量可复用直接命中。含空白的字面量仍需按去空白语义扫描。
+        let mut extra = Vec::new();
+        if literal.chars().any(char::is_whitespace) {
+            extra.extend(
+                find_ignoring_whitespace(text, literal)
+                    .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
+            );
+        } else {
+            let chars: Vec<_> = literal.chars().collect();
+            let mut offset = 0;
+            for direct in &spans[direct_start..] {
+                // 更早的跨空白匹配可能越过直接命中的起点。不能强行跳到其末尾,
+                // 否则会改变非重叠扫描的下一个起点。
+                while offset < direct.start {
+                    let Some(found) = scan_ignoring_whitespace_before(
+                        &text[offset..],
+                        &chars,
+                        direct.start - offset,
+                    ) else {
+                        offset = direct.start;
+                        break;
+                    };
+                    let found = Span {
+                        start: offset + found.start,
+                        end: offset + found.end,
+                    };
+                    offset = found.end;
+                    if !text[found.start..found.end].eq_ignore_ascii_case(literal) {
+                        extra.push(found);
+                    }
+                }
+                if offset == direct.start {
+                    offset = direct.end;
+                }
+            }
+            for found in find_ignoring_whitespace(&text[offset..], literal) {
+                let found = Span {
+                    start: offset + found.start,
+                    end: offset + found.end,
+                };
+                if !text[found.start..found.end].eq_ignore_ascii_case(literal) {
+                    extra.push(found);
+                }
+            }
+        }
+        spans.extend(extra);
     }
     spans.sort_by_key(|span| (span.start, span.end));
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
@@ -200,9 +240,17 @@ fn find_ignoring_whitespace<'a>(text: &'a str, literal: &str) -> impl Iterator<I
 }
 
 fn scan_ignoring_whitespace(text: &str, needle: &[char]) -> Option<Span> {
+    scan_ignoring_whitespace_before(text, needle, text.len())
+}
+
+// 只限制候选起点,比对仍可跨越边界,避免遗漏跨越直接命中的空白匹配。
+fn scan_ignoring_whitespace_before(text: &str, needle: &[char], before: usize) -> Option<Span> {
     let &first = needle.first()?;
     let mut starts = text.char_indices();
     while let Some((start, ch)) = starts.next() {
+        if start >= before {
+            break;
+        }
         // 从非空白首字符尝试,避免重复尝试同一段前导空白。
         if ch.is_whitespace() || !ch.eq_ignore_ascii_case(&first) {
             continue;
@@ -763,6 +811,75 @@ mod tests {
     }
 
     #[test]
+    fn reused_direct_matches_preserve_all_locations() {
+        fn reference(text: &str, literals: &[String]) -> Vec<Span> {
+            let hay = text.to_ascii_lowercase();
+            let mut spans = Vec::new();
+            for literal in literals {
+                if literal.is_empty() {
+                    continue;
+                }
+                for (start, part) in hay.match_indices(&literal.to_ascii_lowercase()) {
+                    spans.push(Span {
+                        start,
+                        end: start + part.len(),
+                    });
+                }
+                spans.extend(
+                    naive_all_whitespace_matches(text, literal)
+                        .into_iter()
+                        .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
+                );
+            }
+            spans.sort_by_key(|span| (span.start, span.end));
+            let mut merged: Vec<Span> = Vec::new();
+            for span in spans {
+                if let Some(last) = merged.last_mut()
+                    && span.start <= last.end
+                {
+                    last.end = last.end.max(span.end);
+                } else {
+                    merged.push(span);
+                }
+            }
+            merged
+        }
+        for (text, literal) in [
+            ("a aaaa", "aaa"),
+            ("哈哈 哈哈哈哈", "哈哈哈"),
+            ("文 档文档 文 档", "文档"),
+        ] {
+            let literals = vec![literal.into()];
+            assert_eq!(locate_literals(text, &literals), reference(text, &literals));
+        }
+        let alphabet = [
+            'a', 'A', 'b', '文', '档', '哈', ' ', '\n', '\u{a0}', '\u{3000}', '🙂',
+        ];
+        let mut seed = 131_u64;
+        let mut next = |max: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 32) as usize) % max
+        };
+        for _ in 0..20_000 {
+            let text: String = (0..next(120))
+                .map(|_| alphabet[next(alphabet.len())])
+                .collect();
+            let literals: Vec<String> = (0..3)
+                .map(|_| {
+                    (0..next(6))
+                        .map(|_| alphabet[next(alphabet.len())])
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                locate_literals(&text, &literals),
+                reference(&text, &literals),
+                "{text:?} {literals:?}"
+            );
+        }
+    }
+
+    #[test]
     fn streaming_whitespace_matches_legacy() {
         for (text, literal) in [
             ("", "文档"),
@@ -814,6 +931,94 @@ mod tests {
             locate_literals(" 文 档 文档", &["文档".into()]),
             vec![Span { start: 1, end: 8 }, Span { start: 9, end: 15 }]
         );
+    }
+
+    // B3 修复后的全量定位基线,用于测量区间复用收益。
+    fn locate_before_direct_reuse(text: &str, literals: &[String]) -> Vec<Span> {
+        let hay = text.to_ascii_lowercase();
+        let mut spans: Vec<Span> = Vec::new();
+        for literal in literals {
+            let needle = literal.to_ascii_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            for (start, part) in hay.match_indices(&needle) {
+                spans.push(Span {
+                    start,
+                    end: start + part.len(),
+                });
+            }
+            // 逐字索引把空白也当分隔符,所以字面量可能跨空白:`document 管理`
+            // 对 `document\n管理` 也应命中。补全去空白后的非重叠匹配,
+            // 与直接匹配相同的区间无需再次保存。
+            spans.extend(
+                find_ignoring_whitespace(text, literal)
+                    .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
+            );
+        }
+        spans.sort_by_key(|span| (span.start, span.end));
+        let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+        for span in spans {
+            match merged.last_mut() {
+                Some(last) if span.start <= last.end => {
+                    last.end = last.end.max(span.end);
+                }
+                _ => merged.push(span),
+            }
+        }
+        merged
+    }
+
+    #[test]
+    #[ignore = "手动全量定位性能对照：cargo test -p rsou --release --lib full_location_reuse_benchmark -- --ignored --nocapture"]
+    fn full_location_reuse_benchmark() {
+        let body = "普通单元格123\t".repeat(400_000);
+        let cases = [
+            ("开头命中", format!("文 档{body}")),
+            ("末尾命中", format!("{body}文 档")),
+            ("未命中", body),
+            ("密集直接", "文档内容123\t".repeat(400_000)),
+            ("密集空白", "文 档内容123\t".repeat(400_000)),
+            ("交错匹配", "文档;文 档;".repeat(200_000)),
+        ];
+        let literals = vec!["文档".to_owned()];
+        for (name, text) in cases {
+            let expected = locate_before_direct_reuse(&text, &literals);
+            let mut samples = [Vec::new(), Vec::new()];
+            for round in 0..9 {
+                for index in [round % 2, 1 - round % 2] {
+                    let implementation = if index == 0 {
+                        locate_before_direct_reuse
+                    } else {
+                        locate_literals
+                    };
+                    let started = Instant::now();
+                    let actual = std::hint::black_box(implementation(
+                        std::hint::black_box(&text),
+                        &literals,
+                    ));
+                    let ms = started.elapsed().as_secs_f64() * 1000.;
+                    assert_eq!(actual, expected, "{name}");
+                    if round > 0 {
+                        samples[index].push(ms);
+                    }
+                }
+            }
+            for (index, values) in samples.iter_mut().enumerate() {
+                values.sort_by(f64::total_cmp);
+                eprintln!(
+                    "{name} {} 字节 {} 中位数 {:.3} ms，{} 个区间",
+                    text.len(),
+                    if index == 0 {
+                        "区间复用前"
+                    } else {
+                        "区间复用后"
+                    },
+                    values[values.len() / 2],
+                    expected.len()
+                );
+            }
+        }
     }
 
     #[test]
