@@ -207,7 +207,7 @@ mod tests {
 
         // 逐字索引下标点不产生词元,「文、档」会被短语 "文档" 误配;搜索决策
         // 单一化后这属于 tokenizer 的正式行为,检索层不再据此剔除结果,只是
-        // 展示层定位不到高亮(见 docs/search-single-decision.md §26.4)。
+        // 展示层定位不到高亮(见 docs/search-single-decision.md「FTS 与 Locator 的语义差异」)。
         let punctuated_count: i64 = connection
             .query_row(
                 "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH ?1",
