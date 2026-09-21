@@ -173,7 +173,20 @@ pub(crate) struct SearchMsg {
 pub(crate) struct PreviewMsg {
     pub generation: u64,
     pub document_id: i64,
-    pub text: Option<String>,
+    pub event: PreviewEvent,
+}
+
+pub(crate) enum PreviewEvent {
+    Text(Arc<String>),
+    Locations(rsou_lib::search::PreviewLocations),
+    Error(String),
+}
+
+pub(crate) struct PreviewRequest {
+    generation: u64,
+    document_id: i64,
+    literals: Vec<String>,
+    cancel: Arc<AtomicBool>,
 }
 
 /// 一次文档列表读取的全部结果。
@@ -347,13 +360,18 @@ pub struct RsouApp {
     /// 当前预览的命中批次(对应检索结果中保存的命中片段)
     preview_hit_index: usize,
     /// 预览文本(plain_text;大文档渲染时按命中窗口截断)
-    preview_text: Option<String>,
+    preview_text: Option<Arc<String>>,
     /// 预览文本通道
     preview_rx: Option<(u64, Receiver<PreviewMsg>)>,
     /// 预览世代号
     preview_gen: u64,
     /// 预览正在加载中
     preview_loading: bool,
+    preview_locating: bool,
+    preview_locations: Option<Arc<rsou_lib::search::PreviewLocations>>,
+    preview_cancel: Option<Arc<AtomicBool>>,
+    preview_worker: Option<JoinHandle<()>>,
+    preview_pending: Option<PreviewRequest>,
     /// 点片段后待滚动的 plain_text 字节偏移(渲染一次后清除)
     pending_scroll: Option<usize>,
     /// 预览窗口的稳定中心(plain_text 字节偏移;只在 focus_preview 时更新)
@@ -461,6 +479,11 @@ impl RsouApp {
             preview_rx: None,
             preview_gen: 0,
             preview_loading: false,
+            preview_locating: false,
+            preview_locations: None,
+            preview_cancel: None,
+            preview_worker: None,
+            preview_pending: None,
             pending_scroll: None,
             preview_anchor: 0,
             preview_spans_cache: None,
@@ -501,7 +524,11 @@ impl RsouApp {
 
     /// 是否有任何在途后台任务(决定是否主动请求重绘)。
     fn has_inflight(&self) -> bool {
-        self.import_active || self.search_active || self.maintenance_active
+        self.import_active
+            || self.search_active
+            || self.maintenance_active
+            || self.preview_worker.is_some()
+            || self.preview_pending.is_some()
     }
 }
 
@@ -510,6 +537,13 @@ impl Drop for RsouApp {
         // 有在途导入时先置取消再 join:关窗不等 worker 跑完长任务
         if let Some(cancel) = &self.import_cancel {
             cancel.store(true, Ordering::Relaxed);
+        }
+        if let Some(cancel) = &self.preview_cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.preview_pending = None;
+        if let Some(worker) = self.preview_worker.take() {
+            let _ = worker.join();
         }
         for worker in self.workers.drain(..) {
             let _ = worker.join();

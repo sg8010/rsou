@@ -394,7 +394,8 @@ impl RsouApp {
                 .find(|d| d.document.id == id)
                 .map(|d| d.document.clone())
         });
-        let hit_offsets = self
+        let complete_locations = self.preview_locations.clone();
+        let initial_offsets = self
             .preview_doc_id
             .and_then(|id| {
                 self.search_result
@@ -405,6 +406,10 @@ impl RsouApp {
             })
             .map(preview_hit_offsets)
             .unwrap_or_default();
+        let hit_offsets = complete_locations
+            .as_ref()
+            .map(|locations| locations.fragment_offsets.as_slice())
+            .unwrap_or(&initial_offsets);
         let current_hit_index = self
             .preview_hit_index
             .min(hit_offsets.len().saturating_sub(1));
@@ -574,11 +579,27 @@ impl RsouApp {
                                 },
                             );
                         });
+                        if self.preview_locating {
+                            ui.label(
+                                egui::RichText::new("正在定位其他匹配…")
+                                    .size(12.0)
+                                    .color(Self::text_muted()),
+                            );
+                        } else if let Some(locations) = &complete_locations {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "共 {} 个命中片段",
+                                    locations.fragment_offsets.len()
+                                ))
+                                .size(12.0)
+                                .color(Self::text_muted()),
+                            );
+                        }
                         if hit_offsets.len() > 1 {
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "命中批次 {} / {}",
+                                        "片段导航 {} / {}",
                                         current_hit_index + 1,
                                         hit_offsets.len()
                                     ))
@@ -661,7 +682,20 @@ impl RsouApp {
                             base,
                             window_len: window.len(),
                             literals: literals.to_vec(),
-                            spans: search::locate_literals(window, literals),
+                            spans: if let Some(locations) = &complete_locations {
+                                let first =
+                                    locations.spans.partition_point(|span| span.end <= base);
+                                locations.spans[first..]
+                                    .iter()
+                                    .take_while(|span| span.start < base + window.len())
+                                    .map(|span| Span {
+                                        start: span.start.saturating_sub(base),
+                                        end: span.end.min(base + window.len()) - base,
+                                    })
+                                    .collect()
+                            } else {
+                                search::locate_literals_fast(window, literals)
+                            },
                         });
                     }
                     let spans: &[Span] = self
@@ -809,16 +843,8 @@ fn ui_doc_card(
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // 展示层定位可能为空(FTS tokenizer 与 Locator 规则不同),
                             // 此时不显示命中处数,但文档仍然保留在结果列表里。
-                            let label = if doc_hit.total_hits > 0 {
-                                Some(if doc_hit.hits.len() < doc_hit.total_hits {
-                                    format!(
-                                        "共 {} 个命中片段，展示前 {} 个",
-                                        doc_hit.total_hits,
-                                        doc_hit.hits.len()
-                                    )
-                                } else {
-                                    format!("{} 个命中片段", doc_hit.total_hits)
-                                })
+                            let label = if !doc_hit.hits.is_empty() {
+                                Some(format!("展示 {} 个相关片段", doc_hit.hits.len()))
                             } else if !doc_hit.title_highlights.is_empty() {
                                 Some("标题命中".to_owned())
                             } else {

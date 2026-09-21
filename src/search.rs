@@ -13,6 +13,7 @@
 //! - 展示分块由命中偏移 + `chunks` 边界切出,分块只影响「怎么展示」,
 //!   不影响「能不能搜到」。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -105,7 +106,7 @@ pub struct DocumentHit {
     /// 展示片段,按在文档中的位置升序。为空只表示展示层没定位到,
     /// 该文档仍属于 FTS 命中结果。
     pub hits: Vec<Hit>,
-    /// 截断前的有效命中片段总数,不是关键词出现次数;可能大于 `hits.len()`。
+    /// 截断前已定位的片段数;快速列表中只是下界。不是关键词出现次数。
     pub total_hits: usize,
     /// bm25 分数(越小越相关)
     pub best_rank: f64,
@@ -114,9 +115,11 @@ pub struct DocumentHit {
 /// 检索结果。
 #[derive(Debug)]
 pub struct SearchResponse {
+    /// false 表示快速列表定位,片段计数只是已定位数量,不是全文总数。
+    pub locations_complete: bool,
     /// 已展示组的全部匹配位置,按组及位置相关度排序。
     pub documents: Vec<DocumentHit>,
-    /// 已展示组代表文档的截断前片段总数,不累加副本或未展示组。
+    /// 已展示组代表文档的截断前已定位片段数;仅 locations_complete 时为完整定位总数。
     pub total_hits: usize,
     /// 满足 FTS MATCH + 结构化过滤条件的文件位置数。
     pub total_documents: usize,
@@ -145,42 +148,87 @@ impl SearchResponse {
 /// 在原文中定位所有正向查询项(ASCII 大小写不敏感子串),合并重叠区间,
 /// 供 UI 高亮与命中导航使用。
 ///
-/// 本函数是唯一的展示定位入口,但**不参与搜索真假判定**:即使返回空结果,
+/// 完整定位与快速列表定位均**不参与搜索真假判定**:即使返回空结果,
 /// 也不得移除 FTS5 已命中的文档。标点不剔除,所以 `文档` 不会命中 `文、档`;
 /// 空白/换行不参与比对,所以 `文档` 会命中 `文 档` 与 `文\n档`。
 pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
+    locate_with(text, literals, false, None).expect("未启用取消")
+}
+
+/// 结果列表定位:直接匹配全部保留,跨空白仅补首处;不承诺完整位置或总数。
+pub fn locate_literals_fast(text: &str, literals: &[String]) -> Vec<Span> {
+    locate_with(text, literals, true, None).expect("未启用取消")
+}
+
+fn cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn locate_with(
+    text: &str,
+    literals: &[String],
+    quick: bool,
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<Span>> {
+    if cancelled(cancel) {
+        return None;
+    }
     let hay = text.to_ascii_lowercase();
     let mut spans: Vec<Span> = Vec::new();
     for literal in literals {
+        if cancelled(cancel) {
+            return None;
+        }
         let needle = literal.to_ascii_lowercase();
         if needle.is_empty() {
             continue;
         }
         let direct_start = spans.len();
         for (start, part) in hay.match_indices(&needle) {
+            if cancelled(cancel) {
+                return None;
+            }
             spans.push(Span {
                 start,
                 end: start + part.len(),
             });
         }
+        if quick {
+            if let Some(found) = scan_ignoring_whitespace_before_cancel(
+                text,
+                &literal
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<Vec<_>>(),
+                text.len(),
+                cancel,
+            ) {
+                spans.push(found);
+            }
+            continue;
+        }
         // 无空白字面量可复用直接命中。含空白的字面量仍需按去空白语义扫描。
         let mut extra = Vec::new();
         if literal.chars().any(char::is_whitespace) {
             extra.extend(
-                find_ignoring_whitespace(text, literal)
+                find_ignoring_whitespace_cancel(text, literal, cancel)
                     .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
             );
         } else {
             let chars: Vec<_> = literal.chars().collect();
             let mut offset = 0;
             for direct in &spans[direct_start..] {
+                if cancelled(cancel) {
+                    return None;
+                }
                 // 更早的跨空白匹配可能越过直接命中的起点。不能强行跳到其末尾,
                 // 否则会改变非重叠扫描的下一个起点。
                 while offset < direct.start {
-                    let Some(found) = scan_ignoring_whitespace_before(
+                    let Some(found) = scan_ignoring_whitespace_before_cancel(
                         &text[offset..],
                         &chars,
                         direct.start - offset,
+                        cancel,
                     ) else {
                         offset = direct.start;
                         break;
@@ -198,7 +246,7 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
                     offset = direct.end;
                 }
             }
-            for found in find_ignoring_whitespace(&text[offset..], literal) {
+            for found in find_ignoring_whitespace_cancel(&text[offset..], literal, cancel) {
                 let found = Span {
                     start: offset + found.start,
                     end: offset + found.end,
@@ -210,9 +258,15 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
         }
         spans.extend(extra);
     }
+    if cancelled(cancel) {
+        return None;
+    }
     spans.sort_by_key(|span| (span.start, span.end));
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
     for span in spans {
+        if cancelled(cancel) {
+            return None;
+        }
         match merged.last_mut() {
             Some(last) if span.start <= last.end => {
                 last.end = last.end.max(span.end);
@@ -220,16 +274,30 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
             _ => merged.push(span),
         }
     }
-    merged
+    Some(merged)
 }
 
 /// 在 `text` 里找 `literal`,允字面量的字符之间隔着空白(与 FTS 逐字索引一致)。
 /// 返回所有非重叠匹配的原文字节区间;每次从上次命中末尾继续扫描。
+#[cfg(test)]
 fn find_ignoring_whitespace<'a>(text: &'a str, literal: &str) -> impl Iterator<Item = Span> + 'a {
+    find_ignoring_whitespace_cancel(text, literal, None)
+}
+
+fn find_ignoring_whitespace_cancel<'a>(
+    text: &'a str,
+    literal: &str,
+    cancel: Option<&'a AtomicBool>,
+) -> impl Iterator<Item = Span> + 'a {
     let needle: Vec<char> = literal.chars().filter(|c| !c.is_whitespace()).collect();
     let mut offset = 0;
     std::iter::from_fn(move || {
-        let span = scan_ignoring_whitespace(&text[offset..], &needle)?;
+        let span = scan_ignoring_whitespace_before_cancel(
+            &text[offset..],
+            &needle,
+            text.len() - offset,
+            cancel,
+        )?;
         let span = Span {
             start: offset + span.start,
             end: offset + span.end,
@@ -239,15 +307,29 @@ fn find_ignoring_whitespace<'a>(text: &'a str, literal: &str) -> impl Iterator<I
     })
 }
 
+#[cfg(test)]
 fn scan_ignoring_whitespace(text: &str, needle: &[char]) -> Option<Span> {
-    scan_ignoring_whitespace_before(text, needle, text.len())
+    scan_ignoring_whitespace_before_cancel(text, needle, text.len(), None)
 }
 
 // 只限制候选起点,比对仍可跨越边界,避免遗漏跨越直接命中的空白匹配。
-fn scan_ignoring_whitespace_before(text: &str, needle: &[char], before: usize) -> Option<Span> {
+fn scan_ignoring_whitespace_before_cancel(
+    text: &str,
+    needle: &[char],
+    before: usize,
+    cancel: Option<&AtomicBool>,
+) -> Option<Span> {
+    if cancelled(cancel) {
+        return None;
+    }
     let &first = needle.first()?;
     let mut starts = text.char_indices();
+    let mut checks = 0usize;
     while let Some((start, ch)) = starts.next() {
+        checks += 1;
+        if checks & 4095 == 0 && cancelled(cancel) {
+            return None;
+        }
         if start >= before {
             break;
         }
@@ -260,6 +342,10 @@ fn scan_ignoring_whitespace_before(text: &str, needle: &[char], before: usize) -
         // 克隆迭代器仅复制游标状态,不复制正文;失败后仍从下一个字符尝试。
         let mut cursor = starts.clone();
         while matched < needle.len() {
+            checks += 1;
+            if checks & 4095 == 0 && cancelled(cancel) {
+                return None;
+            }
             let Some((byte, ch)) = cursor.next() else {
                 break;
             };
@@ -351,37 +437,7 @@ fn group_into_fragments(
     let header_count = distinct_header_count(bounds);
     let header_count = if header_count <= 1 { 0 } else { header_count };
 
-    // 命中起点、终点分别单调递增,各用一个只向前移动的游标。
-    // 落在块间空隙时仍回退到最后一块,但不能因此推进实际游标。
-    let block_of = |byte: usize, cursor: &mut usize| -> usize {
-        while *cursor < bounds.len() && bounds[*cursor].1 <= byte {
-            *cursor += 1;
-        }
-        if *cursor < bounds.len() && bounds[*cursor].0 <= byte {
-            *cursor
-        } else {
-            bounds.len() - 1
-        }
-    };
-    let mut start_block = 0;
-    let mut end_block = 0;
-
-    // 把命中归组:同一个块内的命中合为一个片段;**相邻但不共享块的命中各自
-    // 成段**(它们本来就是不同的「命中处」)。跨块短语(一个 span 横跨两个块)
-    // 把两个块并进同一段,因为它是一处命中,不该被切断。
-    //
-    // spans 已按 start 升序,所以只需与最后一组比较。
-    let mut groups: Vec<(usize, usize)> = Vec::new();
-    for span in spans {
-        let first = block_of(span.start, &mut start_block);
-        // 末字节所在的块(span.end 是开区间,减 1 才落在片段内)。
-        let last = block_of(span.end.saturating_sub(1), &mut end_block).max(first);
-        match groups.last_mut() {
-            // first 落在上一段内 ⇔ 两处命中共享同一块 → 并段。
-            Some(group) if first <= group.1 => group.1 = group.1.max(last),
-            _ => groups.push((first, last)),
-        }
-    }
+    let groups = group_spans(spans, bounds, None).expect("未启用取消");
 
     let mut hits = Vec::with_capacity(groups.len().min(limit));
     let mut total = 0;
@@ -423,6 +479,97 @@ fn group_into_fragments(
     (hits, total)
 }
 
+fn group_spans(
+    spans: &[Span],
+    bounds: &[(usize, usize, String)],
+    cancel: Option<&AtomicBool>,
+) -> Option<Vec<(usize, usize)>> {
+    // 命中起点、终点分别单调递增,各用一个只向前移动的游标。
+    // 落在块间空隙时仍回退到最后一块,但不能因此推进实际游标。
+    let block_of = |byte: usize, cursor: &mut usize| -> usize {
+        while *cursor < bounds.len() && bounds[*cursor].1 <= byte {
+            *cursor += 1;
+        }
+        if *cursor < bounds.len() && bounds[*cursor].0 <= byte {
+            *cursor
+        } else {
+            bounds.len() - 1
+        }
+    };
+    let mut start_block = 0;
+    let mut end_block = 0;
+
+    // 把命中归组:同一个块内的命中合为一个片段;**相邻但不共享块的命中各自
+    // 成段**(它们本来就是不同的「命中处」)。跨块短语(一个 span 横跨两个块)
+    // 把两个块并进同一段,因为它是一处命中,不该被切断。
+    //
+    // spans 已按 start 升序,所以只需与最后一组比较。
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for span in spans {
+        if cancelled(cancel) {
+            return None;
+        }
+        let first = block_of(span.start, &mut start_block);
+        // 末字节所在的块(span.end 是开区间,减 1 才落在片段内)。
+        let last = block_of(span.end.saturating_sub(1), &mut end_block).max(first);
+        match groups.last_mut() {
+            // first 落在上一段内 ⇔ 两处命中共享同一块 → 并段。
+            Some(group) if first <= group.1 => group.1 = group.1.max(last),
+            _ => groups.push((first, last)),
+        }
+    }
+
+    Some(groups)
+}
+
+/// 当前文档的完整展示定位缓存,不复制各片段正文。
+#[derive(Debug)]
+pub struct PreviewLocations {
+    pub spans: Vec<Span>,
+    /// 每个命中片段的首个高亮位置;长度即完整片段数。
+    pub fragment_offsets: Vec<usize>,
+}
+
+pub fn locate_for_preview(
+    text: &str,
+    literals: &[String],
+    bounds: &[(usize, usize, String)],
+    cancel: &AtomicBool,
+) -> Option<PreviewLocations> {
+    let spans = locate_with(text, literals, false, Some(cancel))?;
+    let fallback = [(0, text.len(), String::new())];
+    let bounds = if bounds.is_empty() {
+        &fallback[..]
+    } else {
+        bounds
+    };
+    let groups = group_spans(&spans, bounds, Some(cancel))?;
+    let mut fragment_offsets = Vec::with_capacity(groups.len());
+    let mut cursor = 0;
+    for (first, last) in groups {
+        if cancelled(Some(cancel)) {
+            return None;
+        }
+        let (start, end) = (bounds[first].0, bounds[last].1);
+        if text.get(start..end).is_none() {
+            continue;
+        }
+        while cursor < spans.len() && spans[cursor].start < start {
+            cursor += 1;
+        }
+        fragment_offsets.push(
+            spans
+                .get(cursor)
+                .filter(|span| span.end <= end)
+                .map_or(start, |span| span.start),
+        );
+    }
+    Some(PreviewLocations {
+        spans,
+        fragment_offsets,
+    })
+}
+
 /// 不同的标题路径个数(用于判断标题是否具有区分度)。
 fn distinct_header_count(bounds: &[(usize, usize, String)]) -> usize {
     let mut seen: Vec<&str> = Vec::new();
@@ -461,6 +608,22 @@ fn fragment_header(header: &str, header_count: usize, document_title: &str) -> S
 ///
 /// 语法错误把 `QueryError` 原样上抛(GUI 直接显示其中文文案)。
 pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<SearchResponse> {
+    search_with(conn, request, false)
+}
+
+/// GUI 列表使用快速定位;命中文档及排名与完整搜索一致,定位数量只是下界。
+pub fn search_for_listing(
+    conn: &Connection,
+    request: &SearchRequest,
+) -> anyhow::Result<SearchResponse> {
+    search_with(conn, request, true)
+}
+
+fn search_with(
+    conn: &Connection,
+    request: &SearchRequest,
+    quick: bool,
+) -> anyhow::Result<SearchResponse> {
     let started = Instant::now();
     let compiled =
         query::compile(&request.query, request.scope, request.loose).map_err(anyhow::Error::new)?;
@@ -593,8 +756,13 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             .context("转换命中文档正文失败")?;
         // FTS MATCH 已完成最终搜索判定:命中结果不得因展示层定位为空而被丢弃。
         // 高亮与片段只用于 UI 展示和命中导航,不参与搜索真假判定。
-        let content_highlights = locate_literals(content, literals);
-        let title_highlights = locate_literals(&document.title, literals);
+        let locate = if quick {
+            locate_literals_fast
+        } else {
+            locate_literals
+        };
+        let content_highlights = locate(content, literals);
+        let title_highlights = locate(&document.title, literals);
         if content_highlights.is_empty() && title_highlights.is_empty() {
             log::debug!("FTS result has no display spans: document_id={id}");
         }
@@ -643,6 +811,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
         .sum();
 
     Ok(SearchResponse {
+        locations_complete: !quick,
         documents,
         total_hits,
         total_documents,
@@ -984,13 +1153,16 @@ mod tests {
         let literals = vec!["文档".to_owned()];
         for (name, text) in cases {
             let expected = locate_before_direct_reuse(&text, &literals);
-            let mut samples = [Vec::new(), Vec::new()];
+            let fast_expected = locate_literals_fast(&text, &literals);
+            let mut samples = [Vec::new(), Vec::new(), Vec::new()];
             for round in 0..9 {
-                for index in [round % 2, 1 - round % 2] {
+                for index in [round % 3, (round + 1) % 3, (round + 2) % 3] {
                     let implementation = if index == 0 {
                         locate_before_direct_reuse
-                    } else {
+                    } else if index == 1 {
                         locate_literals
+                    } else {
+                        locate_literals_fast
                     };
                     let started = Instant::now();
                     let actual = std::hint::black_box(implementation(
@@ -998,7 +1170,15 @@ mod tests {
                         &literals,
                     ));
                     let ms = started.elapsed().as_secs_f64() * 1000.;
-                    assert_eq!(actual, expected, "{name}");
+                    assert_eq!(
+                        &actual,
+                        if index == 2 {
+                            &fast_expected
+                        } else {
+                            &expected
+                        },
+                        "{name}"
+                    );
                     if round > 0 {
                         samples[index].push(ms);
                     }
@@ -1011,11 +1191,17 @@ mod tests {
                     text.len(),
                     if index == 0 {
                         "区间复用前"
+                    } else if index == 1 {
+                        "完整定位"
                     } else {
-                        "区间复用后"
+                        "快速列表"
                     },
                     values[values.len() / 2],
-                    expected.len()
+                    if index == 2 {
+                        fast_expected.len()
+                    } else {
+                        expected.len()
+                    }
                 );
             }
         }
@@ -1755,5 +1941,65 @@ mod tests {
         let conn = crate::store::open_in_memory().unwrap();
         let error = search(&conn, &request("文档*")).unwrap_err();
         assert!(format!("{error:#}").contains("搜索语法错误"));
+    }
+    #[test]
+    fn quick_listing_preserves_results_and_preview_recovers_all_fragments() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let id = save_doc_chunks(
+            &mut conn,
+            "/two-stage.txt",
+            FileType::Text,
+            &vec!["文 档"; 57],
+        );
+        let quick = search_for_listing(&conn, &request("文档")).unwrap();
+        let full = search(&conn, &request("文档")).unwrap();
+        assert!(!quick.locations_complete);
+        assert!(full.locations_complete);
+        assert_eq!(quick.total_documents, full.total_documents);
+        assert_eq!(
+            quick.documents[0].document.id,
+            full.documents[0].document.id
+        );
+        assert_eq!(quick.documents[0].best_rank, full.documents[0].best_rank);
+        assert_eq!(quick.total_hits, 1);
+        assert_eq!(full.total_hits, 57);
+        assert_eq!(full.documents[0].hits.len(), 20);
+        let text = plain_text_for_preview(&conn, id).unwrap().unwrap();
+        let bounds = chunk_ranges(&conn, id).unwrap();
+        let cancel = AtomicBool::new(false);
+        let locations =
+            locate_for_preview(&text, &quick.compiled.literals, &bounds, &cancel).unwrap();
+        assert_eq!(
+            locations.spans,
+            locate_literals(&text, &quick.compiled.literals)
+        );
+        assert_eq!(locations.fragment_offsets.len(), 57);
+        assert_eq!(locations.fragment_offsets[56], ("文 档\n\n".len()) * 56);
+        cancel.store(true, Ordering::Relaxed);
+        assert!(locate_for_preview(&text, &quick.compiled.literals, &bounds, &cancel).is_none());
+    }
+
+    #[test]
+    fn preview_fragment_count_matches_materialized_fragments() {
+        let text = "文 档；文 档；文档";
+        let literals = vec!["文档".into()];
+        for bounds in [
+            vec![],
+            vec![(0, text.len(), String::new())],
+            vec![(0, 4, String::new()), (4, text.len(), String::new())],
+        ] {
+            let locations =
+                locate_for_preview(text, &literals, &bounds, &AtomicBool::new(false)).unwrap();
+            let (hits, total) =
+                group_into_fragments(text, &locations.spans, &bounds, "", usize::MAX);
+            assert_eq!(locations.fragment_offsets.len(), total);
+            assert_eq!(
+                locations.fragment_offsets,
+                hits.iter()
+                    .map(|hit| hit.start_offset
+                        + hit.highlights.first().map_or(0, |span| span.start))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 }

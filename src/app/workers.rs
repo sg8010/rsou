@@ -326,6 +326,7 @@ impl RsouApp {
         if query.is_empty() {
             return;
         }
+        self.cancel_preview_work();
         self.search_active = true;
         self.search_error = None;
         self.search_gen += 1;
@@ -365,7 +366,7 @@ impl RsouApp {
             .spawn(move || {
                 // 检索线程自己开只读连接;库不存在时把中文原因带回状态行。
                 let result = store::open(&db_path, OpenMode::ReadOnly)
-                    .and_then(|conn| search::search(&conn, &request))
+                    .and_then(|conn| search::search_for_listing(&conn, &request))
                     .map_err(|error| format!("{error:#}"));
                 if tx.send(SearchMsg { generation, result }).is_ok() {
                     ctx.request_repaint();
@@ -381,35 +382,121 @@ impl RsouApp {
         }
     }
 
-    /// 加载预览文本(同一 worker 模式:线程读库,UI 线程只收消息)。
-    pub(crate) fn start_preview(&mut self, document_id: i64) {
-        self.preview_loading = true;
-        self.preview_gen += 1;
-        let generation = self.preview_gen;
-        let (tx, rx) = mpsc::channel::<PreviewMsg>();
-        self.preview_rx = Some((generation, rx));
+    /// 取消运行中的扫描并丢弃尚未启动的请求;至多保留一个运行任务。
+    fn cancel_preview_work(&mut self) {
+        if let Some(cancel) = self.preview_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.preview_pending = None;
+        self.preview_rx = None;
+        self.preview_loading = false;
+        self.preview_locating = false;
+    }
 
+    pub(crate) fn start_preview(&mut self, document_id: i64) {
+        self.cancel_preview_work();
+        self.preview_gen += 1;
+        self.preview_locations = None;
+        self.preview_spans_cache = None;
+        self.preview_loading = true;
+        self.preview_locating = true;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview_cancel = Some(Arc::clone(&cancel));
+        self.preview_pending = Some(PreviewRequest {
+            generation: self.preview_gen,
+            document_id,
+            literals: self
+                .search_result
+                .as_ref()
+                .map(|r| r.compiled.literals.clone())
+                .unwrap_or_default(),
+            cancel,
+        });
+        self.drive_preview();
+    }
+
+    fn drive_preview(&mut self) {
+        if self
+            .preview_worker
+            .as_ref()
+            .is_some_and(|worker| worker.is_finished())
+            && self.preview_worker.take().unwrap().join().is_err()
+        {
+            self.preview_loading = false;
+            self.preview_locating = false;
+            self.search_error = Some("预览任务异常结束".into());
+        }
+        if self.preview_worker.is_some() {
+            return;
+        }
+        let Some(request) = self.preview_pending.take() else {
+            return;
+        };
+        self.preview_loading = true;
+        self.preview_locating = true;
+        let (tx, rx) = mpsc::channel();
+        self.preview_rx = Some((request.generation, rx));
         let db_path = self.dirs.db_path.clone();
+        let ctx = self.egui_ctx.clone();
         let spawned = std::thread::Builder::new()
-            .name("rsou-preview".to_owned())
+            .name("rsou-preview".into())
             .spawn(move || {
-                let text = store::open(&db_path, OpenMode::ReadOnly)
-                    .ok()
-                    .and_then(|conn| {
-                        search::plain_text_for_preview(&conn, document_id)
-                            .ok()
-                            .flatten()
-                    });
-                let _ = tx.send(PreviewMsg {
+                let PreviewRequest {
                     generation,
                     document_id,
-                    text,
-                });
+                    literals,
+                    cancel,
+                } = request;
+                let send = |event| {
+                    if !cancel.load(Ordering::Relaxed) {
+                        let _ = tx.send(PreviewMsg {
+                            generation,
+                            document_id,
+                            event,
+                        });
+                        ctx.request_repaint();
+                    }
+                };
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // 同一只读快照读取原文与块边界,随后释放连接再做 CPU 定位。
+                let loaded = (|| -> Result<_, String> {
+                    let conn = store::open(&db_path, OpenMode::ReadOnly)
+                        .map_err(|e| format!("打开预览资料库失败: {e}"))?;
+                    let transaction = conn
+                        .unchecked_transaction()
+                        .map_err(|e| format!("读取预览快照失败: {e}"))?;
+                    let text = search::plain_text_for_preview(&transaction, document_id)
+                        .map_err(|e| format!("读取预览原文失败: {e}"))?
+                        .ok_or_else(|| "文档原文已不存在".to_owned())?;
+                    let text = Arc::new(text);
+                    // 原文先送回,不等待完整扫描。
+                    send(PreviewEvent::Text(Arc::clone(&text)));
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    let bounds = search::chunk_ranges(&transaction, document_id)
+                        .map_err(|e| format!("读取预览分块失败: {e}"))?;
+                    Ok(Some((text, bounds)))
+                })();
+                match loaded {
+                    Ok(Some((text, bounds))) => {
+                        if let Some(locations) =
+                            search::locate_for_preview(&text, &literals, &bounds, &cancel)
+                        {
+                            send(PreviewEvent::Locations(locations));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => send(PreviewEvent::Error(error)),
+                }
             });
         match spawned {
-            Ok(handle) => self.workers.push(handle),
+            Ok(handle) => self.preview_worker = Some(handle),
             Err(error) => {
                 self.preview_loading = false;
+                self.preview_locating = false;
                 self.preview_rx = None;
                 self.search_error = Some(format!("无法启动预览线程: {error}"));
             }
@@ -432,7 +519,9 @@ impl RsouApp {
         self.preview_hit_index = hit_index;
         self.pending_scroll = Some(byte_offset);
         self.preview_anchor = byte_offset;
-        if self.preview_doc_id != Some(document_id) || self.preview_text.is_none() {
+        if self.preview_doc_id != Some(document_id)
+            || (self.preview_text.is_none() && !self.preview_loading)
+        {
             self.preview_doc_id = Some(document_id);
             let old = self.preview_text.take();
             if let Some(old) = old {
@@ -444,6 +533,8 @@ impl RsouApp {
 
     /// 清空预览窗格(文档/文本/导航/缓存);世代+1,在途的预览响应按过期丢弃。
     fn clear_preview(&mut self) {
+        self.cancel_preview_work();
+        self.preview_locations = None;
         self.location_popup_group = None;
         self.preview_doc_id = None;
         self.preview_hit_index = 0;
@@ -690,8 +781,34 @@ impl RsouApp {
                         if !still_hit {
                             self.clear_preview();
                         }
+                        let refresh_preview = still_hit
+                            && self.preview_doc_id.is_some_and(|id| {
+                                let old = self.search_result.as_ref();
+                                let old_doc = old
+                                    .and_then(|r| r.documents.iter().find(|d| d.document.id == id));
+                                let new_doc =
+                                    response.documents.iter().find(|d| d.document.id == id);
+                                self.preview_locations.is_none()
+                                    || old.is_none_or(|r| {
+                                        r.compiled.literals != response.compiled.literals
+                                    })
+                                    || old_doc.zip(new_doc).is_none_or(|(a, b)| {
+                                        (
+                                            a.document.updated_at,
+                                            a.document.indexed_at,
+                                            a.document.text_length,
+                                        ) != (
+                                            b.document.updated_at,
+                                            b.document.indexed_at,
+                                            b.document.text_length,
+                                        )
+                                    })
+                            });
                         if let Some(old) = self.search_result.replace(response) {
                             drop_in_background(old);
+                        }
+                        if refresh_preview {
+                            self.start_preview(self.preview_doc_id.unwrap());
                         }
                     }
                     Err(error) => self.search_error = Some(error),
@@ -702,29 +819,46 @@ impl RsouApp {
 
     /// 消费预览文本;同样按世代号丢过期消息。
     fn poll_preview(&mut self) {
-        if let Some((generation, rx)) = &self.preview_rx
-            && *generation == self.preview_gen
+        let messages: Vec<_> = self
+            .preview_rx
+            .as_ref()
+            .map(|(_, rx)| rx.try_iter().collect())
+            .unwrap_or_default();
+        for PreviewMsg {
+            generation,
+            document_id,
+            event,
+        } in messages
         {
-            let mut msg = None;
-            while let Ok(event) = rx.try_recv() {
-                msg = Some(event);
+            if generation != self.preview_gen || self.preview_doc_id != Some(document_id) {
+                continue;
             }
-            if let Some(PreviewMsg {
-                generation,
-                document_id,
-                text,
-            }) = msg
-                && generation == self.preview_gen
-            {
-                self.preview_loading = false;
-                self.preview_rx = None;
-                if self.preview_doc_id == Some(document_id)
-                    && let Some(old) = text.and_then(|t| self.preview_text.replace(t))
-                {
-                    drop_in_background(old);
+            match event {
+                PreviewEvent::Text(text) => {
+                    self.preview_loading = false;
+                    self.preview_spans_cache = None;
+                    if let Some(old) = self.preview_text.replace(text) {
+                        drop_in_background(old);
+                    }
+                }
+                PreviewEvent::Locations(locations) => {
+                    self.preview_locating = false;
+                    // 锚点不变,只校正它对应的导航索引,不强制滚动。
+                    self.preview_hit_index = locations
+                        .fragment_offsets
+                        .partition_point(|offset| *offset <= self.preview_anchor)
+                        .saturating_sub(1);
+                    self.preview_locations = Some(Arc::new(locations));
+                    self.preview_spans_cache = None;
+                }
+                PreviewEvent::Error(error) => {
+                    self.preview_loading = false;
+                    self.preview_locating = false;
+                    self.search_error = Some(error);
                 }
             }
         }
+        self.drive_preview();
     }
 
     /// 消费导入事件:更新进度、按节奏后台刷新文档列表。
@@ -954,6 +1088,7 @@ mod tests {
 
     fn response(ids: &[i64]) -> SearchResponse {
         SearchResponse {
+            locations_complete: false,
             documents: ids.iter().map(|&id| doc(id)).collect(),
             total_hits: 0,
             total_documents: ids.len(),
@@ -988,7 +1123,7 @@ mod tests {
         let mut app = RsouApp::new_state(&ctx);
         push_result(&mut app, response(&[1, 2]));
         app.preview_doc_id = Some(1);
-        app.preview_text = Some("第一篇的原文".to_owned());
+        app.preview_text = Some(Arc::new("第一篇的原文".to_owned()));
         app.preview_hit_index = 1;
         app.preview_anchor = 5;
         app.pending_scroll = Some(5);
@@ -1017,13 +1152,16 @@ mod tests {
         let mut app = RsouApp::new_state(&ctx);
         push_result(&mut app, response(&[1, 2]));
         app.preview_doc_id = Some(2);
-        app.preview_text = Some("原文".to_owned());
+        app.preview_text = Some(Arc::new("原文".to_owned()));
         let old_gen = app.preview_gen;
         // 新结果集仍含该文档:预览保留(高亮随新结果重算)。
         push_result(&mut app, response(&[2, 3]));
         assert_eq!(app.preview_doc_id, Some(2));
-        assert_eq!(app.preview_text.as_deref(), Some("原文"));
-        assert_eq!(app.preview_gen, old_gen);
+        assert_eq!(
+            app.preview_text.as_deref().map(String::as_str),
+            Some("原文")
+        );
+        assert!(app.preview_gen > old_gen);
     }
 
     #[test]
@@ -1036,7 +1174,7 @@ mod tests {
         push_result(&mut app, grouped);
         // 文本已加载时聚焦不需要启动读取线程。
         app.preview_doc_id = Some(2);
-        app.preview_text = Some("副本的正文".to_owned());
+        app.preview_text = Some(Arc::new("副本的正文".to_owned()));
         app.focus_preview(2, 0, 6);
         assert_eq!(app.search_locations.get(&1), Some(&2));
         assert_eq!(app.pending_scroll, Some(6));
@@ -1059,5 +1197,105 @@ mod tests {
         assert!(app.preview_text.is_none());
         assert!(app.search_locations.is_empty());
         assert!(app.location_popup_group.is_none());
+    }
+    #[test]
+    fn preview_text_arrives_before_locations_and_stale_messages_are_ignored() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.preview_doc_id = Some(1);
+        app.preview_gen = 2;
+        app.preview_anchor = 10;
+        app.preview_loading = true;
+        app.preview_locating = true;
+        let (tx, rx) = mpsc::channel();
+        app.preview_rx = Some((2, rx));
+        tx.send(PreviewMsg {
+            generation: 1,
+            document_id: 1,
+            event: PreviewEvent::Text(Arc::new("旧原文".into())),
+        })
+        .unwrap();
+        tx.send(PreviewMsg {
+            generation: 2,
+            document_id: 1,
+            event: PreviewEvent::Text(Arc::new("新原文".into())),
+        })
+        .unwrap();
+        app.poll_preview();
+        assert_eq!(
+            app.preview_text.as_deref().map(String::as_str),
+            Some("新原文")
+        );
+        assert!(!app.preview_loading);
+        assert!(app.preview_locating);
+        assert!(app.preview_locations.is_none());
+        tx.send(PreviewMsg {
+            generation: 2,
+            document_id: 1,
+            event: PreviewEvent::Locations(search::PreviewLocations {
+                spans: vec![],
+                fragment_offsets: vec![0, 10, 20],
+            }),
+        })
+        .unwrap();
+        app.poll_preview();
+        assert!(!app.preview_locating);
+        assert_eq!(
+            app.preview_locations
+                .as_ref()
+                .unwrap()
+                .fragment_offsets
+                .len(),
+            3
+        );
+        assert_eq!(app.preview_hit_index, 1);
+        assert_eq!(app.preview_anchor, 10);
+        assert!(app.pending_scroll.is_none());
+    }
+
+    #[test]
+    fn preview_queue_keeps_only_latest_request_and_cancels_old_work() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        let (release, wait) = mpsc::channel();
+        app.preview_worker = Some(std::thread::spawn(move || {
+            let _ = wait.recv();
+        }));
+        let old = Arc::new(AtomicBool::new(false));
+        app.preview_cancel = Some(Arc::clone(&old));
+        app.start_preview(1);
+        let old_cancelled = old.load(Ordering::Relaxed);
+        let superseded = Arc::clone(app.preview_cancel.as_ref().unwrap());
+        app.start_preview(2);
+        let latest_id = app.preview_pending.as_ref().unwrap().document_id;
+        let cancelled = superseded.load(Ordering::Relaxed);
+        let still_running = app.preview_worker.is_some();
+        app.clear_preview();
+        release.send(()).unwrap();
+        assert_eq!(latest_id, 2);
+        assert!(old_cancelled);
+        assert!(cancelled);
+        assert!(still_running);
+        assert!(app.preview_pending.is_none());
+    }
+
+    #[test]
+    fn same_query_and_document_reuse_complete_preview_cache() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        push_result(&mut app, response(&[1]));
+        app.preview_doc_id = Some(1);
+        app.preview_text = Some(Arc::new("原文".into()));
+        let cache = Arc::new(search::PreviewLocations {
+            spans: vec![],
+            fragment_offsets: vec![0],
+        });
+        app.preview_locations = Some(Arc::clone(&cache));
+        let generation = app.preview_gen;
+        push_result(&mut app, response(&[1]));
+        assert_eq!(app.preview_gen, generation);
+        assert!(Arc::ptr_eq(app.preview_locations.as_ref().unwrap(), &cache));
+        let mut changed = response(&[1]);
+        changed.compiled.literals = vec!["新词".into()];
+        push_result(&mut app, changed);
+        assert!(app.preview_gen > generation);
+        assert!(app.preview_locations.is_none());
     }
 }
