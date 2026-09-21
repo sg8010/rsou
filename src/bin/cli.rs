@@ -396,9 +396,22 @@ fn cmd_search(
         },
     )?;
     for doc_hit in response.representatives() {
+        let summary = if doc_hit.total_hits > doc_hit.hits.len() {
+            format!(
+                "共 {} 个命中片段，展示前 {} 个",
+                doc_hit.total_hits,
+                doc_hit.hits.len()
+            )
+        } else if doc_hit.total_hits > 0 {
+            format!("{} 个命中片段", doc_hit.total_hits)
+        } else if !doc_hit.title_highlights.is_empty() {
+            "标题命中".to_owned()
+        } else {
+            "未定位到展示片段".to_owned()
+        };
         println!(
-            "{} | {} | 命中 {} 处",
-            doc_hit.document.file_name, doc_hit.document.path, doc_hit.total_hits
+            "{} | {} | {}",
+            doc_hit.document.file_name, doc_hit.document.path, summary
         );
         for location in response.locations(doc_hit.group_id).skip(1) {
             println!("  相同内容位置: {}", location.document.path);
@@ -413,7 +426,7 @@ fn cmd_search(
     // 被 max_documents 截断时说明一下,避免把下界当成全量。
     let truncated = response.total_documents > response.documents.len();
     println!(
-        "展示 {} 组 · {} 个文件位置 · {} 处 · 耗时 {:.0} ms{}",
+        "展示 {} 组 · {} 个文件位置 · 代表文档共 {} 个命中片段 · 耗时 {:.0} ms{}",
         response.representatives().count(),
         response.documents.len(),
         response.total_hits,

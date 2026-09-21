@@ -810,7 +810,15 @@ fn ui_doc_card(
                             // 展示层定位可能为空(FTS tokenizer 与 Locator 规则不同),
                             // 此时不显示命中处数,但文档仍然保留在结果列表里。
                             let label = if doc_hit.total_hits > 0 {
-                                Some(format!("命中 {} 处", doc_hit.total_hits))
+                                Some(if doc_hit.hits.len() < doc_hit.total_hits {
+                                    format!(
+                                        "共 {} 个命中片段，展示前 {} 个",
+                                        doc_hit.total_hits,
+                                        doc_hit.hits.len()
+                                    )
+                                } else {
+                                    format!("{} 个命中片段", doc_hit.total_hits)
+                                })
                             } else if !doc_hit.title_highlights.is_empty() {
                                 Some("标题命中".to_owned())
                             } else {

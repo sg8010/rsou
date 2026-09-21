@@ -61,7 +61,7 @@ impl Default for SearchRequest {
 
 /// 每篇文档默认返回的展示片段数上限。
 ///
-/// 「命中 N 处」现在指「N 个展示片段」,而不是 FTS 行数。不设上限的话,
+/// 片段总数不受此上限影响,只限制实际返回的片段。不设上限的话,
 /// 一篇长文档可能命中几百个块,右侧预览的「上一批/下一批」就失去意义了。
 pub const DEFAULT_MAX_FRAGMENTS: usize = 20;
 
@@ -105,7 +105,7 @@ pub struct DocumentHit {
     /// 展示片段,按在文档中的位置升序。为空只表示展示层没定位到,
     /// 该文档仍属于 FTS 命中结果。
     pub hits: Vec<Hit>,
-    /// 该文档的全部命中批次(可能多于 `hits`,超出上限的部分不再展示)
+    /// 截断前的有效命中片段总数,不是关键词出现次数;可能大于 `hits.len()`。
     pub total_hits: usize,
     /// bm25 分数(越小越相关)
     pub best_rank: f64,
@@ -116,7 +116,7 @@ pub struct DocumentHit {
 pub struct SearchResponse {
     /// 已展示组的全部匹配位置,按组及位置相关度排序。
     pub documents: Vec<DocumentHit>,
-    /// 已展示组的代表文档命中片段总数,不累加副本的片段。
+    /// 已展示组代表文档的截断前片段总数,不累加副本或未展示组。
     pub total_hits: usize,
     /// 满足 FTS MATCH + 结构化过滤条件的文件位置数。
     pub total_documents: usize,
@@ -163,10 +163,12 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
             });
         }
         // 逐字索引把空白也当分隔符,所以字面量可能跨空白:`document 管理`
-        // 对 `document\n管理` 也应命中。逐字定位一次去空白后的形态。
-        if let Some(skipped) = find_ignoring_whitespace(text, literal) {
-            spans.push(skipped);
-        }
+        // 对 `document\n管理` 也应命中。补全去空白后的非重叠匹配,
+        // 与直接匹配相同的区间无需再次保存。
+        spans.extend(
+            find_ignoring_whitespace(text, literal)
+                .filter(|span| !text[span.start..span.end].eq_ignore_ascii_case(literal)),
+        );
     }
     spans.sort_by_key(|span| (span.start, span.end));
     let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
@@ -182,10 +184,19 @@ pub fn locate_literals(text: &str, literals: &[String]) -> Vec<Span> {
 }
 
 /// 在 `text` 里找 `literal`,允字面量的字符之间隔着空白(与 FTS 逐字索引一致)。
-/// 返回原文字节区间;找不到返回 None。
-fn find_ignoring_whitespace(text: &str, literal: &str) -> Option<Span> {
+/// 返回所有非重叠匹配的原文字节区间;每次从上次命中末尾继续扫描。
+fn find_ignoring_whitespace<'a>(text: &'a str, literal: &str) -> impl Iterator<Item = Span> + 'a {
     let needle: Vec<char> = literal.chars().filter(|c| !c.is_whitespace()).collect();
-    scan_ignoring_whitespace(text, &needle)
+    let mut offset = 0;
+    std::iter::from_fn(move || {
+        let span = scan_ignoring_whitespace(&text[offset..], &needle)?;
+        let span = Span {
+            start: offset + span.start,
+            end: offset + span.end,
+        };
+        offset = span.end;
+        Some(span)
+    })
 }
 
 fn scan_ignoring_whitespace(text: &str, needle: &[char]) -> Option<Span> {
@@ -268,15 +279,16 @@ pub fn chunk_ranges(
 ///
 /// `bounds` 是展示块边界;为空(没有块信息)时整篇一段。
 /// 命中跨块边界时把它两侧的块并进同一片段,保证短语两半都在片段里。
+/// 返回限量物化的片段与截断前的有效片段总数。
 fn group_into_fragments(
     content: &str,
     spans: &[Span],
     bounds: &[(usize, usize, String)],
     document_title: &str,
     limit: usize,
-) -> Vec<Hit> {
+) -> (Vec<Hit>, usize) {
     if spans.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     // 无块信息:整篇一段。
     let fallback;
@@ -324,17 +336,19 @@ fn group_into_fragments(
     }
 
     let mut hits = Vec::with_capacity(groups.len().min(limit));
+    let mut total = 0;
     let mut highlight_start = 0;
     let mut highlight_end = 0;
     for (first, last) in groups {
-        if hits.len() >= limit {
-            break;
-        }
         let start = bounds[first].0;
         let end = bounds[last].1;
         let Some(piece) = content.get(start..end) else {
             continue;
         };
+        total += 1;
+        if hits.len() >= limit {
+            continue;
+        }
         // 按片段的实际边界确定命中切片,保留空隙回退时的原有筛选语义。
         // 片段边界和命中区间均有序,无需为每个片段重新扫描全部命中。
         while highlight_start < spans.len() && spans[highlight_start].start < start {
@@ -358,7 +372,7 @@ fn group_into_fragments(
             highlights,
         });
     }
-    hits
+    (hits, total)
 }
 
 /// 不同的标题路径个数(用于判断标题是否具有区分度)。
@@ -537,7 +551,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             log::debug!("FTS result has no display spans: document_id={id}");
         }
         let bounds = chunk_ranges(conn, id).unwrap_or_default();
-        let hits = group_into_fragments(
+        let (hits, total_for_doc) = group_into_fragments(
             content,
             &content_highlights,
             &bounds,
@@ -545,7 +559,6 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
             request.max_fragments_per_document,
         );
         drop(content_rows);
-        let total_for_doc = hits.len();
         documents.push(DocumentHit {
             group_id: *representative.get_or_insert(id),
             document,
@@ -578,7 +591,7 @@ pub fn search(conn: &Connection, request: &SearchRequest) -> anyhow::Result<Sear
     let total_hits = documents
         .iter()
         .filter(|hit| hit.group_id == hit.document.id)
-        .map(|doc| doc.hits.len())
+        .map(|doc| doc.total_hits)
         .sum();
 
     Ok(SearchResponse {
@@ -717,6 +730,38 @@ mod tests {
     use crate::repo::{FileMeta, ParsedDocument};
     use crate::text;
 
+    // 独立对照:物化非空白字符后按窗口比对,不调用生产扫描器。
+    fn naive_all_whitespace_matches(text: &str, literal: &str) -> Vec<Span> {
+        let chars: Vec<_> = text
+            .char_indices()
+            .filter(|(_, ch)| !ch.is_whitespace())
+            .collect();
+        let needle: Vec<_> = literal.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let mut spans = Vec::new();
+        if needle.is_empty() {
+            return spans;
+        }
+        let mut index = 0;
+        while index + needle.len() <= chars.len() {
+            let window = &chars[index..index + needle.len()];
+            if window
+                .iter()
+                .zip(&needle)
+                .all(|((_, ch), expected)| ch.eq_ignore_ascii_case(expected))
+            {
+                let (end, ch) = window[window.len() - 1];
+                spans.push(Span {
+                    start: window[0].0,
+                    end: end + ch.len_utf8(),
+                });
+                index += needle.len();
+            } else {
+                index += 1;
+            }
+        }
+        spans
+    }
+
     #[test]
     fn streaming_whitespace_matches_legacy() {
         for (text, literal) in [
@@ -754,9 +799,14 @@ mod tests {
                 .collect();
             let needle: Vec<_> = literal.chars().filter(|c| !c.is_whitespace()).collect();
             assert_eq!(
-                find_ignoring_whitespace(&text, &literal),
+                find_ignoring_whitespace(&text, &literal).next(),
                 legacy_whitespace_scan(&text, &needle),
                 "正文 {text:?}, 查询 {literal:?}"
+            );
+            assert_eq!(
+                find_ignoring_whitespace(&text, &literal).collect::<Vec<_>>(),
+                naive_all_whitespace_matches(&text, &literal),
+                "全文定位: 正文 {text:?}, 查询 {literal:?}"
             );
         }
         // 更早的空白匹配不能被后面的直接匹配遮蔽。
@@ -867,8 +917,12 @@ mod tests {
                 spans.clear();
             }
             for limit in [0, 1, 2, 20, usize::MAX] {
+                assert_eq!(
+                    group_into_fragments(content, &spans, &bounds, "文档", limit).1,
+                    legacy_group_into_fragments(content, &spans, &bounds, "文档", usize::MAX).len()
+                );
                 assert_same_fragments(
-                    &group_into_fragments(content, &spans, &bounds, "文档", limit),
+                    &group_into_fragments(content, &spans, &bounds, "文档", limit).0,
                     &legacy_group_into_fragments(content, &spans, &bounds, "文档", limit),
                 );
             }
@@ -891,7 +945,9 @@ mod tests {
         type FragmentFn = fn(&str, &[Span], &[(usize, usize, String)], &str, usize) -> Vec<Hit>;
         let implementations: [(&str, FragmentFn); 2] = [
             ("优化前", legacy_group_into_fragments),
-            ("优化后", group_into_fragments),
+            ("优化后", |content, spans, bounds, title, limit| {
+                group_into_fragments(content, spans, bounds, title, limit).0
+            }),
         ];
         let expected = legacy_group_into_fragments(&content, &spans, &bounds, "文档", 20);
         for round in 0..3 {
@@ -1333,29 +1389,37 @@ mod tests {
 
     #[test]
     fn fragments_per_document_are_capped() {
-        let mut conn = crate::store::open_in_memory().unwrap();
-        save_doc_chunks(
-            &mut conn,
-            "/d/多段.txt",
-            FileType::Text,
-            &["合同甲", "合同乙", "合同丙", "合同丁", "合同戊"],
-        );
-        let response = search(
-            &conn,
-            &SearchRequest {
-                max_fragments_per_document: 2,
-                ..request("合同")
-            },
-        )
-        .unwrap();
-        let doc = &response.documents[0];
-        assert_eq!(
-            doc.hits.len(),
-            2,
-            "片段数应受 max_fragments_per_document 限制"
-        );
-        // 文档本身仍算命中,总数不变。
-        assert_eq!(response.total_documents, 1);
+        for count in [5, 57] {
+            let mut conn = crate::store::open_in_memory().unwrap();
+            // 显式分块,每块两个关键词仍只算一个片段;副本不重复汇总。
+            let pieces = vec!["合同甲 合同乙"; count];
+            for path in ["/d/原件.txt", "/d/副本.txt"] {
+                let id = save_doc_chunks(&mut conn, path, FileType::Text, &pieces);
+                conn.execute(
+                    "UPDATE documents SET content_hash = ?1 WHERE id = ?2",
+                    ("a".repeat(64), id),
+                )
+                .unwrap();
+            }
+            for limit in [0, 2, 20, 100] {
+                let response = search(
+                    &conn,
+                    &SearchRequest {
+                        max_fragments_per_document: limit,
+                        ..request("合同")
+                    },
+                )
+                .unwrap();
+                assert_eq!(response.total_groups, 1);
+                assert_eq!(response.total_documents, 2);
+                assert_eq!(response.documents.len(), 2);
+                assert_eq!(response.total_hits, count, "不能截断计数或重复累计副本");
+                for doc in &response.documents {
+                    assert_eq!(doc.hits.len(), count.min(limit));
+                    assert_eq!(doc.total_hits, count);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1414,6 +1478,59 @@ mod tests {
         // 词元边界:多字节字符不会错位。
         let spans = locate_literals("前合同后", &["合同".to_owned()]);
         assert_eq!(&"前合同后"[spans[0].start..spans[0].end], "合同");
+    }
+
+    #[test]
+    fn locate_literals_finds_all_whitespace_occurrences() {
+        for (text, literal, expected) in [
+            ("文 档；文 档", "文档", vec!["文 档", "文 档"]),
+            (
+                "文档；文 档；文档；文\n档",
+                "文档",
+                vec!["文档", "文 档", "文档", "文\n档"],
+            ),
+            (
+                "🙂文\u{a0}档；文\u{3000}档",
+                "文档",
+                vec!["文\u{a0}档", "文\u{3000}档"],
+            ),
+            ("A \tB；a\nb", "a b", vec!["A \tB", "a\nb"]),
+            ("文档；文\n档", "文 档", vec!["文档", "文\n档"]),
+        ] {
+            let spans = locate_literals(text, &[literal.into()]);
+            let actual: Vec<_> = spans
+                .iter()
+                .map(|span| &text[span.start..span.end])
+                .collect();
+            assert_eq!(actual, expected, "{text:?}");
+        }
+        // 保留非重叠扫描,不把第三个“哈”纳入第二次重叠出现。
+        assert_eq!(
+            locate_literals("哈哈哈", &["哈哈".into()]),
+            [Span { start: 0, end: 6 }]
+        );
+    }
+
+    #[test]
+    fn whitespace_occurrences_in_separate_chunks_are_navigable() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc_chunks(
+            &mut conn,
+            "/whitespace.txt",
+            FileType::Text,
+            &["文 档", "文 档"],
+        );
+        let response = search(&conn, &request("文档")).unwrap();
+        assert_eq!(response.total_documents, 1);
+        let hits = &response.documents[0].hits;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].start_offset, 0);
+        assert_eq!(hits[1].start_offset, "文 档\n\n".len());
+        for hit in hits {
+            assert_eq!(hit.highlights.len(), 1);
+            let span = hit.highlights[0];
+            assert_eq!(&hit.content[span.start..span.end], "文 档");
+        }
     }
 
     #[test]
