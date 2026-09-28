@@ -30,7 +30,7 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   search <查询>         全文检索,片段用【】标出高亮段
   check                 完整性检查;索引不一致时退出码 1
   rebuild               重建全文索引(打印进度与行数)
-  optimize              FTS optimize + WAL 截断 + VACUUM
+  optimize              FTS optimize + VACUUM + WAL 截断
   purge-markdown        清空已入库的 Markdown 原文并压缩索引文件
   clear                 清空资料库(需 --yes;保留 settings)
 
@@ -491,7 +491,7 @@ fn cmd_rebuild(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// optimize:FTS optimize + WAL 截断 + VACUUM。
+/// optimize:FTS optimize + VACUUM + WAL 截断。
 fn cmd_optimize(connection: &rusqlite::Connection, _path: &Path) -> anyhow::Result<()> {
     maintain::optimize(connection)?;
     println!("索引已优化");

@@ -272,7 +272,7 @@ impl RsouApp {
                         action = Some(MaintainKind::Rebuild);
                     }
                     if Self::small_secondary_button(ui, Some(Icon::Database), "优化", 0.0, true)
-                        .on_hover_text("FTS optimize + WAL 截断 + VACUUM")
+                        .on_hover_text("FTS optimize + VACUUM + WAL 截断")
                         .clicked()
                     {
                         action = Some(MaintainKind::Optimize);

@@ -271,17 +271,23 @@ pub fn rebuild_fts(
     Ok(processed)
 }
 
-/// 索引优化:FTS5 'optimize' 合并内部段 → WAL 截断 → VACUUM。
+/// 索引优化:FTS5 'optimize' 合并内部段 → VACUUM → WAL 截断。
+///
+/// 顺序不能反:WAL 模式下 VACUUM 的产物先落在 WAL 里,只有在它之后
+/// 跑 `wal_checkpoint(TRUNCATE)` 才能把压缩后的页面写回主库并把 WAL
+/// 截断到 0。若先截断再 VACUUM,主库文件会停留在此前的高水位(自由页
+/// 未回收),WAL 里压着一份压缩后的镜像,界面读到的“索引文件大小”在
+/// 应用保持连接期间一直偏大,手动刷新也纠正不了(连接关闭前不会截断)。
 pub fn optimize(conn: &Connection) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO documents_fts(documents_fts) VALUES('optimize')",
         [],
     )
     .context("FTS optimize 失败")?;
+    conn.execute_batch("VACUUM;").context("VACUUM 失败")?;
     // wal_checkpoint 返回一行结果,execute_batch 直接丢弃它即可。
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
         .context("WAL checkpoint 失败")?;
-    conn.execute_batch("VACUUM;").context("VACUUM 失败")?;
     Ok(())
 }
 
@@ -706,6 +712,38 @@ mod tests {
         // optimize 不改变可检索内容。
         let report = check_integrity(&conn).unwrap();
         assert!(report.is_consistent());
+    }
+
+    /// 回归:优化后磁盘文件必须真的缩小,且测量发生在连接仍然打开时。
+    ///
+    /// 旧顺序(VACUUM 前先截断 WAL)会把主库文件留在删除前的高水位,
+    /// 压缩结果压在 WAL 里;应用保持连接期间读到的“索引文件大小”一直是
+    /// 膨胀值,点刷新也只是再读一次同样的字节数。这里用文件库复现该路径。
+    #[test]
+    fn optimize_shrinks_database_files_while_connection_stays_open() {
+        let dir = std::env::temp_dir().join(format!("rsou-optimize-size-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("index.sqlite3");
+
+        let mut conn = crate::store::open(&db_path, crate::store::OpenMode::ReadWrite).unwrap();
+        // 造一个大文档再删掉,留下大量自由页——正是“优化回收体积”的场景。
+        let big = "0123456789".repeat(100_000);
+        let id = save_doc(&mut conn, "/d/big.txt", &format!("# 大文档\n\n{big}"));
+        let before = db_file_bytes(&db_path);
+        repo::delete_document(&mut conn, id).unwrap();
+
+        optimize(&conn).unwrap();
+
+        let after = db_file_bytes(&db_path);
+        assert!(
+            after < 300 * 1024,
+            "优化后文件应回落到压缩体积,实际 {after} 字节(优化前 {before})",
+        );
+        // 连接不关,内容仍可读(优化没有破坏库)。
+        assert!(check_integrity(&conn).unwrap().is_consistent());
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
