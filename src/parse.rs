@@ -273,7 +273,7 @@ pub fn map_convert_error(error: &ConvertError) -> ParseError {
         ),
         ConvertError::NeedsOcr { pages, page_count } => ParseError::new(
             ParseErrorCode::NeedsOcr,
-            "该 PDF 没有可提取文本,需要 OCR,本版本不支持",
+            "该 PDF 需要 OCR,可在失败清单中点击“全部 OCR”",
             format!("{pages:?}/{page_count} 页需要 OCR"),
         ),
         ConvertError::Io(e) => ParseError::new(

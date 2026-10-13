@@ -1,4 +1,4 @@
-//! 设置页:数据位置、索引统计、索引维护、解析选项与检索词典。
+//! 设置页:按文档处理、检索词典、数据与维护分组。
 
 use std::path::Path;
 
@@ -9,8 +9,16 @@ use rsou_lib::repo;
 use super::theme::Icon;
 use super::*;
 
-/// 两列卡片的最小宽度:低于它时卡片改为上下堆叠(窄窗/高 DPI)。
-const TWO_COL_MIN_WIDTH: f32 = 780.0;
+/// 设置内容限制阅读宽度,窄窗按可用宽度自然收缩。
+const SETTINGS_MAX_WIDTH: f32 = 920.0;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum SettingsTab {
+    #[default]
+    Documents,
+    Dictionary,
+    Data,
+}
 
 /// 词典卡片里的动作(在卡片闭包外落地,避免借用冲突)。
 #[derive(Clone, Copy)]
@@ -24,69 +32,116 @@ enum DictAction {
 
 impl RsouApp {
     pub(crate) fn ui_page_settings(&mut self, ui: &mut egui::Ui) {
-        Self::page_header(ui, self.page.title(), self.page.description());
-        ui.add_space(Self::HEADER_TO_CONTENT);
+        let width = ui.available_width().min(SETTINGS_MAX_WIDTH);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(width);
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                Self::page_header(ui, self.page.title(), self.page.description());
+                ui.add_space(Self::HEADER_TO_CONTENT);
+                ui.horizontal_wrapped(|ui| {
+                    for (tab, label) in [
+                        (SettingsTab::Documents, "文档处理"),
+                        (SettingsTab::Dictionary, "检索词典"),
+                        (SettingsTab::Data, "数据与维护"),
+                    ] {
+                        if Self::tab_button(ui, label, self.settings_tab == tab) {
+                            self.settings_tab = tab;
+                        }
+                    }
+                });
+                ui.add_space(Self::SECTION_GAP);
+                match self.settings_tab {
+                    SettingsTab::Documents => {
+                        self.ui_settings_parse(ui);
+                        ui.add_space(Self::SECTION_GAP);
+                        self.ui_settings_ocr(ui);
+                    }
+                    SettingsTab::Dictionary => self.ui_settings_dict(ui),
+                    SettingsTab::Data => {
+                        self.ui_settings_stats(ui);
+                        ui.add_space(Self::SECTION_GAP);
+                        self.ui_settings_maintenance(ui);
+                        ui.add_space(Self::SECTION_GAP);
+                        self.ui_settings_location(ui);
+                    }
+                }
+                ui.add_space(Self::SECTION_GAP);
+                ui.label(
+                    egui::RichText::new(format!("rsou · 版本 {}", env!("CARGO_PKG_VERSION")))
+                        .size(12.0)
+                        .color(Self::text_muted()),
+                );
+            },
+        );
+    }
 
-        // 第一行:数据位置 | 索引统计(窄窗时上下堆叠)。
-        if ui.available_width() >= TWO_COL_MIN_WIDTH {
-            let col = (ui.available_width() - Self::SECTION_GAP) / 2.0;
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.ui_settings_location(ui),
-                );
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.ui_settings_stats(ui),
-                );
+    /// 所有设置卡片占满内容列,避免随文案长短出现宽窄不一。
+    fn settings_card(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui)) {
+        Self::card(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            contents(ui);
+        });
+    }
+
+    fn ui_settings_ocr(&mut self, ui: &mut egui::Ui) {
+        let mut save = false;
+        let mut test = false;
+        Self::settings_card(ui, |ui| {
+            Self::card_title(ui, "OCR 设置");
+            Self::thin_divider(ui);
+            ui.label("服务地址");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ocr_url_input)
+                    .hint_text(rsou_lib::ocr::DEFAULT_BASE_URL)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("用于失败清单中的“全部 OCR”。地址保存后从下一批识别起生效。")
+                    .size(12.0)
+                    .color(Self::text_muted()),
+            );
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                save =
+                    Self::primary_button(ui, None, "保存配置", 108.0, self.db.is_some()).clicked();
+                test = Self::small_secondary_button(
+                    ui,
+                    None,
+                    if self.ocr_test_rx.is_some() {
+                        "正在测试…"
+                    } else {
+                        "测试连接"
+                    },
+                    0.0,
+                    self.ocr_test_rx.is_none(),
+                )
+                .on_hover_text("测试当前填写的地址,无需先保存")
+                .clicked();
             });
-        } else {
-            self.ui_settings_location(ui);
-            ui.add_space(Self::SECTION_GAP);
-            self.ui_settings_stats(ui);
+            if let Some(notice) = &self.ocr_test_notice {
+                ui.add(egui::Label::new(notice).wrap());
+            }
+            if let Some(notice) = &self.ocr_settings_notice {
+                ui.label(notice);
+            }
+        });
+        if test {
+            self.start_ocr_connection_test(ui.ctx());
         }
-        ui.add_space(Self::SECTION_GAP);
-
-        // 第二行:索引维护(操作多,占整行)。
-        self.ui_settings_maintenance(ui);
-        ui.add_space(Self::SECTION_GAP);
-
-        // 第三行:解析选项 | 检索词典。
-        if ui.available_width() >= TWO_COL_MIN_WIDTH {
-            let col = (ui.available_width() - Self::SECTION_GAP) / 2.0;
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.ui_settings_parse(ui),
-                );
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.ui_settings_dict(ui),
-                );
-            });
-        } else {
-            self.ui_settings_parse(ui);
-            ui.add_space(Self::SECTION_GAP);
-            self.ui_settings_dict(ui);
-        }
-        ui.add_space(Self::SECTION_GAP);
-
-        // 第四行:关于(半行宽,与上一行左列对齐)。
-        if ui.available_width() >= TWO_COL_MIN_WIDTH {
-            let col = (ui.available_width() - Self::SECTION_GAP) / 2.0;
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    egui::vec2(col, 0.0),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| self.ui_settings_about(ui),
-                );
-            });
-        } else {
-            self.ui_settings_about(ui);
+        if save && let Some(conn) = &self.db {
+            self.ocr_settings_notice = Some(
+                match rsou_lib::ocr::save_base_url(conn, &self.ocr_url_input) {
+                    Ok(url) => {
+                        self.ocr_url_input = url;
+                        "OCR 配置已保存,下次识别时生效".to_owned()
+                    }
+                    Err(error) => format!("保存 OCR 配置失败: {error:#}"),
+                },
+            );
         }
     }
 
@@ -99,7 +154,7 @@ impl RsouApp {
             CopyPath,
         }
         let mut action = None;
-        Self::card(ui, |ui| {
+        Self::settings_card(ui, |ui| {
             Self::card_title(ui, "数据位置");
             Self::thin_divider(ui);
             Self::field_row(ui, "数据目录", &self.dirs.data_dir.display().to_string());
@@ -178,7 +233,7 @@ impl RsouApp {
     /// 卡片 2:索引统计(缓存值 + 手动刷新)。
     fn ui_settings_stats(&mut self, ui: &mut egui::Ui) {
         let mut want_refresh = false;
-        Self::card(ui, |ui| {
+        Self::settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 Self::card_title(ui, "索引统计");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -227,7 +282,7 @@ impl RsouApp {
         let mut clear_confirm = false;
         let mut clear_cancel = false;
         let busy = self.maintenance_active || self.import_active;
-        Self::card(ui, |ui| {
+        Self::settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 Self::card_title(ui, "索引维护");
                 if self.maintenance_active {
@@ -243,8 +298,7 @@ impl RsouApp {
             Self::thin_divider(ui);
             ui.label(
                 egui::RichText::new(
-                    "索引文件只应由本程序打开(内置自定义分词器)。\
-                     维护与导入互斥:任一进行中另一组按钮都会禁用。",
+                    "导入或 OCR 进行时暂不可维护。清空资料库仅删除索引,保留原始文件。",
                 )
                 .size(13.0)
                 .color(Self::text_secondary()),
@@ -378,7 +432,7 @@ impl RsouApp {
     fn ui_settings_parse(&mut self, ui: &mut egui::Ui) {
         let mut new_max_mb = None;
         let mut new_save_markdown = None;
-        Self::card(ui, |ui| {
+        Self::settings_card(ui, |ui| {
             Self::card_title(ui, "解析选项");
             Self::thin_divider(ui);
             ui.horizontal(|ui| {
@@ -401,7 +455,7 @@ impl RsouApp {
             });
             ui.add_space(4.0);
             ui.label(
-                egui::RichText::new("超过上限的文件会记为导入失败(TOO_LARGE)")
+                egui::RichText::new("超过上限的文件会列入失败清单")
                     .size(12.0)
                     .color(Self::text_muted()),
             );
@@ -434,7 +488,7 @@ impl RsouApp {
     fn ui_settings_dict(&mut self, ui: &mut egui::Ui) {
         let report = self.dict_report.clone();
         let mut action = None;
-        Self::card(ui, |ui| {
+        Self::settings_card(ui, |ui| {
             ui.horizontal(|ui| {
                 Self::card_title(ui, "检索词典");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -663,28 +717,6 @@ impl RsouApp {
         }
     }
 
-    /// 卡片 6:关于。
-    fn ui_settings_about(&mut self, ui: &mut egui::Ui) {
-        Self::card(ui, |ui| {
-            Self::card_title(ui, "关于");
-            Self::thin_divider(ui);
-            Self::field_row(ui, "版本", env!("CARGO_PKG_VERSION"));
-            Self::field_row(ui, "数据目录", &self.dirs.data_dir.display().to_string());
-            let log_text = self
-                .startup_log_path
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "不可用".to_owned());
-            Self::field_row(ui, "启动日志", &log_text);
-            ui.add_space(4.0);
-            ui.label(
-                egui::RichText::new("索引文件只应由本程序打开(内置自定义分词器)。")
-                    .size(12.0)
-                    .color(Self::text_muted()),
-            );
-        });
-    }
-
     /// 字段行:88px 标签列 + 值(长路径自动换行,不撑破卡片)。
     fn field_row(ui: &mut egui::Ui, label: &str, value: &str) {
         ui.horizontal_top(|ui| {
@@ -696,11 +728,14 @@ impl RsouApp {
                 egui::FontId::proportional(13.0),
                 Self::text_secondary(),
             );
-            ui.add(egui::Label::new(
-                egui::RichText::new(value)
-                    .size(13.0)
-                    .color(Self::text_primary()),
-            ));
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(value)
+                        .size(13.0)
+                        .color(Self::text_primary()),
+                )
+                .wrap(),
+            );
         });
         ui.add_space(6.0);
     }

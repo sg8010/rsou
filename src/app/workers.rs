@@ -50,6 +50,13 @@ impl RsouApp {
             .filter(|mb| (1..=repo::MAX_FILE_MB_LIMIT).contains(mb))
             .unwrap_or(repo::DEFAULT_MAX_FILE_MB);
         self.save_markdown = repo::save_markdown_enabled(conn);
+        match rsou_lib::ocr::configured_base_url(
+            conn,
+            std::env::var("RSOU_OCR_URL").ok().as_deref(),
+        ) {
+            Ok(url) => self.ocr_url_input = url,
+            Err(error) => self.ocr_settings_notice = Some(format!("读取 OCR 配置失败: {error:#}")),
+        }
     }
 
     /// 加载 / 重新加载用户词典(启动与设置页「重新加载」都走这里)。
@@ -153,6 +160,80 @@ impl RsouApp {
         );
     }
 
+    pub(crate) fn start_ocr_connection_test(&mut self, ctx: &egui::Context) {
+        if self.ocr_test_rx.is_some() {
+            return;
+        }
+        let url = match rsou_lib::ocr::normalize_base_url(&self.ocr_url_input) {
+            Ok(url) => url,
+            Err(error) => {
+                self.ocr_test_notice = Some(format!("测试连接失败: {error:#}"));
+                return;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.ocr_test_notice = Some(format!("正在测试 {url}…"));
+        let spawned = std::thread::Builder::new()
+            .name("rsou-ocr-test".into())
+            .spawn(move || {
+                let result =
+                    rsou_lib::ocr::Client::new(&url).and_then(|client| client.test_connection());
+                let message = match result {
+                    Ok(info) => format!("{url}: {info}"),
+                    Err(error) => format!("{url}: 测试连接失败: {error:#}"),
+                };
+                let _ = tx.send(message);
+                ctx.request_repaint();
+            });
+        match spawned {
+            Ok(handle) => {
+                self.ocr_test_rx = Some(rx);
+                self.workers.push(handle);
+            }
+            Err(error) => self.ocr_test_notice = Some(format!("无法启动连接测试: {error}")),
+        }
+    }
+
+    fn poll_ocr_connection_test(&mut self) {
+        let Some(rx) = &self.ocr_test_rx else { return };
+        let message = match rx.try_recv() {
+            Ok(message) => message,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => "连接测试异常结束,请重试".to_owned(),
+        };
+        self.ocr_test_notice = Some(message);
+        self.ocr_test_rx = None;
+    }
+
+    pub(crate) fn start_ocr(&mut self, ctx: &egui::Context) {
+        let Some(conn) = &self.db else { return };
+        let url = match rsou_lib::ocr::configured_base_url(
+            conn,
+            std::env::var("RSOU_OCR_URL").ok().as_deref(),
+        ) {
+            Ok(url) => url,
+            Err(error) => {
+                self.library_notice = Some(format!("OCR 配置无效,请在设置中修改: {error:#}"));
+                return;
+            }
+        };
+        let inputs = self
+            .failed_documents
+            .iter()
+            .filter(|d| d.parse_error_code.as_deref() == Some("NEEDS_OCR"))
+            .map(|d| PathBuf::from(&d.path))
+            .collect();
+        self.start_import_with_options(
+            ctx,
+            inputs,
+            ImportOptions {
+                ocr_base_url: Some(url),
+                ..Default::default()
+            },
+        );
+    }
+
     fn start_import_with_options(
         &mut self,
         ctx: &egui::Context,
@@ -163,7 +244,10 @@ impl RsouApp {
             return;
         }
         self.import_active = true;
-        self.import_progress = ImportProgress::default();
+        self.import_progress = ImportProgress {
+            is_ocr: options.ocr_base_url.is_some(),
+            ..Default::default()
+        };
         self.import_gen += 1;
         let generation = self.import_gen;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -198,6 +282,10 @@ impl RsouApp {
                 );
                 if let Err(error) = result {
                     log::error!("导入线程失败: {error:#}");
+                    let _ = tx.send(ImportEvent::Error {
+                        message: format!("处理失败: {error:#}"),
+                    });
+                    ctx.request_repaint();
                 }
             });
         match spawned {
@@ -215,7 +303,14 @@ impl RsouApp {
     pub(crate) fn cancel_import(&mut self) {
         if let Some(cancel) = &self.import_cancel {
             cancel.store(true, Ordering::Relaxed);
-            self.library_notice = Some("正在取消导入…".to_owned());
+            self.library_notice = Some(
+                if self.import_progress.is_ocr {
+                    "正在取消 OCR 等待,服务端已接收的任务可能继续运行…"
+                } else {
+                    "正在取消导入…"
+                }
+                .to_owned(),
+            );
         }
     }
 
@@ -655,6 +750,7 @@ impl RsouApp {
     /// 每帧非阻塞地收取后台任务消息;回收已结束的 worker 线程
     /// (已完成的 join 掉收 panic 信息,未完成的继续留在列表里)。
     pub(crate) fn poll_workers(&mut self) {
+        self.poll_ocr_connection_test();
         self.poll_import();
         self.poll_docs();
         self.poll_search();
@@ -871,6 +967,11 @@ impl RsouApp {
         {
             while let Ok(event) = rx.try_recv() {
                 match event {
+                    ImportEvent::Error { message } => {
+                        self.import_active = false;
+                        self.library_notice = Some(message);
+                        finished = true;
+                    }
                     ImportEvent::Scanned { total } => {
                         self.import_progress.counts.total = total;
                     }
@@ -902,14 +1003,19 @@ impl RsouApp {
                         self.import_progress.cancelled = cancelled;
                         self.import_active = false;
                         finished = true;
+                        let operation = if self.import_progress.is_ocr {
+                            "OCR"
+                        } else {
+                            "导入"
+                        };
                         self.library_notice = Some(if cancelled {
                             format!(
-                                "导入已取消:处理 {}/{} 个文件",
+                                "{operation}已取消:处理 {}/{} 个文件",
                                 counts.processed, counts.total
                             )
                         } else {
                             format!(
-                                "导入完成:成功 {}、失败 {}、跳过 {}(共 {})",
+                                "{operation}完成:成功 {}、失败 {}、跳过 {}(共 {})",
                                 counts.ok, counts.failed, counts.skipped, counts.total
                             )
                         });

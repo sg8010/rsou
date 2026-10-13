@@ -62,7 +62,7 @@ impl Page {
         match self {
             Self::Library => "把文档放进资料库,之后即可全文检索。",
             Self::Search => "输入关键词,在全部已索引文档中查找。",
-            Self::Settings => "查看数据位置,维护索引文件。",
+            Self::Settings => "配置文档解析、OCR 与检索词典,管理本地数据。",
         }
     }
 }
@@ -155,6 +155,7 @@ pub(crate) enum PendingConfirm {
 /// 导入进度(界面展示用)。
 #[derive(Default)]
 pub(crate) struct ImportProgress {
+    pub is_ocr: bool,
     pub counts: ImportCounts,
     /// 最近处理完的文件
     pub current_path: Option<PathBuf>,
@@ -396,6 +397,11 @@ pub struct RsouApp {
     confirm_clear: bool,
     /// 设置页的操作提示(复制路径 / 打开目录结果等)
     settings_notice: Option<String>,
+    settings_tab: page_settings::SettingsTab,
+    ocr_url_input: String,
+    ocr_settings_notice: Option<String>,
+    ocr_test_rx: Option<Receiver<String>>,
+    ocr_test_notice: Option<String>,
     /// 单文件体积上限(MB;settings.max_file_mb,设置页 DragValue)
     max_file_mb: u64,
     /// 是否持久化 Markdown 中间稿(settings.save_markdown,设置页复选框)
@@ -496,6 +502,11 @@ impl RsouApp {
             maintain_inconsistent: false,
             confirm_clear: false,
             settings_notice: None,
+            settings_tab: page_settings::SettingsTab::default(),
+            ocr_url_input: rsou_lib::ocr::DEFAULT_BASE_URL.to_owned(),
+            ocr_settings_notice: None,
+            ocr_test_rx: None,
+            ocr_test_notice: None,
             max_file_mb: rsou_lib::repo::DEFAULT_MAX_FILE_MB,
             save_markdown: rsou_lib::repo::DEFAULT_SAVE_MARKDOWN,
             dict_report: DictReport::default(),
@@ -518,7 +529,7 @@ impl RsouApp {
         match page {
             Page::Library => self.import_active,
             Page::Search => self.search_active,
-            Page::Settings => self.maintenance_active,
+            Page::Settings => self.maintenance_active || self.ocr_test_rx.is_some(),
         }
     }
 
@@ -529,6 +540,7 @@ impl RsouApp {
             || self.maintenance_active
             || self.preview_worker.is_some()
             || self.preview_pending.is_some()
+            || self.ocr_test_rx.is_some()
     }
 }
 

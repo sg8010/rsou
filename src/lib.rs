@@ -9,6 +9,7 @@ pub mod filebrowser;
 pub mod import;
 pub mod maintain;
 pub mod normalize;
+pub mod ocr;
 pub mod parse;
 pub mod query;
 pub mod repo;

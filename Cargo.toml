@@ -99,6 +99,9 @@ rayon = "1"
 jieba-rs = { version = "0.11", default-features = false, features = ["default-dict"], optional = true }
 anyhow = "1"
 log = "0.4"
+# 本地 OCR HTTP 接口,不引入系统 TLS 依赖。
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart"] }
+serde_json = "1"
 
 [dev-dependencies]
 # 测试 fixture 用的最小 docx/pptx/xlsx/odt/epub 包都是手写的 zip。

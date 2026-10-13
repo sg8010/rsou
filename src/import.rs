@@ -31,6 +31,8 @@ pub use crate::repo::ImportCounts;
 pub struct ImportOptions {
     /// 单文件字节上限(默认 100 MiB)
     pub max_file_bytes: u64,
+    /// 显式 OCR 批次:只处理库中 NEEDS_OCR 的失败 PDF,普通导入为 None。
+    pub ocr_base_url: Option<String>,
     /// true = 忽略 hash/mtime 跳过,全部重解析
     pub force: bool,
     /// 重新扫描时也跳过未变化的失败文件;force 优先。
@@ -43,6 +45,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             max_file_bytes: 100 * 1024 * 1024,
+            ocr_base_url: None,
             force: false,
             skip_unchanged_failed: false,
             preserve_source_root: false,
@@ -52,6 +55,8 @@ impl Default for ImportOptions {
 
 /// 导入进度事件(写库线程逐条发给调用方)。
 pub enum ImportEvent {
+    /// 批次无法启动或写库失败。
+    Error { message: String },
     /// 扫描完成,确定了文件总数
     Scanned { total: usize },
     /// 一个文件处理完毕
@@ -147,6 +152,7 @@ struct Existing {
     content_hash: String,
     parsed: bool,
     source_root: Option<String>,
+    needs_ocr: bool,
 }
 
 /// worker 产出的单文件结果(内部消息;公开事件是 FileOutcome)。
@@ -175,7 +181,31 @@ pub fn run_import(
     let mut conn = crate::store::open(db_path, crate::store::OpenMode::ReadWrite)
         .context("导入前打开索引库失败")?;
 
-    let files = scan_paths(&inputs);
+    let existing = load_existing(&conn)?;
+    let ocr = options
+        .ocr_base_url
+        .as_deref()
+        .map(crate::ocr::Client::new)
+        .transpose()?;
+    let mut options = options;
+    let files = if ocr.is_some() {
+        options.force = true;
+        options.preserve_source_root = true;
+        // 以库中当前状态为准,防止 GUI 缓存过期后重写已成功的文档。
+        let requested: HashSet<_> = inputs
+            .iter()
+            .map(|p| dunce::canonicalize(p).unwrap_or_else(|_| absolute(p)))
+            .collect();
+        let mut files: Vec<_> = existing
+            .iter()
+            .filter(|(path, prior)| prior.needs_ocr && requested.contains(&PathBuf::from(path)))
+            .map(|(path, _)| PathBuf::from(path))
+            .collect();
+        files.sort();
+        files
+    } else {
+        scan_paths(&inputs)
+    };
     on_event(ImportEvent::Scanned { total: files.len() });
 
     let now = repo::now_ms();
@@ -198,9 +228,6 @@ pub fn run_import(
     // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
     seed_items(&mut conn, run_id, &files, now)?;
 
-    // 跳过判定用的一次性快照(读已有记录,不逐个查库)。
-    let existing = load_existing(&conn)?;
-
     let mut counts = ImportCounts {
         total: files.len(),
         ..ImportCounts::default()
@@ -218,16 +245,32 @@ pub fn run_import(
     // Receiver/回调/连接都不需要跨线程。
     std::thread::scope(|scope| {
         scope.spawn(move || {
-            files.par_iter().for_each(|path| {
+            let process = |path: &PathBuf| {
                 if cancel_ref.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = process_file(path, options_ref, existing_ref, source_root_ref);
+                let result = process_file(
+                    path,
+                    options_ref,
+                    existing_ref,
+                    source_root_ref,
+                    ocr.as_ref(),
+                    cancel_ref,
+                );
+                // OCR 可在轮询间取消,取消不覆盖原失败原因。
+                if ocr.is_some() && cancel_ref.load(Ordering::Relaxed) {
+                    return;
+                }
                 if tx.send(result).is_err() {
-                    // 消费者已退出(写库出错),直接收工。
                     cancel_ref.store(true, Ordering::Relaxed);
                 }
-            });
+            };
+            if ocr.is_some() {
+                // 服务端自行并行处理页面;客户端逐文档提交,避免挤爆队列。
+                files.iter().for_each(process);
+            } else {
+                files.par_iter().for_each(process);
+            }
         });
 
         // 调用线程做消费者:写库串行。收到一条就开事务;通道里紧随其后
@@ -312,7 +355,7 @@ fn seed_items(
 /// 一次读出 `canonical_path → 已有记录` 的映射(worker 的跳过判定用)。
 fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, Existing>> {
     let mut stmt = conn.prepare(
-        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root \
+        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root, parse_error_code, file_type \
          FROM documents",
     )?;
     let map = stmt
@@ -326,6 +369,9 @@ fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, 
                     content_hash: row.get(4)?,
                     parsed: row.get::<_, String>(5)? == "parsed",
                     source_root: row.get(6)?,
+                    needs_ocr: row.get::<_, String>(5)? == "failed"
+                        && row.get::<_, Option<String>>(7)?.as_deref() == Some("NEEDS_OCR")
+                        && row.get::<_, String>(8)? == "pdf",
                 },
             ))
         })?
@@ -340,6 +386,8 @@ fn process_file(
     options: &ImportOptions,
     existing: &HashMap<String, Existing>,
     source_root: Option<&str>,
+    ocr: Option<&crate::ocr::Client>,
+    cancel: &AtomicBool,
 ) -> FileResult {
     // scan_paths 已统一为规范化路径。重试沿用原归属,显式目录输入仍优先。
     let source_root = source_root.or_else(|| {
@@ -425,7 +473,11 @@ fn process_file(
         };
     }
 
-    let result = parse::parse_bytes(path, &bytes).and_then(|parsed| build_document(&meta, parsed));
+    let result = match ocr {
+        Some(client) => client.parse_pdf(bytes, cancel),
+        None => parse::parse_bytes(path, &bytes),
+    }
+    .and_then(|parsed| build_document(&meta, parsed));
     FileResult::Done { meta, hash, result }
 }
 

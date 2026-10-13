@@ -151,11 +151,22 @@ impl RsouApp {
             let mut cancel = false;
             Self::card(ui, |ui| {
                 ui.horizontal(|ui| {
-                    Self::card_title(ui, "正在导入");
+                    Self::card_title(
+                        ui,
+                        if self.import_progress.is_ocr {
+                            "正在 OCR"
+                        } else {
+                            "正在导入"
+                        },
+                    );
                     ui.label(
-                        egui::RichText::new("解析在后台线程并行,写库串行")
-                            .size(12.0)
-                            .color(Self::text_muted()),
+                        egui::RichText::new(if self.import_progress.is_ocr {
+                            "识别完成后自动加入全文索引"
+                        } else {
+                            "正在解析文档并建立全文索引"
+                        })
+                        .size(12.0)
+                        .color(Self::text_muted()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if Self::small_secondary_button(ui, None, "取消", 72.0, true).clicked() {
@@ -942,6 +953,17 @@ impl RsouApp {
         let mut counts = [0_usize; FailureCategory::ALL.len()];
         for doc in &self.failed_documents {
             counts[FailureCategory::from_code(doc.parse_error_code.as_deref()) as usize] += 1;
+        }
+        let ocr_count = counts[FailureCategory::NeedsOcr as usize];
+        if ui
+            .add_enabled(
+                !busy && ocr_count > 0,
+                egui::Button::new(format!("全部 OCR（{ocr_count}）")),
+            )
+            .on_hover_text("识别全部“需要 OCR”的失败文档,成功后自动加入全文索引。")
+            .clicked()
+        {
+            self.start_ocr(ui.ctx());
         }
         let previous_filter = self.failure_filter;
         // 重试成功或移除后,所选类别消失则回到全部。
