@@ -110,9 +110,30 @@ impl Client {
             .post(format!("{}/api/ocr/pdf", self.base_url))
             .multipart(multipart::Form::new().part("file", part))
             .send()
-            .and_then(|r| r.error_for_status())
-            .and_then(|r| r.json::<Value>())
             .map_err(|e| failure("OCR 提交失败,请检查服务后重试", e))?;
+        // 页数限制由服务配置决定，不在客户端硬编码 1000 页，也不截断或自动分片。
+        // 先读取错误正文，避免 error_for_status 丢失 422 的中文 detail。
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                let error: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                return Err(failure(
+                    error["detail"]
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or("OCR 提交被拒绝，请检查 PDF 页数上限或文件有效性"),
+                    format!("HTTP {status}"),
+                ));
+            }
+            return Err(failure(
+                "OCR 提交失败,请检查服务后重试",
+                format!("HTTP {status}: {body}"),
+            ));
+        }
+        let response = response
+            .json::<Value>()
+            .map_err(|e| failure("OCR 提交响应不是有效的 JSON", e))?;
         let id = response["job_id"]
             .as_str()
             .filter(|s| {
@@ -135,18 +156,25 @@ impl Client {
                 .and_then(|r| r.json::<Value>())
                 .map_err(|e| failure("OCR 查询失败,请检查服务后重试", e))?;
             check()?;
+            // 新契约:done 或 complete=true 即完整，不要求服务同时提供两个字段。
+            if result["status"] == "done" || result["complete"] == true {
+                return completed(&result);
+            }
             match result["status"].as_str() {
                 Some("pending" | "running") => {
                     // 兼容立即返回的服务,避免忙轮询。
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Some("done") => return completed(&result),
-                Some("partial" | "timeout" | "failed") => {
+                Some("partial") => {
+                    return Err(failure(
+                        "OCR 存在识别失败页，可重新识别",
+                        result["error"].as_str().unwrap_or("部分页面识别失败"),
+                    ));
+                }
+                Some("timeout" | "failed") => {
                     return Err(failure(
                         "OCR 未完整成功,可重新识别",
-                        result["error"]
-                            .as_str()
-                            .unwrap_or("存在失败页、缺页或任务超时"),
+                        result["error"].as_str().unwrap_or("任务失败或超时"),
                     ));
                 }
                 _ => return Err(failure("OCR 服务返回未知任务状态", "")),
@@ -156,9 +184,6 @@ impl Client {
 }
 
 fn completed(result: &Value) -> Result<Parsed, ParseError> {
-    if result["complete"] != true || result["truncated"] != false {
-        return Err(failure("OCR 结果不完整,可重新识别", ""));
-    }
     let markdown = result["markdown"].as_str().unwrap_or_default();
     if crate::text::markdown_to_plain(markdown)
         .text
