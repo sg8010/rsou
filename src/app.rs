@@ -147,9 +147,18 @@ pub(crate) fn file_name_matches(file_name: &str, filter: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingConfirm {
     /// 移除单个文档
-    RemoveDocument { id: i64, label: String },
+    RemoveDocument {
+        id: i64,
+        label: String,
+    },
     /// 移除整个文件夹(连同其下全部文档的索引)
-    RemoveFolder { root: String, doc_count: usize },
+    RemoveFolder {
+        root: String,
+        doc_count: usize,
+    },
+    ClearMissing {
+        doc_count: usize,
+    },
 }
 
 /// 导入进度(界面展示用)。
@@ -225,6 +234,8 @@ pub(crate) enum MaintainKind {
     Optimize,
     /// 清掉存量 Markdown 原文并压缩索引文件
     ClearMarkdown,
+    /// 复核并清除原文件不存在的库记录
+    ClearMissing,
     Clear,
 }
 

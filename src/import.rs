@@ -39,6 +39,8 @@ pub struct ImportOptions {
     pub skip_unchanged_failed: bool,
     /// 单文件重试/更新时保留已有文件夹归属,不把它改成单独文件。
     pub preserve_source_root: bool,
+    /// 增量更新时核对本次输入范围内的原文件，标记明确不存在的文档。
+    pub detect_missing: bool,
 }
 
 impl Default for ImportOptions {
@@ -49,6 +51,7 @@ impl Default for ImportOptions {
             force: false,
             skip_unchanged_failed: false,
             preserve_source_root: false,
+            detect_missing: false,
         }
     }
 }
@@ -153,10 +156,15 @@ struct Existing {
     parsed: bool,
     source_root: Option<String>,
     needs_ocr: bool,
+    file_missing: bool,
 }
 
 /// worker 产出的单文件结果(内部消息;公开事件是 FileOutcome)。
 enum FileResult {
+    Missing {
+        path: PathBuf,
+        document_id: i64,
+    },
     /// 按 mtime/size 或 hash 判定未变更;touch = 需要回写新的 size/mtime
     Skipped {
         meta: FileMeta,
@@ -188,7 +196,7 @@ pub fn run_import(
         .map(crate::ocr::Client::new)
         .transpose()?;
     let mut options = options;
-    let files = if ocr.is_some() {
+    let mut files = if ocr.is_some() {
         options.force = true;
         options.preserve_source_root = true;
         // 以库中当前状态为准,防止 GUI 缓存过期后重写已成功的文档。
@@ -206,6 +214,14 @@ pub fn run_import(
     } else {
         scan_paths(&inputs)
     };
+    let missing = if options.detect_missing && ocr.is_none() {
+        collect_missing(&inputs, &existing, &cancel)?
+    } else {
+        HashMap::new()
+    };
+    files.extend(missing.keys().cloned());
+    files.sort();
+    files.dedup();
     on_event(ImportEvent::Scanned { total: files.len() });
 
     let now = repo::now_ms();
@@ -249,14 +265,21 @@ pub fn run_import(
                 if cancel_ref.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = process_file(
-                    path,
-                    options_ref,
-                    existing_ref,
-                    source_root_ref,
-                    ocr.as_ref(),
-                    cancel_ref,
-                );
+                let result = if let Some(&document_id) = missing.get(path) {
+                    FileResult::Missing {
+                        path: path.clone(),
+                        document_id,
+                    }
+                } else {
+                    process_file(
+                        path,
+                        options_ref,
+                        existing_ref,
+                        source_root_ref,
+                        ocr.as_ref(),
+                        cancel_ref,
+                    )
+                };
                 // OCR 可在轮询间取消,取消不覆盖原失败原因。
                 if ocr.is_some() && cancel_ref.load(Ordering::Relaxed) {
                     return;
@@ -338,6 +361,47 @@ fn classify_inputs(inputs: &[PathBuf]) -> (&'static str, Option<PathBuf>) {
     }
 }
 
+/// 不用扫描差集判断删除:被跳过的目录、权限错误都不能作为删除证据。
+fn collect_missing(
+    inputs: &[PathBuf],
+    existing: &HashMap<String, Existing>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<HashMap<PathBuf, i64>> {
+    let mut scopes = Vec::new();
+    for input in inputs {
+        let normalized = dunce::canonicalize(input).unwrap_or_else(|_| absolute(input));
+        let known_root = existing.values().any(|prior| {
+            prior.source_root.as_deref() == Some(normalized.to_string_lossy().as_ref())
+        });
+        let is_dir = match std::fs::metadata(&normalized) {
+            Ok(meta) => meta.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !known_root => false,
+            Err(error) => {
+                return Err(error).with_context(|| format!("更新路径不可用: {}", input.display()));
+            }
+        };
+        if known_root && !is_dir {
+            anyhow::bail!("来源文件夹不可用: {}", input.display());
+        }
+        scopes.push((normalized, is_dir));
+    }
+    let mut missing = HashMap::new();
+    for (path, prior) in existing {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let path = Path::new(path);
+        if scopes
+            .iter()
+            .any(|(input, is_dir)| path == input || (*is_dir && path.starts_with(input)))
+            && repo::original_file_missing(path, prior.source_root.as_deref())?
+        {
+            missing.insert(path.to_path_buf(), prior.id);
+        }
+    }
+    Ok(missing)
+}
+
 fn seed_items(
     conn: &mut rusqlite::Connection,
     run_id: i64,
@@ -372,6 +436,8 @@ fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, 
                     needs_ocr: row.get::<_, String>(5)? == "failed"
                         && row.get::<_, Option<String>>(7)?.as_deref() == Some("NEEDS_OCR")
                         && row.get::<_, String>(8)? == "pdf",
+                    file_missing: row.get::<_, Option<String>>(7)?.as_deref()
+                        == Some("FILE_MISSING"),
                 },
             ))
         })?
@@ -419,6 +485,18 @@ fn process_file(
             };
         }
         Err(error) => {
+            if options.detect_missing
+                && let Some(prior) = existing.get(path.to_string_lossy().as_ref())
+                && matches!(
+                    repo::original_file_missing(path, prior.source_root.as_deref()),
+                    Ok(true)
+                )
+            {
+                return FileResult::Missing {
+                    path: path.to_path_buf(),
+                    document_id: prior.id,
+                };
+            }
             return FileResult::Done {
                 meta: dummy_meta(path, source_root),
                 hash: String::new(),
@@ -436,6 +514,7 @@ fn process_file(
     // 一级跳过:size 与 mtime 都未变,不读文件。
     if !options.force
         && let Some(prior) = prior
+        && !prior.file_missing
         && (prior.parsed || options.skip_unchanged_failed)
         && prior.file_size == meta.file_size as i64
         && prior.file_mtime_ms == meta.file_mtime_ms
@@ -451,6 +530,18 @@ fn process_file(
     let bytes = match parse::read_file(path, options.max_file_bytes) {
         Ok(bytes) => bytes,
         Err(error) => {
+            if options.detect_missing
+                && let Some(prior) = prior
+                && matches!(
+                    repo::original_file_missing(path, prior.source_root.as_deref()),
+                    Ok(true)
+                )
+            {
+                return FileResult::Missing {
+                    path: path.to_path_buf(),
+                    document_id: prior.id,
+                };
+            }
             return FileResult::Done {
                 meta,
                 hash: String::new(),
@@ -463,6 +554,7 @@ fn process_file(
     // 二级跳过:元数据变了但内容哈希相同 → 只更新 size/mtime。
     if !options.force
         && let Some(prior) = prior
+        && !prior.file_missing
         && (prior.parsed || options.skip_unchanged_failed)
         && prior.content_hash == hash
     {
@@ -554,6 +646,37 @@ fn consume(
 ) -> anyhow::Result<(PathBuf, FileOutcome)> {
     let now = repo::now_ms();
     let (path, outcome) = match msg {
+        FileResult::Missing { path, document_id } => {
+            let marked = repo::mark_file_missing_in(conn, document_id, now)?;
+            let (status, code, message, outcome) = if marked {
+                counts.failed += 1;
+                let code = parse::ParseErrorCode::FileMissing.as_str();
+                let message = "原文件不存在（可能已删除或移动）";
+                (
+                    "failed",
+                    Some(code),
+                    Some(message),
+                    FileOutcome::Failed {
+                        code: code.to_owned(),
+                        message: message.to_owned(),
+                    },
+                )
+            } else {
+                counts.skipped += 1;
+                ("skipped", None, None, FileOutcome::Skipped)
+            };
+            repo::upsert_item(
+                conn,
+                run_id,
+                &path,
+                status,
+                code,
+                message,
+                Some(document_id),
+                now,
+            )?;
+            (path, outcome)
+        }
         FileResult::Skipped {
             meta,
             document_id,

@@ -155,6 +155,7 @@ impl RsouApp {
             ImportOptions {
                 skip_unchanged_failed: true,
                 preserve_source_root: true,
+                detect_missing: true,
                 ..Default::default()
             },
         );
@@ -697,6 +698,10 @@ impl RsouApp {
                             }),
                         MaintainKind::Clear => maintain::clear_all(&mut conn)
                             .map(|()| ("资料库已清空".to_owned(), false)),
+                        MaintainKind::ClearMissing => repo::delete_missing_documents(&mut conn)
+                            .map(|(deleted, retained)| (format!(
+                                "已清除 {deleted} 篇原文件不存在的文档；保留 {retained} 篇已恢复或无法确认的文档"
+                            ), false)),
                     });
                 let (result, inconsistent) = match result {
                     Ok((message, inconsistent)) => (Ok(message), inconsistent),
@@ -722,6 +727,12 @@ impl RsouApp {
                 self.maintain_progress = None;
                 let result = Err(format!("无法启动维护线程: {error}"));
                 self.finish_fts_maintenance(kind, &result);
+                if matches!(kind, MaintainKind::ClearMissing) {
+                    self.library_notice = Some(match &result {
+                        Ok(message) => message.clone(),
+                        Err(error) => format!("清除不存在文档失败: {error}"),
+                    });
+                }
                 self.maintain_result = Some(result);
             }
         }
@@ -792,6 +803,13 @@ impl RsouApp {
                 self.finish_fts_maintenance(kind, &result);
                 self.maintain_result = Some(result);
                 self.maintain_inconsistent = inconsistent;
+                if matches!(kind, MaintainKind::ClearMissing) {
+                    self.library_notice =
+                        self.maintain_result.as_ref().map(|result| match result {
+                            Ok(message) => message.clone(),
+                            Err(error) => format!("清除不存在文档失败: {error}"),
+                        });
+                }
                 self.refresh_index_stats();
                 // 清空后文档列表必须跟着空;重建/优化后也顺手刷新,成本一样。
                 if !matches!(kind, MaintainKind::Check) {

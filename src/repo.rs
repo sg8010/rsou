@@ -480,6 +480,72 @@ pub fn delete_document(conn: &mut Connection, id: i64) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 只把明确的 NotFound 当作不存在;来源根目录不可用时不能推断文件被删除。
+pub fn original_file_missing(path: &Path, source_root: Option<&str>) -> anyhow::Result<bool> {
+    if let Some(root) = source_root {
+        let meta = std::fs::metadata(root)
+            .with_context(|| format!("来源文件夹不可用，无法核对原文件: {root}"))?;
+        if !meta.is_dir() {
+            bail!("来源文件夹已不是目录，无法核对原文件: {root}");
+        }
+    }
+    match std::fs::metadata(path) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).with_context(|| format!("无法核对原文件: {}", path.display())),
+    }
+}
+
+/// 事务内标记不存在:保留正文、分块和元数据，只撤下全文索引。
+/// 写入前复核路径;原文件已经恢复则不标记。
+pub fn mark_file_missing_in(conn: &Connection, id: i64, now_ms: i64) -> anyhow::Result<bool> {
+    let doc = get_documents_by_ids(conn, &[id])?
+        .remove(&id)
+        .context("待标记的文档不存在")?;
+    if !original_file_missing(Path::new(&doc.path), doc.source_root.as_deref())? {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM documents_fts WHERE rowid = ?1", params![id])?;
+    conn.execute(
+        "UPDATE documents SET parse_status = 'failed', parse_error_code = 'FILE_MISSING', \
+         parse_error_message = '原文件不存在（可能已删除或移动）', indexed_at = NULL, updated_at = ?2 \
+         WHERE id = ?1",
+        params![id, now_ms],
+    )?;
+    Ok(true)
+}
+
+/// 批量清除标记不存在的库记录。复核时已恢复或无法确认的文档保留。
+/// 返回 (删除数, 保留数);绝不删除磁盘文件。
+pub fn delete_missing_documents(conn: &mut Connection) -> anyhow::Result<(usize, usize)> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let candidates: Vec<_> = list_failed_documents(&tx)?
+        .into_iter()
+        .filter(|doc| doc.parse_error_code.as_deref() == Some("FILE_MISSING"))
+        .collect();
+    let mut deleted = 0;
+    let mut retained = 0;
+    for doc in candidates {
+        if !matches!(
+            original_file_missing(Path::new(&doc.path), doc.source_root.as_deref()),
+            Ok(true)
+        ) {
+            retained += 1;
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM documents_fts WHERE rowid = ?1",
+            params![doc.id],
+        )?;
+        deleted += tx.execute(
+            "DELETE FROM documents WHERE id = ?1 AND parse_status = 'failed' AND parse_error_code = 'FILE_MISSING'",
+            params![doc.id],
+        )?;
+    }
+    tx.commit().context("提交清除不存在文档事务失败")?;
+    Ok((deleted, retained))
+}
+
 /// 移除一个「已添加文件夹」及其**全部**归属文档(按 source_root 精确匹配)。
 /// 返回删除的文档数。
 ///

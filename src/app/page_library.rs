@@ -16,6 +16,7 @@ pub(super) enum FailureCategory {
     Malformed,
     ResourceLimit,
     NeedsOcr,
+    FileMissing,
     Io,
     TooLarge,
     Empty,
@@ -23,12 +24,13 @@ pub(super) enum FailureCategory {
 }
 
 impl FailureCategory {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Unsupported,
         Self::Encrypted,
         Self::Malformed,
         Self::ResourceLimit,
         Self::NeedsOcr,
+        Self::FileMissing,
         Self::Io,
         Self::TooLarge,
         Self::Empty,
@@ -43,6 +45,7 @@ impl FailureCategory {
             Self::Malformed => Some(Code::Malformed),
             Self::ResourceLimit => Some(Code::ResourceLimit),
             Self::NeedsOcr => Some(Code::NeedsOcr),
+            Self::FileMissing => Some(Code::FileMissing),
             Self::Io => Some(Code::Io),
             Self::TooLarge => Some(Code::TooLarge),
             Self::Empty => Some(Code::Empty),
@@ -64,6 +67,7 @@ impl FailureCategory {
             Self::Malformed => "文件损坏",
             Self::ResourceLimit => "资源限制",
             Self::NeedsOcr => "需要 OCR",
+            Self::FileMissing => "原文件不存在",
             Self::Io => "读写错误",
             Self::TooLarge => "文件过大",
             Self::Empty => "内容为空",
@@ -258,6 +262,13 @@ impl RsouApp {
                     + "只删除本程序建的索引记录,磁盘上的文件与文件夹都不会被删除。",
                 format!("确认移除({doc_count} 篇)"),
             ),
+            PendingConfirm::ClearMissing { doc_count } => (
+                "清除不存在的文档",
+                format!(
+                    "确定要清除 {doc_count} 篇原文件不存在的文档吗？\n\n只删除库内记录及正文，不删除磁盘文件。清除前会复核路径，保留已恢复或无法确认的文档。"
+                ),
+                format!("确认清除({doc_count} 篇)"),
+            ),
         };
 
         egui::Modal::new(egui::Id::new("rsou-remove-confirm")).show(ctx, |ui| {
@@ -297,6 +308,9 @@ impl RsouApp {
             match pending {
                 PendingConfirm::RemoveDocument { id, .. } => self.delete_document(id),
                 PendingConfirm::RemoveFolder { root, .. } => self.delete_folder(&root),
+                PendingConfirm::ClearMissing { .. } => {
+                    self.start_maintain(ctx, MaintainKind::ClearMissing)
+                }
             }
         } else if cancel {
             self.pending_confirm = None;
@@ -441,8 +455,13 @@ impl RsouApp {
                                     .color(Self::success()),
                             );
                         } else {
+                            let status = if doc.parse_error_code.as_deref() == Some("FILE_MISSING") {
+                                "原文件不存在"
+                            } else {
+                                "失败"
+                            };
                             let label = ui.label(
-                                egui::RichText::new("失败").size(12.0).color(Self::danger()),
+                                egui::RichText::new(status).size(12.0).color(Self::danger()),
                             );
                             if let Some(message) = &doc.parse_error_message {
                                 label.on_hover_text(message);
@@ -468,7 +487,7 @@ impl RsouApp {
                             if ui
                                 .add_enabled_ui(!busy, |ui| Self::link_button(ui, "增量更新"))
                                 .inner
-                                .on_hover_text("只处理新增或修改的文件，跳过未变化的成功及失败文件")
+                                .on_hover_text("更新新增或修改的文件，标记原文件不存在的文档；跳过其他未变化文件")
                                 .clicked()
                             {
                                 action = Some(RowAction::Rescan(PathBuf::from(&doc.path)));
@@ -729,7 +748,7 @@ impl RsouApp {
                                                             RsouApp::link_button(ui, "增量更新")
                                                         })
                                                         .inner
-                                                        .on_hover_text("递归扫描，只处理新增或修改的文件，跳过未变化的成功及失败文件")
+                                                        .on_hover_text("递归更新新增或修改的文件，标记原文件不存在的文档；跳过其他未变化文件")
                                                         .clicked()
                                                     {
                                                         *folder_slot_in.borrow_mut() = Some(
@@ -767,6 +786,11 @@ impl RsouApp {
                                     let name = document.file_name.clone();
                                     let path = document.path.clone();
                                     let status_ok = document.parse_status == "parsed";
+                                    let failure_label = if document.parse_error_code.as_deref() == Some("FILE_MISSING") {
+                                        "原文件不存在"
+                                    } else {
+                                        "失败"
+                                    };
                                     let busy_here = busy;
                                     // label_ui 的闭包按值捕获,而闭包结束后还要读结果,
                                     // 所以用 Rc<RefCell> 共享槽位。
@@ -797,7 +821,7 @@ impl RsouApp {
                                                     if !status_ok {
                                                         ui.add(
                                                             egui::Label::new(
-                                                                egui::RichText::new("失败")
+                                                                egui::RichText::new(failure_label)
                                                                     .size(11.0)
                                                                     .color(RsouApp::danger()),
                                                             )
@@ -955,6 +979,21 @@ impl RsouApp {
             counts[FailureCategory::from_code(doc.parse_error_code.as_deref()) as usize] += 1;
         }
         let ocr_count = counts[FailureCategory::NeedsOcr as usize];
+        let missing_count = counts[FailureCategory::FileMissing as usize];
+        if ui
+            .add_enabled(
+                !busy && missing_count > 0,
+                egui::Button::new(format!("一键清除不存在文档（{missing_count}）")),
+            )
+            .on_hover_text(
+                "只清除原文件不存在的库记录；保留已恢复或无法确认的文档，不删除磁盘文件。",
+            )
+            .clicked()
+        {
+            self.pending_confirm = Some(PendingConfirm::ClearMissing {
+                doc_count: missing_count,
+            });
+        }
         if ui
             .add_enabled(
                 !busy && ocr_count > 0,
