@@ -143,15 +143,15 @@ impl FileMeta {
 ///
 /// `markdown` 是过程数据:plain/标题/分块都由它派生,但是否落库由
 /// `settings.save_markdown` 决定(见 `save_parsed_in`)。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedDocument {
     pub title: String,
     pub markdown: String,
     pub plain: PlainText,
     pub chunks: Vec<Chunk>,
     pub warnings: Vec<String>,
-    pub parser_name: &'static str,
-    pub parser_version: &'static str,
+    pub parser_name: String,
+    pub parser_version: String,
 }
 
 // ---------- documents 查询 ----------
@@ -266,6 +266,89 @@ pub fn get_plain_text(conn: &Connection, document_id: i64) -> anyhow::Result<Opt
 
 // ---------- 写入 ----------
 
+/// 按 ID 和内容哈希读取可复用产物。调用方用读事务保持各字段的一致性。
+/// 旧库未保存块信息且没有 Markdown 时返回 None,由导入器正常解析。
+pub(crate) fn load_reusable_document(
+    conn: &Connection,
+    id: i64,
+    hash: &str,
+    route: &str,
+    require_markdown: bool,
+) -> anyhow::Result<Option<ParsedDocument>> {
+    let row = conn
+        .query_row(
+            "SELECT d.title, d.parser_name, d.parser_version, c.markdown, c.plain_text, \
+         c.warnings_json, c.blocks_json FROM documents d \
+         JOIN document_contents c ON c.document_id = d.id \
+         WHERE d.id = ?1 AND d.content_hash = ?2 AND d.parse_status = 'parsed' \
+         AND (d.ext = ?3 OR (?3 = 'text' AND d.ext IN ('txt', 'md')))",
+            params![id, hash, route],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((title, parser_name, parser_version, markdown, plain_text, warnings, blocks)) = row
+    else {
+        return Ok(None);
+    };
+    if require_markdown && markdown.is_empty() {
+        return Ok(None);
+    }
+    let plain = if let Some(blocks) = blocks {
+        let blocks: Vec<(usize, usize, Option<u8>)> = serde_json::from_str(&blocks)?;
+        let mut previous_end = 0;
+        for &(start, end, level) in &blocks {
+            if start < previous_end
+                || start >= end
+                || !plain_text.is_char_boundary(start)
+                || !plain_text.is_char_boundary(end)
+                || level.is_some_and(|level| !(1..=6).contains(&level))
+            {
+                bail!("复用文档的纯文本块元数据无效: {id}");
+            }
+            previous_end = end;
+        }
+        PlainText {
+            text: plain_text,
+            blocks: blocks
+                .into_iter()
+                .map(|(start, end, heading_level)| crate::text::Block {
+                    start,
+                    end,
+                    heading_level,
+                })
+                .collect(),
+        }
+    } else if !markdown.is_empty() {
+        let plain = crate::text::markdown_to_plain(&markdown);
+        if plain.text != plain_text {
+            return Ok(None);
+        }
+        plain
+    } else {
+        return Ok(None);
+    };
+    let chunks = crate::chunk::chunk_document(&title, &plain);
+    Ok(Some(ParsedDocument {
+        title,
+        markdown,
+        plain,
+        chunks,
+        warnings: serde_json::from_str(&warnings)?,
+        parser_name,
+        parser_version,
+    }))
+}
+
 /// 已解析文档落库:一个 BEGIN IMMEDIATE 事务写完 documents + contents +
 /// chunks + documents_fts。返回 documents.id。
 pub fn save_parsed(
@@ -297,8 +380,8 @@ pub fn save_parsed_in(
         meta,
         content_hash,
         parsed.title.as_str(),
-        parsed.parser_name,
-        parsed.parser_version,
+        &parsed.parser_name,
+        &parsed.parser_version,
         now_ms,
     )?;
     clear_document_body(conn, id)?;
@@ -311,13 +394,17 @@ pub fn save_parsed_in(
         ""
     };
     conn.execute(
-        "INSERT INTO document_contents(document_id, markdown, plain_text, warnings_json) \
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO document_contents(document_id, markdown, plain_text, warnings_json, blocks_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             id,
             markdown,
             parsed.plain.text,
             warnings_to_json(&parsed.warnings),
+            serde_json::to_string(
+                &parsed.plain.blocks.iter()
+                    .map(|b| (b.start, b.end, b.heading_level)).collect::<Vec<_>>()
+            )?,
         ],
     )
     .context("写入 document_contents 失败")?;
@@ -817,8 +904,8 @@ mod tests {
             plain,
             chunks,
             warnings: Vec::new(),
-            parser_name: "t",
-            parser_version: "t",
+            parser_name: "t".into(),
+            parser_version: "t".into(),
         };
         save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
     }
@@ -1002,8 +1089,8 @@ mod tests {
             plain,
             chunks,
             warnings: Vec::new(),
-            parser_name: "t",
-            parser_version: "t",
+            parser_name: "t".into(),
+            parser_version: "t".into(),
         };
         save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
     }

@@ -359,8 +359,8 @@ mod tests {
             plain,
             chunks,
             warnings: Vec::new(),
-            parser_name: "text",
-            parser_version: "text.v1",
+            parser_name: "text".into(),
+            parser_version: "text.v1".into(),
         };
         repo::save_parsed(conn, &meta, "hash", &parsed, 1_000).unwrap()
     }
@@ -644,8 +644,8 @@ mod tests {
             plain,
             chunks: Vec::new(),
             warnings: Vec::new(),
-            parser_name: "t",
-            parser_version: "t",
+            parser_name: "t".into(),
+            parser_version: "t".into(),
         };
         let id = repo::save_parsed(&mut conn, &meta, "h", &parsed, 1).unwrap();
         assert_eq!(purge_stored_markdown(&conn).unwrap(), 1);

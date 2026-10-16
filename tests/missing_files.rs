@@ -92,6 +92,56 @@ fn missing_marker_retains_body_and_restoration_reindexes_identical_metadata() {
 }
 
 #[test]
+fn duplicate_reuse_preserves_missing_markers_and_restored_locations() {
+    let (db, docs, original) = fixture("missing-duplicates");
+    let missing_copy = docs.join("待恢复副本.txt");
+    std::fs::copy(&original, &missing_copy).unwrap();
+    run(&db, &docs, ImportOptions::default()).unwrap();
+    let conn = store::open(&db, OpenMode::ReadWrite).unwrap();
+    let before = repo::find_document_by_path(&conn, &missing_copy)
+        .unwrap()
+        .unwrap();
+    let body = repo::get_plain_text(&conn, before.id).unwrap();
+    let modified = std::fs::metadata(&missing_copy)
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::remove_file(&missing_copy).unwrap();
+    let new_copy = docs.join("新增副本.txt");
+    std::fs::copy(&original, &new_copy).unwrap();
+
+    // 缓存候选也可能在同批次被标记为不存在,新副本仍必须成功入库。
+    let counts = run(&db, &docs, rescan_options()).unwrap();
+    assert_eq!((counts.ok, counts.failed, counts.skipped), (1, 1, 1));
+    let marked = repo::list_failed_documents(&conn).unwrap().remove(0);
+    assert_eq!(marked.id, before.id);
+    assert_eq!(marked.parse_error_code.as_deref(), Some("FILE_MISSING"));
+    assert_eq!(repo::get_plain_text(&conn, before.id).unwrap(), body);
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+
+    std::fs::copy(&original, &missing_copy).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&missing_copy)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    // 恢复副本即使复用了相同内容,也要解除缺失标记并恢复独立索引。
+    let counts = run(&db, &docs, rescan_options()).unwrap();
+    assert_eq!((counts.ok, counts.failed, counts.skipped), (1, 0, 2));
+    let restored = repo::find_document_by_path(&conn, &missing_copy)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.id, before.id);
+    assert_eq!(restored.source_root, before.source_root);
+    assert_eq!(restored.title, "待恢复副本");
+    assert_eq!(restored.parse_status, "parsed");
+    assert!(restored.parse_error_code.is_none());
+    assert!(repo::list_failed_documents(&conn).unwrap().is_empty());
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+}
+
+#[test]
 fn missing_check_is_scoped_and_single_file_update_works() {
     let (db, docs, file) = fixture("missing-scope");
     let other = docs.parent().unwrap().join("其他.txt");

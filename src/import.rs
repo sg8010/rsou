@@ -11,9 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rayon::prelude::*;
@@ -157,6 +157,130 @@ struct Existing {
     source_root: Option<String>,
     needs_ocr: bool,
     file_missing: bool,
+    ext: String,
+}
+
+/// 文本扩展名共用解析器;其他格式保守地按扩展名隔离,避免兜底路由不同。
+fn parse_route(ext: &str) -> &str {
+    match ext {
+        "txt" | "md" => "text",
+        _ => ext,
+    }
+}
+
+type ReuseEntry = Arc<Mutex<Option<Reusable>>>;
+
+enum Reusable {
+    /// 只保留尚未提交的解析产物,写库成功后释放大文本。
+    Parsed(Arc<ParsedDocument>),
+    Stored(i64),
+}
+
+/// 每个内容键单独加锁,避免同批并发重复解析;不同内容仍可并行。
+/// 只读连接短事务按需加载正文,不预载整个资料库、不长期持有 WAL 快照。
+struct ReuseCache {
+    entries: Mutex<HashMap<(String, String), ReuseEntry>>,
+    reader: Mutex<rusqlite::Connection>,
+    require_markdown: bool,
+}
+
+impl ReuseCache {
+    fn new(
+        db_path: &Path,
+        existing: &HashMap<String, Existing>,
+        require_markdown: bool,
+    ) -> anyhow::Result<Self> {
+        let mut entries: HashMap<_, ReuseEntry> = HashMap::new();
+        for prior in existing
+            .values()
+            .filter(|p| p.parsed && p.content_hash.len() == 64)
+        {
+            let key = (
+                prior.content_hash.clone(),
+                parse_route(&prior.ext).to_owned(),
+            );
+            let entry = entries
+                .entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(None)));
+            let mut state = entry.lock().unwrap();
+            // 优先较新的副本,让升级前缺少块信息的旧记录逐步退出复用候选。
+            if !matches!(*state, Some(Reusable::Stored(id)) if id > prior.id) {
+                *state = Some(Reusable::Stored(prior.id));
+            }
+        }
+        Ok(Self {
+            entries: Mutex::new(entries),
+            reader: Mutex::new(crate::store::open(
+                db_path,
+                crate::store::OpenMode::ReadOnly,
+            )?),
+            require_markdown,
+        })
+    }
+
+    fn resolve(
+        &self,
+        meta: &FileMeta,
+        hash: &str,
+        parse: impl FnOnce() -> Result<ParsedDocument, ParseError>,
+    ) -> (Result<Arc<ParsedDocument>, ParseError>, ReuseEntry) {
+        let route = parse_route(&meta.ext);
+        let entry = self
+            .entries
+            .lock()
+            .unwrap()
+            .entry((hash.to_owned(), route.to_owned()))
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        let mut state = entry.lock().unwrap();
+        let cached = match &*state {
+            Some(Reusable::Parsed(parsed)) => Some(Arc::clone(parsed)),
+            Some(Reusable::Stored(id)) => {
+                let load = || -> anyhow::Result<Option<ParsedDocument>> {
+                    let mut reader = self.reader.lock().unwrap();
+                    let tx = reader.transaction()?;
+                    // 源位置可能也在本批次被更新,必须再次核对哈希与解析状态。
+                    let parsed =
+                        repo::load_reusable_document(&tx, *id, hash, route, self.require_markdown)?;
+                    tx.commit()?;
+                    Ok(parsed)
+                };
+                match load() {
+                    Ok(parsed) => parsed.map(Arc::new),
+                    Err(error) => {
+                        log::warn!("读取重复文件解析缓存失败,回退正常解析: {error:#}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let result = if let Some(parsed) = cached {
+            Ok(parsed)
+        } else {
+            // 不缓存失败;失败副本不能阻止后续文件正常重试。
+            let result = parse().map(Arc::new);
+            *state = result
+                .as_ref()
+                .ok()
+                .map(|p| Reusable::Parsed(Arc::clone(p)));
+            result
+        };
+        drop(state);
+        let result = result.map(|parsed| {
+            let title = text::extract_title(&parsed.plain, &meta.stem());
+            if title == parsed.title {
+                parsed
+            } else {
+                // 无正文标题时使用各自文件名,并重新生成对应的分块标题路径。
+                let mut own = (*parsed).clone();
+                own.title = title;
+                own.chunks = chunk::chunk_document(&own.title, &own.plain);
+                Arc::new(own)
+            }
+        });
+        (result, entry)
+    }
 }
 
 /// worker 产出的单文件结果(内部消息;公开事件是 FileOutcome)。
@@ -174,7 +298,8 @@ enum FileResult {
     Done {
         meta: FileMeta,
         hash: String,
-        result: Result<ParsedDocument, ParseError>,
+        result: Result<Arc<ParsedDocument>, ParseError>,
+        reuse: Option<ReuseEntry>,
     },
 }
 
@@ -222,6 +347,16 @@ pub fn run_import(
     files.extend(missing.keys().cloned());
     files.sort();
     files.dedup();
+    // force(含显式 OCR)保留逐文件重新解析语义,不复用任何旧结果。
+    let reuse = if options.force {
+        None
+    } else {
+        Some(ReuseCache::new(
+            db_path,
+            &existing,
+            repo::save_markdown_enabled(&conn),
+        )?)
+    };
     on_event(ImportEvent::Scanned { total: files.len() });
 
     let now = repo::now_ms();
@@ -257,6 +392,7 @@ pub fn run_import(
     let cancel_ref = &cancel;
     let existing_ref = &existing;
     let source_root_ref = source_root.as_deref();
+    let reuse_ref = reuse.as_ref();
     // 生产者线程跑 rayon 并行解析,消费(写库)留在调用线程:
     // Receiver/回调/连接都不需要跨线程。
     std::thread::scope(|scope| {
@@ -278,6 +414,7 @@ pub fn run_import(
                         source_root_ref,
                         ocr.as_ref(),
                         cancel_ref,
+                        reuse_ref,
                     )
                 };
                 // OCR 可在轮询间取消,取消不覆盖原失败原因。
@@ -419,7 +556,7 @@ fn seed_items(
 /// 一次读出 `canonical_path → 已有记录` 的映射(worker 的跳过判定用)。
 fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, Existing>> {
     let mut stmt = conn.prepare(
-        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root, parse_error_code, file_type \
+        "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root, parse_error_code, file_type, ext \
          FROM documents",
     )?;
     let map = stmt
@@ -438,6 +575,7 @@ fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, 
                         && row.get::<_, String>(8)? == "pdf",
                     file_missing: row.get::<_, Option<String>>(7)?.as_deref()
                         == Some("FILE_MISSING"),
+                    ext: row.get(9)?,
                 },
             ))
         })?
@@ -454,6 +592,7 @@ fn process_file(
     source_root: Option<&str>,
     ocr: Option<&crate::ocr::Client>,
     cancel: &AtomicBool,
+    reuse: Option<&ReuseCache>,
 ) -> FileResult {
     // scan_paths 已统一为规范化路径。重试沿用原归属,显式目录输入仍优先。
     let source_root = source_root.or_else(|| {
@@ -477,6 +616,7 @@ fn process_file(
             return FileResult::Done {
                 meta: dummy_meta(path, source_root),
                 hash: String::new(),
+                reuse: None,
                 result: Err(ParseError {
                     code: parse::ParseErrorCode::Unsupported,
                     message: "无法识别的格式,或该格式无法转换(例如纯图片 PDF)".to_owned(),
@@ -500,6 +640,7 @@ fn process_file(
             return FileResult::Done {
                 meta: dummy_meta(path, source_root),
                 hash: String::new(),
+                reuse: None,
                 result: Err(ParseError {
                     code: parse::ParseErrorCode::Io,
                     message: "无法读取文件(权限/占用/路径失效)".to_owned(),
@@ -545,6 +686,7 @@ fn process_file(
             return FileResult::Done {
                 meta,
                 hash: String::new(),
+                reuse: None,
                 result: Err(error),
             };
         }
@@ -565,12 +707,26 @@ fn process_file(
         };
     }
 
-    let result = match ocr {
-        Some(client) => client.parse_pdf(bytes, cancel),
-        None => parse::parse_bytes(path, &bytes),
+    let parse = || {
+        match ocr {
+            Some(client) => client.parse_pdf(bytes, cancel),
+            None => parse::parse_bytes(path, &bytes),
+        }
+        .and_then(|parsed| build_document(&meta, parsed))
+    };
+    let (result, reuse) = match reuse {
+        Some(cache) => {
+            let (result, entry) = cache.resolve(&meta, &hash, parse);
+            (result, Some(entry))
+        }
+        None => (parse().map(Arc::new), None),
+    };
+    FileResult::Done {
+        meta,
+        hash,
+        result,
+        reuse,
     }
-    .and_then(|parsed| build_document(&meta, parsed));
-    FileResult::Done { meta, hash, result }
 }
 
 /// 元数据读取失败时的占位 FileMeta(只为把错误带回写库线程记 item)。
@@ -601,8 +757,8 @@ fn build_document(meta: &FileMeta, parsed: parse::Parsed) -> Result<ParsedDocume
         plain,
         chunks,
         warnings: parsed.warnings,
-        parser_name: parsed.parser_name,
-        parser_version: parsed.parser_version,
+        parser_name: parsed.parser_name.to_owned(),
+        parser_version: parsed.parser_version.to_owned(),
     })
 }
 
@@ -628,11 +784,27 @@ fn write_batch(
         .context("开启写入事务失败")?;
     let mut counts = counts;
     let mut events = Vec::with_capacity(batch.len());
+    let mut published = Vec::new();
     for msg in batch {
+        let reuse = match &msg {
+            FileResult::Done {
+                reuse,
+                result: Ok(_),
+                ..
+            } => reuse.clone(),
+            _ => None,
+        };
         let (path, outcome) = consume(&tx, run_id, msg, &mut counts)?;
+        if let (Some(entry), FileOutcome::Ok { document_id }) = (reuse, &outcome) {
+            published.push((entry, *document_id));
+        }
         events.push((path, outcome, counts));
     }
     tx.commit().context("提交写入事务失败")?;
+    // 提交后才能把内存产物替换为 ID,否则读连接会看不到尚未提交的正文。
+    for (entry, id) in published {
+        *entry.lock().unwrap() = Some(Reusable::Stored(id));
+    }
     Ok((counts, events))
 }
 
@@ -698,7 +870,9 @@ fn consume(
             counts.skipped += 1;
             (meta.path.clone(), FileOutcome::Skipped)
         }
-        FileResult::Done { meta, hash, result } => match result {
+        FileResult::Done {
+            meta, hash, result, ..
+        } => match result {
             Ok(parsed) => {
                 let id = repo::save_parsed_in(conn, &meta, &hash, &parsed, now)?;
                 repo::upsert_item(conn, run_id, &meta.path, "ok", None, None, Some(id), now)?;
@@ -765,12 +939,164 @@ mod tests {
         FileResult::Done {
             meta,
             hash: hash.to_owned(),
-            result: Ok(parsed),
+            result: Ok(Arc::new(parsed)),
+            reuse: None,
         }
     }
 
     fn row_count(conn: &rusqlite::Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn test_cache() -> (PathBuf, rusqlite::Connection, ReuseCache) {
+        let dir = std::env::temp_dir().join(format!(
+            "rsou-reuse-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = dir.join("index.sqlite3");
+        let conn = store::open(&path, store::OpenMode::ReadWrite).unwrap();
+        let cache = ReuseCache::new(&path, &load_existing(&conn).unwrap(), false).unwrap();
+        (path, conn, cache)
+    }
+
+    fn parsed_text(meta: &FileMeta, markdown: &str) -> ParsedDocument {
+        build_document(
+            meta,
+            parse::Parsed {
+                markdown: markdown.to_owned(),
+                warnings: Vec::new(),
+                parser_name: "text",
+                parser_version: "text.v1",
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn concurrent_duplicates_parse_once_but_different_routes_stay_separate() {
+        let (_path, _conn, cache) = test_cache();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            (0..32).into_par_iter().for_each(|i| {
+                let meta = file_meta(&format!("/d/{i}.{}", if i % 2 == 0 { "txt" } else { "md" }));
+                let (parsed, _) = cache.resolve(&meta, "same-hash", || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    Ok(parsed_text(&meta, "# 正文标题\n\n正文"))
+                });
+                assert_eq!(parsed.unwrap().title, "正文标题");
+            });
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let meta = file_meta("/d/a.csv");
+        cache
+            .resolve(&meta, "same-hash", || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(parsed_text(&meta, "不同解析路由"))
+            })
+            .0
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn committed_duplicates_release_memory_and_reuse_persisted_blocks() {
+        let (path, mut conn, cache) = test_cache();
+        let hash = "a".repeat(64);
+        let source = file_meta("/d/原件.txt");
+        let (parsed, entry) = cache.resolve(&source, &hash, || {
+            Ok(parsed_text(&source, "### 原件\n\n正文"))
+        });
+        let parsed = parsed.unwrap();
+        let weak = Arc::downgrade(&parsed);
+        let run_id = repo::create_run(&conn, "files", None, 1, 1_000).unwrap();
+        write_batch(
+            &mut conn,
+            run_id,
+            vec![FileResult::Done {
+                meta: source,
+                hash: hash.clone(),
+                result: Ok(parsed),
+                reuse: Some(entry.clone()),
+            }],
+            ImportCounts::default(),
+        )
+        .unwrap();
+        assert!(matches!(*entry.lock().unwrap(), Some(Reusable::Stored(_))));
+        assert!(weak.upgrade().is_none(), "提交后不能一直缓存大文本");
+
+        let copy = file_meta("/d/副本.md");
+        // 覆盖同批提交后复用和重新启动导入后的跨批复用。
+        let reopened = ReuseCache::new(&path, &load_existing(&conn).unwrap(), false).unwrap();
+        for cache in [&cache, &reopened] {
+            let (parsed, _) = cache.resolve(&copy, &hash, || panic!("相同内容不应再解析"));
+            let parsed = parsed.unwrap();
+            assert_eq!(parsed.title, "副本");
+            assert_eq!(parsed.plain.text, "原件\n\n正文");
+            assert_eq!(parsed.chunks[0].context_header, "副本 › 原件");
+            assert_eq!(parsed.parser_name, "text");
+        }
+        let stored_id = match *entry.lock().unwrap() {
+            Some(Reusable::Stored(id)) => id,
+            _ => unreachable!(),
+        };
+        conn.execute(
+            "UPDATE documents SET content_hash = 'changed' WHERE id = ?1",
+            [stored_id],
+        )
+        .unwrap();
+        let (parsed, _) = cache.resolve(&copy, &hash, || Ok(parsed_text(&copy, "回退重新解析")));
+        assert_eq!(
+            parsed.unwrap().plain.text,
+            "回退重新解析",
+            "源记录被更新后不能复用旧哈希"
+        );
+    }
+
+    #[test]
+    fn failures_are_not_cached_and_rollback_does_not_publish_ids() {
+        let (_path, mut conn, cache) = test_cache();
+        let meta = file_meta("/d/甲.txt");
+        let (result, _) = cache.resolve(&meta, "hash", || {
+            Err(ParseError {
+                code: parse::ParseErrorCode::Empty,
+                message: "空文件".into(),
+                detail: String::new(),
+            })
+        });
+        assert!(result.is_err());
+        let (result, entry) = cache.resolve(&meta, "hash", || Ok(parsed_text(&meta, "正常重试")));
+        assert!(result.is_ok());
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER fail_item BEFORE INSERT ON import_items \
+             BEGIN SELECT RAISE(ABORT, '注入写库失败'); END;",
+        )
+        .unwrap();
+        let run_id = repo::create_run(&conn, "files", None, 1, 1_000).unwrap();
+        assert!(
+            write_batch(
+                &mut conn,
+                run_id,
+                vec![FileResult::Done {
+                    meta,
+                    hash: "hash".into(),
+                    result,
+                    reuse: Some(entry.clone()),
+                }],
+                ImportCounts::default()
+            )
+            .is_err()
+        );
+        assert!(matches!(*entry.lock().unwrap(), Some(Reusable::Parsed(_))));
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
     }
 
     #[test]

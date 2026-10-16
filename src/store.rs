@@ -28,7 +28,8 @@ use crate::tokenize;
 /// 旧表整个丢弃(索引由启动后的维护任务重灌,不在 open 里做全量重建),
 /// 检索语义不变。
 /// 版本 5 合并 ASCII 字母数字词元;旧索引清空后由维护任务重建。
-pub const SCHEMA_VERSION: &str = "5";
+/// 版本 6 保存纯文本块元数据,供相同内容的文件复用解析结果。
+pub const SCHEMA_VERSION: &str = "6";
 
 /// 待重建标志:迁移丢弃旧 FTS 表时置 '1',`maintain::rebuild_fts` 提交时清掉。
 /// GUI 启动读到它即自动发起重建;CLI 各命令打印提示。
@@ -197,11 +198,12 @@ pub fn ensure_schema(connection: &Connection) -> anyhow::Result<()> {
 /// - v2 → v5:补 `source_root` 列并更换 FTS 表;
 /// - v3 → v5:更换 FTS 表结构与分词规则;
 /// - v4 → v5:更换分词规则,丢弃旧索引等待重建。
+/// - v5 → v6:仅追加可空的块元数据列,不改动全文索引。
 ///
-/// 都不丢文档数据;旧 FTS 表丢弃后索引由维护任务重建(见 `drop_legacy_fts`)。
+/// 都不丢文档数据;v2–v4 的旧 FTS 表丢弃后由维护任务重建(见 `drop_legacy_fts`)。
 /// v1 的 chunks_fts 是每分块一行的另一套结构,继续拒绝并提示重建。
 fn can_upgrade_from(from: &str) -> bool {
-    matches!(from, "2" | "3" | "4")
+    matches!(from, "2" | "3" | "4" | "5")
 }
 
 /// v4 迁移:旧 documents_fts 是普通 FTS5 表(带 %_content 影子表,整存一份
@@ -244,7 +246,10 @@ fn drop_legacy_fts(connection: &Connection) -> anyhow::Result<()> {
 /// 幂等:先查 `pragma_table_info`,缺才 `ALTER TABLE ADD COLUMN`。
 fn add_missing_columns(connection: &Connection) -> anyhow::Result<()> {
     // (表, 列, 列定义)— 只列可空、无默认值的追加列,ALTER 对已有行写入 NULL。
-    const ADDED: &[(&str, &str, &str)] = &[("documents", "source_root", "TEXT")];
+    const ADDED: &[(&str, &str, &str)] = &[
+        ("documents", "source_root", "TEXT"),
+        ("document_contents", "blocks_json", "TEXT"),
+    ];
     for (table, column, definition) in ADDED {
         // 表还不存在(全新库):什么都不做,交给后面的 SCHEMA_SQL 建成带该列的表。
         let table_exists: bool = connection
@@ -330,6 +335,7 @@ CREATE TABLE IF NOT EXISTS document_contents (
   document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
   markdown TEXT NOT NULL,               -- anydoc 产物;settings.save_markdown=1 才存,否则空串
   plain_text TEXT NOT NULL,             -- 从 markdown 提取的纯文本,偏移基准
+  blocks_json TEXT,                    -- [起始偏移,结束偏移,标题级别];旧数据为 NULL
   warnings_json TEXT NOT NULL DEFAULT '[]'
 ) STRICT;
 
@@ -661,6 +667,50 @@ mod tests {
             .unwrap();
         assert!(has_index, "升级应补上新索引吗(execute_batch 会建)");
         drop(connection);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn v5_upgrade_preserves_content_and_fts_and_adds_nullable_blocks() {
+        let path = temp_db("upgrade-v5");
+        {
+            let conn = open(&path, OpenMode::ReadWrite).unwrap();
+            conn.execute_batch(
+                "INSERT INTO documents(path,canonical_path,file_name,ext,file_type,
+                    file_size,file_mtime_ms,content_hash,parse_status,created_at,updated_at)
+                    VALUES('/a.txt','/a.txt','a.txt','txt','text',1,1,'h','parsed',1,1);
+                 INSERT INTO document_contents(document_id,markdown,plain_text) VALUES(1,'','正文');
+                 INSERT INTO documents_fts(rowid,title,content) VALUES(1,'标题','正文');
+                 ALTER TABLE document_contents DROP COLUMN blocks_json;
+                 UPDATE settings SET value='5' WHERE key='schema_version';",
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let conn = open(&path, OpenMode::ReadWrite).unwrap();
+            assert_eq!(
+                stored_schema_version(&conn).unwrap().as_deref(),
+                Some(SCHEMA_VERSION)
+            );
+            let (plain, blocks): (String, Option<String>) = conn
+                .query_row(
+                    "SELECT plain_text, blocks_json FROM document_contents WHERE document_id=1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(plain, "正文");
+            assert_eq!(blocks, None);
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '正文'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 1);
+            assert!(!crate::maintain::needs_fts_rebuild(&conn).unwrap());
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

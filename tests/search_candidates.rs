@@ -38,8 +38,8 @@ fn save(conn: &mut Connection, path: &str, title: &str, pieces: &[&str]) -> i64 
         },
         chunks,
         warnings: Vec::new(),
-        parser_name: "text",
-        parser_version: "text.v1",
+        parser_name: "text".into(),
+        parser_version: "text.v1".into(),
     };
     repo::save_parsed(conn, &meta, "hash", &parsed, 1_000).unwrap()
 }

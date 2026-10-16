@@ -351,6 +351,135 @@ fn import_skip_reimport_and_delete() {
 }
 
 #[test]
+fn identical_files_keep_locations_titles_and_membership_and_force_bypasses_reuse() {
+    let dir = common::temp_dir("e2e-identical-files");
+    let db = dir.join("index.sqlite3");
+    let docs = dir.join("docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    // 超过写库批次大小,覆盖尚未提交和已经提交的重复副本。
+    for i in 0..80 {
+        std::fs::write(docs.join(format!("副本{i}.txt")), "### 章节\n\n相同正文").unwrap();
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let (counts, events) = pool.install(|| run(&db, vec![docs.clone()], false));
+    assert_eq!((counts.ok, counts.failed, counts.skipped), (80, 0, 0));
+    assert_eq!(events.len(), 80);
+    let conn = store::open(&db, OpenMode::ReadWrite).unwrap();
+    let root = dunce::canonicalize(&docs)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let documents = repo::list_documents_by_source_root(&conn).unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].1.len(), 80);
+    for document in &documents[0].1 {
+        assert_eq!(document.title, document.file_name.trim_end_matches(".txt"));
+        assert_eq!(document.source_root.as_deref(), Some(root.as_str()));
+    }
+    let hashes: i64 = conn
+        .query_row(
+            "SELECT count(DISTINCT content_hash) FROM documents",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hashes, 1);
+    assert_fts_matches_plain(&conn);
+    let (counts, _) = run(&db, vec![docs.clone()], false);
+    assert_eq!((counts.ok, counts.skipped), (0, 80));
+
+    // 测试探针:若复用了已有解析产物,副本会沿用这个解析器标记。
+    conn.execute("UPDATE documents SET parser_name = 'reuse-probe'", [])
+        .unwrap();
+    let standalone = dir.join("单独副本.md");
+    std::fs::copy(docs.join("副本0.txt"), &standalone).unwrap();
+    let (counts, _) = run(&db, vec![standalone.clone()], false);
+    assert_eq!(counts.ok, 1);
+    let own = repo::find_document_by_path(&conn, &dunce::canonicalize(&standalone).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(own.title, "单独副本");
+    assert_eq!(own.source_root, None);
+    let parser = |id| {
+        conn.query_row(
+            "SELECT parser_name FROM documents WHERE id = ?1",
+            [id],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(parser(own.id), "reuse-probe", "跨批次也应复用正文");
+    let (counts, _) = run(&db, vec![standalone.clone()], true);
+    assert_eq!((counts.ok, counts.skipped), (1, 0));
+    assert_eq!(parser(own.id), "text", "force 必须真正重新解析");
+
+    let oversized = dir.join("超限副本.txt");
+    std::fs::copy(&standalone, &oversized).unwrap();
+    let (counts, _) = run_with_options(
+        &db,
+        vec![oversized],
+        ImportOptions {
+            max_file_bytes: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(counts.failed, 1, "重复内容也不能绕过文件大小限制");
+    assert_fts_matches_plain(&conn);
+}
+
+#[test]
+fn identical_file_reuse_respects_markdown_setting_and_real_headings() {
+    let dir = common::temp_dir("e2e-identical-markdown");
+    let db = dir.join("index.sqlite3");
+    let source = dir.join("正文标题.txt");
+    std::fs::write(&source, "# 正文标题\n\n相同正文").unwrap();
+    run(&db, vec![source.clone()], false);
+    let conn = store::open(&db, OpenMode::ReadWrite).unwrap();
+    repo::set_setting(&conn, "save_markdown", "1").unwrap();
+    let copy = dir.join("另一个文件名.txt");
+    std::fs::copy(&source, &copy).unwrap();
+    let (counts, _) = run(&db, vec![copy.clone()], false);
+    assert_eq!(counts.ok, 1);
+    let doc = repo::find_document_by_path(&conn, &dunce::canonicalize(&copy).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        doc.title, "正文标题",
+        "正文标题即使恰好等于源文件名也不能被改写"
+    );
+    let markdown: String = conn
+        .query_row(
+            "SELECT markdown FROM document_contents WHERE document_id = ?1",
+            [doc.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        markdown, "# 正文标题\n\n相同正文",
+        "旧缓存没有 Markdown 时应回退解析"
+    );
+
+    // 大小相同但字节不同,不得视为相同内容。
+    let different = dir.join("不同内容.txt");
+    std::fs::write(&different, "# 正文标题\n\n不同正文").unwrap();
+    run(&db, vec![different.clone()], false);
+    let different_doc =
+        repo::find_document_by_path(&conn, &dunce::canonicalize(&different).unwrap())
+            .unwrap()
+            .unwrap();
+    assert!(
+        repo::get_plain_text(&conn, different_doc.id)
+            .unwrap()
+            .unwrap()
+            .contains("不同正文")
+    );
+    assert_fts_matches_plain(&conn);
+}
+
+#[test]
 fn rescan_skips_unchanged_failures_and_imports_new_or_changed_files() {
     let dir = common::temp_dir("e2e-rescan");
     let db = dir.join("index.sqlite3");
