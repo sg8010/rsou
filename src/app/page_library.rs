@@ -741,9 +741,6 @@ impl RsouApp {
                     row.col(|ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 2.0;
-                            if Self::link_button(ui, "打开").clicked() {
-                                action = Some(RowAction::Open(PathBuf::from(&folder.root)));
-                            }
                             if Self::link_button(ui, "定位").clicked() {
                                 action = Some(RowAction::RevealFolder(folder.root.clone()));
                             }
