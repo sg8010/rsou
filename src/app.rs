@@ -48,7 +48,7 @@ pub(crate) enum Page {
 }
 
 impl Page {
-    pub(crate) const ALL: [Page; 3] = [Page::Library, Page::Search, Page::Settings];
+    pub(crate) const ALL: [Page; 3] = [Page::Search, Page::Library, Page::Settings];
 
     fn title(self) -> &'static str {
         match self {
@@ -443,7 +443,7 @@ pub struct RsouApp {
 impl RsouApp {
     fn new_state(ctx: &egui::Context) -> Self {
         Self {
-            page: Page::Library,
+            page: Page::Search,
             db: None,
             db_error: None,
             fts_readiness: FtsReadiness::Ready,
@@ -470,7 +470,7 @@ impl RsouApp {
             filter_auto_opened: Vec::new(),
             show_failures: false,
             failure_filter: None,
-            prev_page: Page::Library,
+            prev_page: Page::Search,
             import_progress: ImportProgress::default(),
             import_rx: None,
             import_cancel: None,
@@ -725,4 +725,21 @@ fn install_cjk_font(ctx: &egui::Context) {
         log::warn!("未找到预设 CJK 字体,将使用 egui 默认字体");
     }
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_lists_search_before_library() {
+        assert_eq!(Page::ALL.map(Page::title), ["搜索", "资料库", "设置"]);
+    }
+
+    #[test]
+    fn initial_page_is_search() {
+        let app = RsouApp::new_state(&egui::Context::default());
+        assert!(app.page == Page::Search);
+        assert!(app.prev_page == app.page);
+    }
 }

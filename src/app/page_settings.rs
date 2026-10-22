@@ -68,12 +68,6 @@ impl RsouApp {
                         self.ui_settings_location(ui);
                     }
                 }
-                ui.add_space(Self::SECTION_GAP);
-                ui.label(
-                    egui::RichText::new(format!("rsou · 版本 {}", env!("CARGO_PKG_VERSION")))
-                        .size(12.0)
-                        .color(Self::text_muted()),
-                );
             },
         );
     }
