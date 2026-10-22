@@ -837,16 +837,18 @@ impl RsouApp {
         self.docs_rx = None;
         self.docs_last_refresh = Some(std::time::Instant::now());
         let stale = generation != self.docs_gen;
-        if !stale {
+        if stale {
+            drop_in_background(result);
+        } else {
             match result {
                 Ok(snapshot) => {
-                    // 旧列表可能很大,换下来后台丢,避免在 GUI 线程上跑析构
-                    let old = std::mem::replace(&mut self.documents, snapshot.documents);
+                    // 三份旧列表一起移交后台,失败清单也可能有上千条长路径/错误。
+                    let old = (
+                        std::mem::replace(&mut self.documents, snapshot.documents),
+                        std::mem::replace(&mut self.failed_documents, snapshot.failed),
+                        std::mem::replace(&mut self.folder_groups, snapshot.folder_groups),
+                    );
                     drop_in_background(old);
-                    let old_groups =
-                        std::mem::replace(&mut self.folder_groups, snapshot.folder_groups);
-                    drop_in_background(old_groups);
-                    self.failed_documents = snapshot.failed;
                     self.documents_version += 1;
                 }
                 Err(error) => {

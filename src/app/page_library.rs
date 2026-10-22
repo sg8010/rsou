@@ -76,6 +76,33 @@ impl FailureCategory {
     }
 }
 
+/// 只缓存下标,不复制路径与错误文本;切换分类和重新打开清单都可直接复用。
+#[derive(Default)]
+pub(super) struct FailureListCache {
+    version: Option<u64>,
+    by_category: [Vec<usize>; FailureCategory::ALL.len()],
+}
+
+impl FailureListCache {
+    fn refresh(&mut self, version: u64, documents: &[DocumentRow]) {
+        if self.version == Some(version) {
+            return;
+        }
+        for indices in &mut self.by_category {
+            indices.clear();
+        }
+        for (index, document) in documents.iter().enumerate() {
+            let category = FailureCategory::from_code(document.parse_error_code.as_deref());
+            self.by_category[category as usize].push(index);
+        }
+        self.version = Some(version);
+    }
+
+    fn indices(&self, category: FailureCategory) -> &[usize] {
+        &self.by_category[category as usize]
+    }
+}
+
 /// 行内操作意图(表格/树闭包结束后再落地,避免借用冲突)。
 enum RowAction {
     Open(PathBuf),
@@ -962,22 +989,41 @@ impl RsouApp {
         self.pending_library_folder = Some(root);
     }
 
-    /// 顶部筛选固定,完整路径与错误在独立滚动区展示。
+    /// 清单摘要最多两行,完整路径与错误按需在悬停提示中排版。
+    fn failure_summary(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
+        let mut job = egui::text::LayoutJob::simple(
+            text.to_owned(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            color,
+            ui.available_width(),
+        );
+        job.wrap.max_rows = 2;
+        ui.add(egui::Label::new(job).wrap()).on_hover_text(text)
+    }
+
+    /// 顶部筛选固定,清单使用等高虚拟行,仅对视口内的记录排版。
     pub(super) fn ui_failures_panel(&mut self, ui: &mut egui::Ui) {
         let mut action: Option<RowAction> = None;
         let busy = self.import_active || self.maintenance_active;
+        let mut close = false;
         ui.horizontal(|ui| {
             Self::card_title(ui, "失败清单");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if Self::link_button(ui, "关闭").clicked() {
-                    self.show_failures = false;
+                    close = true;
                 }
             });
         });
-        let mut counts = [0_usize; FailureCategory::ALL.len()];
-        for doc in &self.failed_documents {
-            counts[FailureCategory::from_code(doc.parse_error_code.as_deref()) as usize] += 1;
+        // 关闭这一帧也不再排版列表;下一帧撤下侧栏,释放给主工作区。
+        if close {
+            self.show_failures = false;
+            ui.ctx().request_repaint();
+            return;
         }
+        self.failure_list_cache
+            .refresh(self.documents_version, &self.failed_documents);
+        let counts =
+            FailureCategory::ALL.map(|category| self.failure_list_cache.indices(category).len());
         let ocr_count = counts[FailureCategory::NeedsOcr as usize];
         let missing_count = counts[FailureCategory::FileMissing as usize];
         if ui
@@ -1028,66 +1074,84 @@ impl RsouApp {
             }
         });
         Self::thin_divider(ui);
-        let mut scroll = egui::ScrollArea::vertical()
-            .id_salt("failure_list_scroll")
-            .auto_shrink([false, false]);
-        if previous_filter != self.failure_filter {
-            scroll = scroll.vertical_scroll_offset(0.0);
+        if self.failed_documents.is_empty() {
+            Self::empty_note(ui, "没有失败的文档。");
+            return;
         }
-        scroll.show(ui, |ui| {
-            if self.failed_documents.is_empty() {
-                Self::empty_note(ui, "没有失败的文档。");
-            }
-            for doc in &self.failed_documents {
-                let category = FailureCategory::from_code(doc.parse_error_code.as_deref());
-                if self
-                    .failure_filter
-                    .is_some_and(|selected| selected != category)
-                {
-                    continue;
-                }
-                ui.push_id(doc.id, |ui| {
-                    ui.add(egui::Label::new(egui::RichText::new(&doc.file_name).strong()).wrap());
-                    ui.add(egui::Label::new(&doc.path).wrap());
-                    let message = doc.parse_error_message.as_deref().unwrap_or("解析失败");
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(message).color(Self::warning()))
-                            .wrap(),
-                    );
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled_ui(doc.source_root.is_some(), |ui| {
-                                Self::link_button(ui, "定位所属文件夹")
-                            })
-                            .inner
-                            .on_disabled_hover_text("此文档为单独添加,没有所属入库文件夹。")
-                            .clicked()
-                            && let Some(root) = &doc.source_root
-                        {
-                            action = Some(RowAction::LocateFolder(root.clone()));
-                        }
-                        if Self::link_button(ui, "打开所在目录").clicked() {
-                            action = Some(RowAction::Reveal(PathBuf::from(&doc.path)));
-                        }
-                        if ui
-                            .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重试"))
-                            .inner
-                            .clicked()
-                        {
-                            action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
-                        }
-                        if ui
-                            .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
-                            .inner
-                            .clicked()
-                        {
-                            action =
-                                Some(RowAction::AskRemoveDocument(doc.id, doc.file_name.clone()));
-                        }
+        let documents = &self.failed_documents;
+        let filtered = self
+            .failure_filter
+            .map(|category| self.failure_list_cache.indices(category));
+        let count = filtered.map_or(documents.len(), <[usize]>::len);
+        // 文件名一行、路径和原因各最多两行,操作固定两行以兼容最窄侧栏。
+        // 高度不随单条文本长度变化,才能在打开/调整宽度时跳过所有屏外记录。
+        let row_height = 5.0 * ui.text_style_height(&egui::TextStyle::Body)
+            + 2.0 * ui.spacing().interact_size.y
+            + 6.0 * ui.spacing().item_spacing.y
+            + 16.0;
+        let mut table = TableBuilder::new(ui)
+            .id_salt("failure_list_table")
+            .vscroll(true)
+            .auto_shrink([false, false])
+            .cell_layout(egui::Layout::top_down(egui::Align::Min))
+            .column(Column::remainder().clip(true));
+        if previous_filter != self.failure_filter {
+            table = table.vertical_scroll_offset(0.0);
+        }
+        table.body(|body| {
+            body.rows(row_height, count, |mut row| {
+                let index = filtered.map_or(row.index(), |indices| indices[row.index()]);
+                let doc = &documents[index];
+                row.set_overline(row.index() > 0);
+                row.col(|ui| {
+                    ui.push_id(doc.id, |ui| {
+                        ui.add_space(8.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(&doc.file_name).strong())
+                                .truncate(),
+                        )
+                        .on_hover_text(&doc.file_name);
+                        Self::failure_summary(ui, &doc.path, Self::text_primary());
+                        let message = doc.parse_error_message.as_deref().unwrap_or("解析失败");
+                        Self::failure_summary(ui, message, Self::warning());
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled_ui(doc.source_root.is_some(), |ui| {
+                                    Self::link_button(ui, "定位所属文件夹")
+                                })
+                                .inner
+                                .on_disabled_hover_text("此文档为单独添加,没有所属入库文件夹。")
+                                .clicked()
+                                && let Some(root) = &doc.source_root
+                            {
+                                action = Some(RowAction::LocateFolder(root.clone()));
+                            }
+                            if Self::link_button(ui, "打开所在目录").clicked() {
+                                action = Some(RowAction::Reveal(PathBuf::from(&doc.path)));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "重试"))
+                                .inner
+                                .clicked()
+                            {
+                                action = Some(RowAction::Reimport(PathBuf::from(&doc.path)));
+                            }
+                            if ui
+                                .add_enabled_ui(!busy, |ui| Self::danger_link_button(ui, "移除"))
+                                .inner
+                                .clicked()
+                            {
+                                action = Some(RowAction::AskRemoveDocument(
+                                    doc.id,
+                                    doc.file_name.clone(),
+                                ));
+                            }
+                        });
                     });
-                    Self::thin_divider(ui);
                 });
-            }
+            });
         });
         self.apply_row_action(ui, action);
     }
@@ -1320,6 +1384,97 @@ mod tests {
             indexed_at: Some(0),
             source_root: source_root.map(str::to_owned),
             updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn failure_cache_groups_known_and_unknown_codes() {
+        let mut documents: Vec<_> = FailureCategory::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, category)| {
+                let mut document = row(index as i64, "失败.pdf", None);
+                document.parse_error_code = category.code().map(|code| code.as_str().to_owned());
+                document
+            })
+            .collect();
+        let mut unknown = row(10, "未知错误.pdf", None);
+        unknown.parse_error_code = Some("FUTURE_ERROR".to_owned());
+        documents.push(unknown);
+
+        let mut cache = FailureListCache::default();
+        cache.refresh(0, &documents);
+        for (index, category) in FailureCategory::ALL.into_iter().enumerate() {
+            if category == FailureCategory::Other {
+                assert_eq!(cache.indices(category), &[index, 10]);
+            } else {
+                assert_eq!(cache.indices(category), &[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn failure_cache_keeps_large_list_indices_in_order() {
+        let categories = [
+            FailureCategory::NeedsOcr,
+            FailureCategory::FileMissing,
+            FailureCategory::Malformed,
+        ];
+        let documents: Vec<_> = (0..1500)
+            .map(|index| {
+                let mut document = row(index as i64, "失败.pdf", Some("/资料"));
+                document.parse_error_code = categories[index % categories.len()]
+                    .code()
+                    .map(|code| code.as_str().to_owned());
+                document
+            })
+            .collect();
+
+        let mut cache = FailureListCache::default();
+        cache.refresh(1, &documents);
+        // 重新打开或滚动不换代,复用同一份分类下标。
+        let cached = cache.indices(FailureCategory::NeedsOcr).as_ptr();
+        cache.refresh(1, &documents);
+        assert_eq!(cache.indices(FailureCategory::NeedsOcr).as_ptr(), cached);
+        for (offset, category) in categories.into_iter().enumerate() {
+            let expected: Vec<_> = (offset..documents.len())
+                .step_by(categories.len())
+                .collect();
+            assert_eq!(cache.indices(category), expected);
+        }
+        assert_eq!(
+            FailureCategory::ALL
+                .into_iter()
+                .map(|category| cache.indices(category).len())
+                .sum::<usize>(),
+            documents.len()
+        );
+    }
+
+    #[test]
+    fn failure_cache_refreshes_changed_removed_and_empty_documents() {
+        let mut documents = vec![row(1, "甲.pdf", None), row(2, "乙.pdf", None)];
+        documents[0].parse_error_code = Some("NEEDS_OCR".to_owned());
+        documents[1].parse_error_code = Some("FILE_MISSING".to_owned());
+        let mut cache = FailureListCache::default();
+        cache.refresh(1, &documents);
+        assert_eq!(cache.indices(FailureCategory::NeedsOcr), &[0]);
+        assert_eq!(cache.indices(FailureCategory::FileMissing), &[1]);
+
+        // 条数相同但错误码变化,也必须按换代号重建。
+        documents[1].parse_error_code = Some("IO".to_owned());
+        cache.refresh(2, &documents);
+        assert!(cache.indices(FailureCategory::FileMissing).is_empty());
+        assert_eq!(cache.indices(FailureCategory::Io), &[1]);
+
+        documents.remove(0);
+        cache.refresh(3, &documents);
+        assert!(cache.indices(FailureCategory::NeedsOcr).is_empty());
+        assert_eq!(cache.indices(FailureCategory::Io), &[0]);
+
+        cache.refresh(4, &[]);
+        for category in FailureCategory::ALL {
+            assert!(cache.indices(category).is_empty());
         }
     }
 

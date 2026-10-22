@@ -327,6 +327,8 @@ pub struct RsouApp {
     /// 右侧失败清单开关,仅由用户操作改变
     show_failures: bool,
     failure_filter: Option<page_library::FailureCategory>,
+    /// 失败分类下标按 documents_version 缓存,打开/滚动时不反复扫描清单。
+    failure_list_cache: page_library::FailureListCache,
     /// 上一个页面(进资料库页时刷新文档列表用)
     prev_page: Page,
     /// 导入进度(进度卡与顶栏徽标)
@@ -470,6 +472,7 @@ impl RsouApp {
             filter_auto_opened: Vec::new(),
             show_failures: false,
             failure_filter: None,
+            failure_list_cache: page_library::FailureListCache::default(),
             prev_page: Page::Search,
             import_progress: ImportProgress::default(),
             import_rx: None,
