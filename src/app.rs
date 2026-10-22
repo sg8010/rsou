@@ -145,6 +145,8 @@ pub(crate) struct ImportProgress {
     pub current_path: Option<PathBuf>,
     /// 最近的失败(文件名 + 中文原因),最多留 20 条
     pub recent_failures: VecDeque<(String, String)>,
+    /// 用户已请求取消,后台尚未退出;此时仍禁止启动下一次导入。
+    pub cancelling: bool,
     pub cancelled: bool,
 }
 
@@ -297,7 +299,7 @@ pub struct RsouApp {
     folder_import: Option<folder_import::FolderImport>,
     /// 导入线程事件通道(世代号随通道存,防上一轮残留接收端被误用)
     import_rx: Option<(u64, Receiver<ImportEvent>)>,
-    /// 导入取消标志(GUI 置位,worker 在文件粒度上停)
+    /// 导入取消标志(GUI 置位,worker 在阶段边界退出)
     import_cancel: Option<Arc<AtomicBool>>,
     /// 导入世代号
     import_gen: u64,

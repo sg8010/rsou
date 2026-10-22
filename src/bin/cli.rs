@@ -44,6 +44,9 @@ const USAGE: &str = "用法: rsou-cli [--db PATH] <命令> [参数]
   --yes       clear:确认清空(不可恢复)";
 
 fn main() -> ExitCode {
+    if let Some(code) = rsou_lib::import_process::worker_main() {
+        return ExitCode::from(code as u8);
+    }
     let mut db_path: Option<PathBuf> = None;
     let mut force = false;
     let mut loose = false;

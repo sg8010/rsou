@@ -1,14 +1,14 @@
 //! 应用行为层:构造、索引库打开、后台任务轮询与对话框编排(非 UI 代码)。
 //!
-//! 线程模型:导入流水线跑在 `rsou-import` 线程,产出 `import::ImportEvent`;
+//! 线程模型:`rsou-import` 线程监控独立导入进程,产出 `import::ImportEvent`;
 //! GUI 每帧 `poll_workers` 消费事件更新状态——主线程是状态的唯一写入方,
-//! worker 不直接触碰 GUI。写库连接由导入线程自己打开(GUI 的连接不跨线程)。
+//! worker 不直接触碰 GUI。导入进程自己开写库连接(GUI 的连接不跨线程)。
 
 use std::sync::mpsc;
 use std::time::Duration;
 
 use rsou_lib::dict;
-use rsou_lib::import::{self, FileOutcome, ImportOptions};
+use rsou_lib::import::{FileOutcome, ImportOptions};
 use rsou_lib::maintain;
 use rsou_lib::repo;
 use rsou_lib::search::{self, Filters, SearchRequest};
@@ -267,20 +267,25 @@ impl RsouApp {
         let spawned = std::thread::Builder::new()
             .name("rsou-import".to_owned())
             .spawn(move || {
-                let result = import::run_import(
-                    &db_path,
-                    inputs,
-                    ImportOptions {
-                        max_file_bytes,
-                        ..options
-                    },
-                    cancel,
-                    &mut |event| {
-                        if tx.send(event).is_ok() {
-                            ctx.request_repaint();
-                        }
-                    },
-                );
+                let result = std::env::current_exe()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|executable| {
+                        rsou_lib::import_process::run_import(
+                            &executable,
+                            &db_path,
+                            inputs,
+                            ImportOptions {
+                                max_file_bytes,
+                                ..options
+                            },
+                            cancel,
+                            &mut |event| {
+                                if tx.send(event).is_ok() {
+                                    ctx.request_repaint();
+                                }
+                            },
+                        )
+                    });
                 if let Err(error) = result {
                     log::error!("导入线程失败: {error:#}");
                     let _ = tx.send(ImportEvent::Error {
@@ -300,15 +305,19 @@ impl RsouApp {
         }
     }
 
-    /// 取消正在进行的导入(置标志;worker 在文件粒度上停)。
+    /// 只请求取消,不提前清除 active;等待 Finished/Error 后才能开始下一批。
     pub(crate) fn cancel_import(&mut self) {
+        if !self.import_active || self.import_progress.cancelling {
+            return;
+        }
         if let Some(cancel) = &self.import_cancel {
             cancel.store(true, Ordering::Relaxed);
+            self.import_progress.cancelling = true;
             self.library_notice = Some(
                 if self.import_progress.is_ocr {
                     "正在取消 OCR 等待,服务端已接收的任务可能继续运行…"
                 } else {
-                    "正在取消导入…"
+                    "正在停止后台导入；已入库数据将保留…"
                 }
                 .to_owned(),
             );
@@ -990,7 +999,19 @@ impl RsouApp {
         if let Some((generation, rx)) = &self.import_rx
             && *generation == self.import_gen
         {
-            while let Ok(event) = rx.try_recv() {
+            loop {
+                let event = match rx.try_recv() {
+                    Ok(event) => event,
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if !finished {
+                            self.import_active = false;
+                            self.library_notice = Some("导入任务异常结束,请重试".to_owned());
+                            finished = true;
+                        }
+                        break;
+                    }
+                };
                 match event {
                     ImportEvent::Error { message } => {
                         self.import_active = false;
@@ -1049,6 +1070,7 @@ impl RsouApp {
             }
         }
         if finished {
+            self.import_progress.cancelling = false;
             self.import_rx = None;
             self.import_cancel = None;
         }
@@ -1140,7 +1162,93 @@ impl RsouApp {
 mod tests {
     use super::super::search_results::tests::response;
     use super::*;
+    use rsou_lib::import;
     use rsou_lib::search::SearchResponse;
+
+    #[test]
+    fn cancelling_import_stays_active_until_finished_and_accepts_committed_events() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        app.import_active = true;
+        // 有数据库时也不能在取消期间开始下一批。
+        app.db = Some(store::open_in_memory().unwrap());
+        app.import_gen = 1;
+        let flag = Arc::new(AtomicBool::new(false));
+        app.import_cancel = Some(Arc::clone(&flag));
+        let (tx, rx) = mpsc::channel();
+        app.import_rx = Some((1, rx));
+        app.cancel_import();
+        assert!(flag.load(Ordering::Relaxed));
+        assert!(app.import_active && app.import_progress.cancelling);
+        assert!(!app.import_progress.cancelled);
+        let notice = app.library_notice.clone();
+        app.cancel_import();
+        assert_eq!(app.library_notice, notice);
+        app.start_import_with_options(&ctx, vec!["ignored.txt".into()], ImportOptions::default());
+        assert_eq!(app.import_gen, 1);
+        assert!(Arc::ptr_eq(app.import_cancel.as_ref().unwrap(), &flag));
+        // 后续轮询无需真实后台列表读取。
+        app.db = None;
+        tx.send(ImportEvent::FileDone {
+            path: "committed.txt".into(),
+            outcome: FileOutcome::Ok { document_id: 1 },
+            counts: import::ImportCounts {
+                total: 10,
+                processed: 1,
+                ok: 1,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        app.poll_import();
+        assert!(app.import_active && app.import_progress.cancelling);
+        assert_eq!(app.import_progress.counts.processed, 1);
+        tx.send(ImportEvent::Finished {
+            run_id: 1,
+            counts: app.import_progress.counts,
+            cancelled: true,
+        })
+        .unwrap();
+        app.poll_import();
+        assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(app.import_progress.cancelled);
+        assert!(app.import_cancel.is_none() && app.import_rx.is_none());
+        assert!(app.library_notice.as_deref().unwrap().contains("已取消"));
+    }
+
+    #[test]
+    fn import_error_clears_cancelling_without_claiming_successful_cancellation() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.import_active = true;
+        app.import_cancel = Some(Arc::new(AtomicBool::new(false)));
+        let (tx, rx) = mpsc::channel();
+        app.import_rx = Some((app.import_gen, rx));
+        app.cancel_import();
+        tx.send(ImportEvent::Error {
+            message: "写库失败".into(),
+        })
+        .unwrap();
+        app.poll_import();
+        assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(!app.import_progress.cancelled);
+        assert_eq!(app.library_notice.as_deref(), Some("写库失败"));
+    }
+
+    #[test]
+    fn disconnected_import_worker_clears_cancelling_instead_of_waiting_forever() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.import_active = true;
+        app.import_cancel = Some(Arc::new(AtomicBool::new(false)));
+        let (tx, rx) = mpsc::channel();
+        app.import_rx = Some((app.import_gen, rx));
+        app.cancel_import();
+        drop(tx);
+        app.poll_import();
+        assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(!app.import_progress.cancelled);
+        assert!(app.import_rx.is_none() && app.import_cancel.is_none());
+        assert!(app.library_notice.as_deref().unwrap().contains("异常结束"));
+    }
 
     #[test]
     fn pending_and_failed_indexes_block_search_until_successful_rebuild() {

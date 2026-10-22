@@ -749,7 +749,7 @@ pub fn prune_import_history(conn: &Connection, now_ms: i64) -> anyhow::Result<us
     .context("清理超过 90 天的导入历史失败")
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct ImportCounts {
     pub total: usize,
     pub processed: usize,
@@ -776,6 +776,20 @@ pub fn create_run(
         ],
     )?;
     Ok(conn.last_insert_rowid())
+}
+
+/// 子进程完成输入类型探测后补全监控端预建批次的来源。
+pub(crate) fn set_run_source(
+    conn: &Connection,
+    run_id: i64,
+    kind: &str,
+    root: Option<&Path>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "UPDATE import_runs SET kind = ?2, root_path = ?3 WHERE id = ?1",
+        params![run_id, kind, root.map(|p| p.to_string_lossy().into_owned())],
+    )?;
+    Ok(())
 }
 
 // 签名由阶段 2 任务书固定,参数个数不收敛。
@@ -822,7 +836,7 @@ pub fn finish_run(
 ) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE import_runs SET status = ?2, processed_files = ?3, ok_files = ?4, \
-         failed_files = ?5, skipped_files = ?6, finished_at = ?7, message = ?8 \
+         failed_files = ?5, skipped_files = ?6, finished_at = ?7, message = ?8, total_files = ?9 \
          WHERE id = ?1",
         params![
             run_id,
@@ -832,7 +846,8 @@ pub fn finish_run(
             counts.failed as i64,
             counts.skipped as i64,
             now_ms,
-            message
+            message,
+            counts.total as i64
         ],
     )?;
     Ok(())

@@ -25,6 +25,9 @@ fn app_icon() -> Option<Arc<egui::IconData>> {
 }
 
 fn main() {
+    if let Some(code) = rsou_lib::import_process::worker_main() {
+        std::process::exit(code);
+    }
     let diagnostics = StartupDiagnostics::begin();
     let startup_ready = Arc::new(AtomicBool::new(false));
     diagnostics.install_panic_hook(&startup_ready);

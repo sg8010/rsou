@@ -6,8 +6,9 @@
 //! - 所有写库操作串行发生在调用线程,经有界 mpsc 通道消费 worker 结果
 //!   (写库慢时通道给解析线程背压)。
 //!
-//! 取消:worker 在每个文件开工前检查 cancel 标志;单文件解析不可中断
-//! (anydoc 没有取消接口),置位后已开始的文件会跑完,未开始的直接不开工。
+//! 取消:扫描、初始化及文件处理的阶段边界检查 cancel,丢弃待写入结果,
+//! 未提交事务回滚。已提交数据保留。anydoc/单次 I/O 不可中断,须等返回后
+//! 才能退出;缓存锁仍使用阻塞等待,拿锁后再次检查,不忙轮询。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -26,8 +27,28 @@ use crate::text;
 
 pub use crate::repo::ImportCounts;
 
+/// 内部控制流,不作为解析失败入库,也不覆盖真正的写库错误。
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("导入已取消")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+fn check_cancel(cancel: &AtomicBool) -> Result<(), Cancelled> {
+    if cancel.load(Ordering::Relaxed) {
+        Err(Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// 导入参数。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportOptions {
     /// 只导入这些扩展名(不含点,忽略大小写)。None 沿用文件夹设置,
     /// 没有设置时导入全部支持格式;显式空集合不允许启动导入。
@@ -61,6 +82,7 @@ impl Default for ImportOptions {
 }
 
 /// 导入进度事件(写库线程逐条发给调用方)。
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum ImportEvent {
     /// 批次无法启动或写库失败。
     Error { message: String },
@@ -68,6 +90,7 @@ pub enum ImportEvent {
     Scanned { total: usize },
     /// 一个文件处理完毕
     FileDone {
+        #[serde(with = "crate::ipc_path")]
         path: PathBuf,
         outcome: FileOutcome,
         counts: ImportCounts,
@@ -81,6 +104,7 @@ pub enum ImportEvent {
 }
 
 /// 单文件处理结果。
+#[derive(serde::Serialize, serde::Deserialize)]
 pub enum FileOutcome {
     Ok { document_id: i64 },
     Failed { code: String, message: String },
@@ -94,7 +118,7 @@ pub enum FileOutcome {
 ///   `System Volume Information`,不跟随符号链接;
 /// - 只收 `file_type_of` 支持的文件;按规范化路径去重、排序。
 pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
-    scan_paths_filtered(inputs, None)
+    scan_paths_filtered(inputs, None, || Ok(())).expect("未启用取消")
 }
 
 fn extension_selected(path: &Path, extensions: Option<&BTreeSet<String>>) -> bool {
@@ -105,13 +129,22 @@ fn extension_selected(path: &Path, extensions: Option<&BTreeSet<String>>) -> boo
     })
 }
 
-fn scan_paths_filtered(inputs: &[PathBuf], extensions: Option<&BTreeSet<String>>) -> Vec<PathBuf> {
+fn scan_paths_filtered(
+    inputs: &[PathBuf],
+    extensions: Option<&BTreeSet<String>>,
+    mut check: impl FnMut() -> Result<(), Cancelled>,
+) -> Result<Vec<PathBuf>, Cancelled> {
     const SKIP_DIRS: &[&str] = &["node_modules", "$RECYCLE.BIN", "System Volume Information"];
     let mut files = Vec::new();
     let mut seen = HashSet::new();
-    let mut stack: Vec<PathBuf> = inputs.to_vec();
+    let mut stack = Vec::new();
+    for input in inputs {
+        check()?;
+        stack.push(input.clone());
+    }
 
     while let Some(path) = stack.pop() {
+        check()?;
         // symlink_metadata 不跟随符号链接:链向目录的 symlink 不被递归。
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             continue;
@@ -126,6 +159,7 @@ fn scan_paths_filtered(inputs: &[PathBuf], extensions: Option<&BTreeSet<String>>
             }
             if let Ok(read) = std::fs::read_dir(&path) {
                 for entry in read.flatten() {
+                    check()?;
                     let name = entry.file_name();
                     if name.to_string_lossy().starts_with('.') {
                         continue;
@@ -149,8 +183,10 @@ fn scan_paths_filtered(inputs: &[PathBuf], extensions: Option<&BTreeSet<String>>
             files.push(normalized);
         }
     }
+    check()?;
     files.sort();
-    files
+    check()?;
+    Ok(files)
 }
 
 fn absolute(path: &Path) -> PathBuf {
@@ -205,12 +241,15 @@ impl ReuseCache {
         db_path: &Path,
         existing: &HashMap<String, Existing>,
         require_markdown: bool,
+        cancel: &AtomicBool,
     ) -> anyhow::Result<Self> {
+        check_cancel(cancel)?;
         let mut entries: HashMap<_, ReuseEntry> = HashMap::new();
-        for prior in existing
-            .values()
-            .filter(|p| p.parsed && p.content_hash.len() == 64)
-        {
+        for prior in existing.values() {
+            check_cancel(cancel)?;
+            if !prior.parsed || prior.content_hash.len() != 64 {
+                continue;
+            }
             let key = (
                 prior.content_hash.clone(),
                 parse_route(&prior.ext).to_owned(),
@@ -224,6 +263,7 @@ impl ReuseCache {
                 *state = Some(Reusable::Stored(prior.id));
             }
         }
+        check_cancel(cancel)?;
         Ok(Self {
             entries: Mutex::new(entries),
             reader: Mutex::new(crate::store::open(
@@ -238,8 +278,10 @@ impl ReuseCache {
         &self,
         meta: &FileMeta,
         hash: &str,
-        parse: impl FnOnce() -> Result<ParsedDocument, ParseError>,
-    ) -> (Result<Arc<ParsedDocument>, ParseError>, ReuseEntry) {
+        cancel: &AtomicBool,
+        parse: impl FnOnce() -> Result<Result<ParsedDocument, ParseError>, Cancelled>,
+    ) -> Result<(Result<Arc<ParsedDocument>, ParseError>, ReuseEntry), Cancelled> {
+        check_cancel(cancel)?;
         let route = parse_route(&meta.ext);
         let entry = self
             .entries
@@ -248,12 +290,15 @@ impl ReuseCache {
             .entry((hash.to_owned(), route.to_owned()))
             .or_insert_with(|| Arc::new(Mutex::new(None)))
             .clone();
+        check_cancel(cancel)?;
         let mut state = entry.lock().unwrap();
+        check_cancel(cancel)?;
         let cached = match &*state {
             Some(Reusable::Parsed(parsed)) => Some(Arc::clone(parsed)),
             Some(Reusable::Stored(id)) => {
                 let load = || -> anyhow::Result<Option<ParsedDocument>> {
                     let mut reader = self.reader.lock().unwrap();
+                    check_cancel(cancel)?;
                     let tx = reader.transaction()?;
                     // 源位置可能也在本批次被更新,必须再次核对哈希与解析状态。
                     let parsed =
@@ -263,6 +308,7 @@ impl ReuseCache {
                 };
                 match load() {
                     Ok(parsed) => parsed.map(Arc::new),
+                    Err(error) if error.is::<Cancelled>() => return Err(Cancelled),
                     Err(error) => {
                         log::warn!("读取重复文件解析缓存失败,回退正常解析: {error:#}");
                         None
@@ -271,11 +317,13 @@ impl ReuseCache {
             }
             None => None,
         };
+        check_cancel(cancel)?;
         let result = if let Some(parsed) = cached {
             Ok(parsed)
         } else {
             // 不缓存失败;失败副本不能阻止后续文件正常重试。
-            let result = parse().map(Arc::new);
+            let result = parse()?.map(Arc::new);
+            check_cancel(cancel)?;
             *state = result
                 .as_ref()
                 .ok()
@@ -283,19 +331,26 @@ impl ReuseCache {
             result
         };
         drop(state);
-        let result = result.map(|parsed| {
-            let title = text::extract_title(&parsed.plain, &meta.stem());
-            if title == parsed.title {
-                parsed
-            } else {
-                // 无正文标题时使用各自文件名,并重新生成对应的分块标题路径。
-                let mut own = (*parsed).clone();
-                own.title = title;
-                own.chunks = chunk::chunk_document(&own.title, &own.plain);
-                Arc::new(own)
+        check_cancel(cancel)?;
+        let result = match result {
+            Ok(parsed) => {
+                let title = text::extract_title(&parsed.plain, &meta.stem());
+                check_cancel(cancel)?;
+                if title == parsed.title {
+                    Ok(parsed)
+                } else {
+                    // 无正文标题时使用各自文件名,并重新生成对应的分块标题路径。
+                    let mut own = (*parsed).clone();
+                    check_cancel(cancel)?;
+                    own.title = title;
+                    own.chunks = chunk::chunk_document(&own.title, &own.plain);
+                    Ok(Arc::new(own))
+                }
             }
-        });
-        (result, entry)
+            Err(error) => Err(error),
+        };
+        check_cancel(cancel)?;
+        Ok((result, entry))
     }
 }
 
@@ -327,184 +382,207 @@ pub fn run_import(
     cancel: Arc<AtomicBool>,
     on_event: &mut dyn FnMut(ImportEvent),
 ) -> anyhow::Result<ImportCounts> {
+    run_import_in_run(db_path, inputs, options, cancel, on_event, None)
+}
+
+/// 独立进程复用监控端预先创建的批次,进程被终止后仍可准确收口该批次。
+pub(crate) fn run_import_in_run(
+    db_path: &Path,
+    inputs: Vec<PathBuf>,
+    options: ImportOptions,
+    cancel: Arc<AtomicBool>,
+    on_event: &mut dyn FnMut(ImportEvent),
+    mut run_id: Option<i64>,
+) -> anyhow::Result<ImportCounts> {
     let mut conn = crate::store::open(db_path, crate::store::OpenMode::ReadWrite)
         .context("导入前打开索引库失败")?;
 
-    let existing = load_existing(&conn)?;
-    let ocr = options
-        .ocr_base_url
-        .as_deref()
-        .map(crate::ocr::Client::new)
-        .transpose()?;
-    let mut options = options;
     let (kind, root) = classify_inputs(&inputs);
-    // 只有单个目录输入有唯一的文件夹归属。设置与文档都用规范化路径作键。
-    let source_root = if kind == "folder" {
-        root.as_ref().map(|dir| {
-            dunce::canonicalize(dir)
-                .unwrap_or_else(|_| absolute(dir))
-                .to_string_lossy()
-                .into_owned()
-        })
-    } else {
-        None
-    };
-    if ocr.is_none() {
-        if options.extensions.is_none()
-            && let Some(root) = &source_root
-        {
-            options.extensions = repo::folder_import_extensions(&conn, root)?;
+    let mut counts = ImportCounts::default();
+    // 统一收口准备阶段和处理阶段的取消,包括尚未创建 run 的目录扫描。
+    let result = (|| -> anyhow::Result<()> {
+        check_cancel(&cancel)?;
+        if let Some(id) = run_id {
+            repo::set_run_source(&conn, id, kind, root.as_deref())?;
         }
-        if let Some(extensions) = &mut options.extensions {
-            *extensions = extensions
+        let existing = load_existing(&conn, &cancel)?;
+        check_cancel(&cancel)?;
+        let ocr = options
+            .ocr_base_url
+            .as_deref()
+            .map(crate::ocr::Client::new)
+            .transpose()?;
+        let mut options = options;
+        // 只有单个目录输入有唯一的文件夹归属。设置与文档都用规范化路径作键。
+        let source_root = if kind == "folder" {
+            root.as_ref().map(|dir| {
+                dunce::canonicalize(dir)
+                    .unwrap_or_else(|_| absolute(dir))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+        } else {
+            None
+        };
+        if ocr.is_none() {
+            if options.extensions.is_none()
+                && let Some(root) = &source_root
+            {
+                options.extensions = repo::folder_import_extensions(&conn, root)?;
+            }
+            if let Some(extensions) = &mut options.extensions {
+                *extensions = extensions
+                    .iter()
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .collect();
+                anyhow::ensure!(!extensions.is_empty(), "请至少选择一种要索引的文件类型");
+                for ext in extensions.iter() {
+                    anyhow::ensure!(
+                        parse::supported_extensions().contains(&ext.as_str()),
+                        "不支持的索引文件类型: {ext}"
+                    );
+                }
+            }
+        }
+        let mut files = if ocr.is_some() {
+            options.force = true;
+            options.preserve_source_root = true;
+            // 以库中当前状态为准,防止 GUI 缓存过期后重写已成功的文档。
+            let requested: HashSet<_> = inputs
                 .iter()
-                .map(|ext| ext.to_ascii_lowercase())
+                .take_while(|_| !cancel.load(Ordering::Relaxed))
+                .map(|p| dunce::canonicalize(p).unwrap_or_else(|_| absolute(p)))
                 .collect();
-            anyhow::ensure!(!extensions.is_empty(), "请至少选择一种要索引的文件类型");
-            for ext in extensions.iter() {
-                anyhow::ensure!(
-                    parse::supported_extensions().contains(&ext.as_str()),
-                    "不支持的索引文件类型: {ext}"
-                );
-            }
-        }
-    }
-    let mut files = if ocr.is_some() {
-        options.force = true;
-        options.preserve_source_root = true;
-        // 以库中当前状态为准,防止 GUI 缓存过期后重写已成功的文档。
-        let requested: HashSet<_> = inputs
-            .iter()
-            .map(|p| dunce::canonicalize(p).unwrap_or_else(|_| absolute(p)))
-            .collect();
-        let mut files: Vec<_> = existing
-            .iter()
-            .filter(|(path, prior)| prior.needs_ocr && requested.contains(&PathBuf::from(path)))
-            .map(|(path, _)| PathBuf::from(path))
-            .collect();
+            let files: Vec<_> = existing
+                .iter()
+                .take_while(|_| !cancel.load(Ordering::Relaxed))
+                .filter(|(path, prior)| prior.needs_ocr && requested.contains(&PathBuf::from(path)))
+                .map(|(path, _)| PathBuf::from(path))
+                .collect();
+            files
+        } else {
+            scan_paths_filtered(&inputs, options.extensions.as_ref(), || {
+                check_cancel(&cancel)
+            })?
+        };
+        check_cancel(&cancel)?;
+        let missing = if options.detect_missing && ocr.is_none() {
+            collect_missing(&inputs, &existing, &cancel, options.extensions.as_ref())?
+        } else {
+            HashMap::new()
+        };
+        check_cancel(&cancel)?;
+        files.extend(missing.keys().cloned());
         files.sort();
-        files
-    } else {
-        scan_paths_filtered(&inputs, options.extensions.as_ref())
-    };
-    let missing = if options.detect_missing && ocr.is_none() {
-        collect_missing(&inputs, &existing, &cancel, options.extensions.as_ref())?
-    } else {
-        HashMap::new()
-    };
-    files.extend(missing.keys().cloned());
-    files.sort();
-    files.dedup();
-    // force(含显式 OCR)保留逐文件重新解析语义,不复用任何旧结果。
-    let reuse = if options.force {
-        None
-    } else {
-        Some(ReuseCache::new(
-            db_path,
-            &existing,
-            repo::save_markdown_enabled(&conn),
-        )?)
-    };
-    on_event(ImportEvent::Scanned { total: files.len() });
+        check_cancel(&cancel)?;
+        files.dedup();
+        counts.total = files.len();
+        check_cancel(&cancel)?;
+        // force(含显式 OCR)保留逐文件重新解析语义,不复用任何旧结果。
+        let reuse = if options.force {
+            None
+        } else {
+            Some(ReuseCache::new(
+                db_path,
+                &existing,
+                repo::save_markdown_enabled(&conn),
+                &cancel,
+            )?)
+        };
+        check_cancel(&cancel)?;
+        on_event(ImportEvent::Scanned { total: files.len() });
+        check_cancel(&cancel)?;
 
-    let now = repo::now_ms();
-    let run_id = repo::create_run(&conn, kind, root.as_deref(), files.len(), now)?;
-    if ocr.is_none()
-        && let (Some(root), Some(extensions)) = (&source_root, &options.extensions)
-    {
-        repo::set_folder_import_extensions(&conn, root, extensions)?;
-    }
-    // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
-    seed_items(&mut conn, run_id, &files, now)?;
-
-    let mut counts = ImportCounts {
-        total: files.len(),
-        ..ImportCounts::default()
-    };
-    let mut first_error: Option<anyhow::Error> = None;
-
-    // 有界通道:写库慢时给解析线程背压;消费者在写库出错后仍排空通道,
-    // 生产者不会卡死在 send 上。
-    let (tx, rx) = mpsc::sync_channel::<FileResult>(rayon::current_num_threads().max(1) * 2);
-    let options_ref = &options;
-    let cancel_ref = &cancel;
-    let existing_ref = &existing;
-    let source_root_ref = source_root.as_deref();
-    let reuse_ref = reuse.as_ref();
-    // 生产者线程跑 rayon 并行解析,消费(写库)留在调用线程:
-    // Receiver/回调/连接都不需要跨线程。
-    std::thread::scope(|scope| {
-        scope.spawn(move || {
-            let process = |path: &PathBuf| {
-                if cancel_ref.load(Ordering::Relaxed) {
-                    return;
-                }
-                let result = if let Some(&document_id) = missing.get(path) {
-                    FileResult::Missing {
-                        path: path.clone(),
-                        document_id,
-                    }
-                } else {
-                    process_file(
-                        path,
-                        options_ref,
-                        existing_ref,
-                        source_root_ref,
-                        ocr.as_ref(),
-                        cancel_ref,
-                        reuse_ref,
-                    )
-                };
-                // OCR 可在轮询间取消,取消不覆盖原失败原因。
-                if ocr.is_some() && cancel_ref.load(Ordering::Relaxed) {
-                    return;
-                }
-                if tx.send(result).is_err() {
-                    cancel_ref.store(true, Ordering::Relaxed);
-                }
-            };
-            if ocr.is_some() {
-                // 服务端自行并行处理页面;客户端逐文档提交,避免挤爆队列。
-                files.iter().for_each(process);
-            } else {
-                files.par_iter().for_each(process);
-            }
-        });
-
-        // 调用线程做消费者:写库串行。收到一条就开事务;通道里紧随其后
-        // 已到达的条目并入同一事务,通道空或攒满一批即提交,不为凑批次等待。
-        while let Ok(first) = rx.recv() {
-            if first_error.is_some() {
-                continue;
-            }
-            let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
-            batch.push(first);
-            while batch.len() < WRITE_BATCH_MAX {
-                match rx.try_recv() {
-                    Ok(msg) => batch.push(msg),
-                    Err(_) => break,
-                }
-            }
-            match write_batch(&mut conn, run_id, batch, counts) {
-                Ok((new_counts, events)) => {
-                    counts = new_counts;
-                    for (path, outcome, event_counts) in events {
-                        on_event(ImportEvent::FileDone {
-                            path,
-                            outcome,
-                            counts: event_counts,
-                        });
-                    }
-                }
-                Err(error) => {
-                    // 记首个写库错误,置 cancel 让 worker 收工,排空通道后统一返回。
-                    first_error = Some(error);
-                    cancel.store(true, Ordering::Relaxed);
-                }
-            }
+        let now = repo::now_ms();
+        let id = match run_id {
+            Some(id) => id,
+            None => repo::create_run(&conn, kind, root.as_deref(), files.len(), now)?,
+        };
+        run_id = Some(id);
+        check_cancel(&cancel)?;
+        if ocr.is_none()
+            && let (Some(root), Some(extensions)) = (&source_root, &options.extensions)
+        {
+            repo::set_folder_import_extensions(&conn, root, extensions)?;
         }
-    });
+        // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
+        seed_items(&mut conn, id, &files, now, &cancel)?;
 
+        // 有界通道:写库慢时给解析线程背压;取消/写库出错后仍排空但不写入,
+        // 生产者不会卡死在 send 上。
+        let (tx, rx) = mpsc::sync_channel::<FileResult>(rayon::current_num_threads().max(1) * 2);
+        let options_ref = &options;
+        let cancel_ref = &cancel;
+        let existing_ref = &existing;
+        let source_root_ref = source_root.as_deref();
+        let reuse_ref = reuse.as_ref();
+        // 生产者线程跑 rayon 并行解析,消费(写库)留在调用线程:
+        // Receiver/回调/连接都不需要跨线程。
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let process = |path: &PathBuf| {
+                    if cancel_ref.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let result = if let Some(&document_id) = missing.get(path) {
+                        FileResult::Missing {
+                            path: path.clone(),
+                            document_id,
+                        }
+                    } else {
+                        let Ok(result) = process_file(
+                            path,
+                            options_ref,
+                            existing_ref,
+                            source_root_ref,
+                            ocr.as_ref(),
+                            cancel_ref,
+                            reuse_ref,
+                        ) else {
+                            return;
+                        };
+                        result
+                    };
+                    // 普通导入和 OCR 都丢弃取消后的产物,不记作解析失败。
+                    if cancel_ref.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if tx.send(result).is_err() {
+                        cancel_ref.store(true, Ordering::Relaxed);
+                    }
+                };
+                if ocr.is_some() {
+                    // 服务端自行并行处理页面;客户端逐文档提交,避免挤爆队列。
+                    files
+                        .iter()
+                        .take_while(|_| !cancel_ref.load(Ordering::Relaxed))
+                        .for_each(process);
+                } else {
+                    files
+                        .par_iter()
+                        .try_for_each(|path| {
+                            check_cancel(cancel_ref)?;
+                            process(path);
+                            check_cancel(cancel_ref)
+                        })
+                        .ok();
+                }
+            });
+
+            consume_results(&mut conn, id, rx, &mut counts, &cancel, on_event)
+        })
+    })();
+    let first_error = result.err().filter(|error| !error.is::<Cancelled>());
+    // 无法启动的真正错误保持原语义:由调用方报告 Error,不伪装成取消。
+    if run_id.is_none()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    let run_id = match run_id {
+        Some(id) => id,
+        None => repo::create_run(&conn, kind, root.as_deref(), counts.total, repo::now_ms())?,
+    };
     let cancelled = cancel.load(Ordering::Relaxed) && first_error.is_none();
     let now = repo::now_ms();
     let (status, message) = if let Some(error) = &first_error {
@@ -545,10 +623,15 @@ fn collect_missing(
 ) -> anyhow::Result<HashMap<PathBuf, i64>> {
     let mut scopes = Vec::new();
     for input in inputs {
+        check_cancel(cancel)?;
         let normalized = dunce::canonicalize(input).unwrap_or_else(|_| absolute(input));
-        let known_root = existing.values().any(|prior| {
-            prior.source_root.as_deref() == Some(normalized.to_string_lossy().as_ref())
-        });
+        let known_root = existing
+            .values()
+            .take_while(|_| !cancel.load(Ordering::Relaxed))
+            .any(|prior| {
+                prior.source_root.as_deref() == Some(normalized.to_string_lossy().as_ref())
+            });
+        check_cancel(cancel)?;
         let is_dir = match std::fs::metadata(&normalized) {
             Ok(meta) => meta.is_dir(),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && !known_root => false,
@@ -563,9 +646,7 @@ fn collect_missing(
     }
     let mut missing = HashMap::new();
     for (path, prior) in existing {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
+        check_cancel(cancel)?;
         let path = Path::new(path);
         if !extension_selected(path, extensions) {
             continue;
@@ -586,47 +667,59 @@ fn seed_items(
     run_id: i64,
     files: &[PathBuf],
     now: i64,
+    cancel: &AtomicBool,
 ) -> anyhow::Result<()> {
+    check_cancel(cancel)?;
     let tx = conn.transaction()?;
     for path in files {
+        check_cancel(cancel)?;
         repo::upsert_item(&tx, run_id, path, "pending", None, None, None, now)?;
     }
+    check_cancel(cancel)?;
     tx.commit()?;
     Ok(())
 }
 
 /// 一次读出 `canonical_path → 已有记录` 的映射(worker 的跳过判定用)。
-fn load_existing(conn: &rusqlite::Connection) -> anyhow::Result<HashMap<String, Existing>> {
+fn load_existing(
+    conn: &rusqlite::Connection,
+    cancel: &AtomicBool,
+) -> anyhow::Result<HashMap<String, Existing>> {
+    check_cancel(cancel)?;
     let mut stmt = conn.prepare(
         "SELECT id, canonical_path, file_size, file_mtime_ms, content_hash, parse_status, source_root, parse_error_code, file_type, ext \
          FROM documents",
     )?;
-    let map = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(1)?,
-                Existing {
-                    id: row.get(0)?,
-                    file_size: row.get(2)?,
-                    file_mtime_ms: row.get(3)?,
-                    content_hash: row.get(4)?,
-                    parsed: row.get::<_, String>(5)? == "parsed",
-                    source_root: row.get(6)?,
-                    needs_ocr: row.get::<_, String>(5)? == "failed"
-                        && row.get::<_, Option<String>>(7)?.as_deref() == Some("NEEDS_OCR")
-                        && row.get::<_, String>(8)? == "pdf",
-                    file_missing: row.get::<_, Option<String>>(7)?.as_deref()
-                        == Some("FILE_MISSING"),
-                    ext: row.get(9)?,
-                },
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            Existing {
+                id: row.get(0)?,
+                file_size: row.get(2)?,
+                file_mtime_ms: row.get(3)?,
+                content_hash: row.get(4)?,
+                parsed: row.get::<_, String>(5)? == "parsed",
+                source_root: row.get(6)?,
+                needs_ocr: row.get::<_, String>(5)? == "failed"
+                    && row.get::<_, Option<String>>(7)?.as_deref() == Some("NEEDS_OCR")
+                    && row.get::<_, String>(8)? == "pdf",
+                file_missing: row.get::<_, Option<String>>(7)?.as_deref() == Some("FILE_MISSING"),
+                ext: row.get(9)?,
+            },
+        ))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        check_cancel(cancel)?;
+        let (path, prior) = row?;
+        map.insert(path, prior);
+    }
+    check_cancel(cancel)?;
     Ok(map)
 }
 
 /// worker:读文件 → 算 hash → 解析 → 文本化 → 分块。
-/// 单文件解析不可中断(anydoc 无取消接口),只在文件之间检查 cancel。
+/// 单次解析/I/O 不可中断,在阶段边界停止,不把取消写成文件失败。
 fn process_file(
     path: &Path,
     options: &ImportOptions,
@@ -635,7 +728,8 @@ fn process_file(
     ocr: Option<&crate::ocr::Client>,
     cancel: &AtomicBool,
     reuse: Option<&ReuseCache>,
-) -> FileResult {
+) -> Result<FileResult, Cancelled> {
+    check_cancel(cancel)?;
     // scan_paths 已统一为规范化路径。重试沿用原归属,显式目录输入仍优先。
     let source_root = source_root.or_else(|| {
         options
@@ -655,7 +749,7 @@ fn process_file(
         }
         Ok(None) => {
             // 扫描与处理之间文件被改名/替换导致扩展名不再受支持。
-            return FileResult::Done {
+            return Ok(FileResult::Done {
                 meta: dummy_meta(path, source_root),
                 hash: String::new(),
                 reuse: None,
@@ -664,9 +758,10 @@ fn process_file(
                     message: "无法识别的格式,或该格式无法转换(例如纯图片 PDF)".to_owned(),
                     detail: format!("扩展名不支持: {}", path.display()),
                 }),
-            };
+            });
         }
         Err(error) => {
+            check_cancel(cancel)?;
             if options.detect_missing
                 && let Some(prior) = existing.get(path.to_string_lossy().as_ref())
                 && matches!(
@@ -674,12 +769,12 @@ fn process_file(
                     Ok(true)
                 )
             {
-                return FileResult::Missing {
+                return Ok(FileResult::Missing {
                     path: path.to_path_buf(),
                     document_id: prior.id,
-                };
+                });
             }
-            return FileResult::Done {
+            return Ok(FileResult::Done {
                 meta: dummy_meta(path, source_root),
                 hash: String::new(),
                 reuse: None,
@@ -688,9 +783,10 @@ fn process_file(
                     message: "无法读取文件(权限/占用/路径失效)".to_owned(),
                     detail: format!("{error:#}"),
                 }),
-            };
+            });
         }
     };
+    check_cancel(cancel)?;
 
     let key = meta.canonical_path.to_string_lossy().into_owned();
     let prior = existing.get(&key);
@@ -702,17 +798,18 @@ fn process_file(
         && prior.file_size == meta.file_size as i64
         && prior.file_mtime_ms == meta.file_mtime_ms
     {
-        return FileResult::Skipped {
+        return Ok(FileResult::Skipped {
             meta,
             document_id: prior.id,
             touch: false,
-        };
+        });
     }
 
     // 先读后算哈希:内容未变的文件在二级跳过就返回,不白白解析一遍。
     let bytes = match parse::read_file(path, options.max_file_bytes) {
         Ok(bytes) => bytes,
         Err(error) => {
+            check_cancel(cancel)?;
             if options.detect_missing
                 && let Some(prior) = prior
                 && matches!(
@@ -720,20 +817,22 @@ fn process_file(
                     Ok(true)
                 )
             {
-                return FileResult::Missing {
+                return Ok(FileResult::Missing {
                     path: path.to_path_buf(),
                     document_id: prior.id,
-                };
+                });
             }
-            return FileResult::Done {
+            return Ok(FileResult::Done {
                 meta,
                 hash: String::new(),
                 reuse: None,
                 result: Err(error),
-            };
+            });
         }
     };
+    check_cancel(cancel)?;
     let hash = format!("{:x}", sha2::Sha256::digest(&bytes));
+    check_cancel(cancel)?;
 
     // 二级跳过:元数据变了但内容哈希相同 → 只更新 size/mtime。
     if !options.force
@@ -742,33 +841,33 @@ fn process_file(
         && (prior.parsed || options.skip_unchanged_failed)
         && prior.content_hash == hash
     {
-        return FileResult::Skipped {
+        return Ok(FileResult::Skipped {
             meta,
             document_id: prior.id,
             touch: true,
-        };
+        });
     }
 
     let parse = || {
-        match ocr {
+        parse_document(&meta, cancel, || match ocr {
             Some(client) => client.parse_pdf(bytes, cancel),
             None => parse::parse_bytes(path, &bytes),
-        }
-        .and_then(|parsed| build_document(&meta, parsed))
+        })
     };
     let (result, reuse) = match reuse {
         Some(cache) => {
-            let (result, entry) = cache.resolve(&meta, &hash, parse);
+            let (result, entry) = cache.resolve(&meta, &hash, cancel, parse)?;
             (result, Some(entry))
         }
-        None => (parse().map(Arc::new), None),
+        None => (parse()?.map(Arc::new), None),
     };
-    FileResult::Done {
+    check_cancel(cancel)?;
+    Ok(FileResult::Done {
         meta,
         hash,
         result,
         reuse,
-    }
+    })
 }
 
 /// 元数据读取失败时的占位 FileMeta(只为把错误带回写库线程记 item)。
@@ -789,10 +888,33 @@ fn dummy_meta(path: &Path, source_root: Option<&str>) -> FileMeta {
 }
 
 /// 解析产物 → ParsedDocument(markdown → plain → 标题 → 分块)。
-fn build_document(meta: &FileMeta, parsed: parse::Parsed) -> Result<ParsedDocument, ParseError> {
+/// 外层 Err 表示取消,内层 Err 才是可写入失败清单的解析错误。
+fn parse_document(
+    meta: &FileMeta,
+    cancel: &AtomicBool,
+    parse: impl FnOnce() -> Result<parse::Parsed, ParseError>,
+) -> Result<Result<ParsedDocument, ParseError>, Cancelled> {
+    check_cancel(cancel)?;
+    let parsed = parse();
+    check_cancel(cancel)?;
+    match parsed {
+        Ok(parsed) => Ok(Ok(build_document(meta, parsed, cancel)?)),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+fn build_document(
+    meta: &FileMeta,
+    parsed: parse::Parsed,
+    cancel: &AtomicBool,
+) -> Result<ParsedDocument, Cancelled> {
+    check_cancel(cancel)?;
     let plain = text::markdown_to_plain(&parsed.markdown);
+    check_cancel(cancel)?;
     let title = text::extract_title(&plain, &meta.stem());
+    check_cancel(cancel)?;
     let chunks = chunk::chunk_document(&title, &plain);
+    check_cancel(cancel)?;
     Ok(ParsedDocument {
         title,
         markdown: parsed.markdown,
@@ -807,20 +929,69 @@ fn build_document(meta: &FileMeta, parsed: parse::Parsed) -> Result<ParsedDocume
 /// 一次事务最多并入的 worker 结果条数(上限防大事务;不为凑批次等待)。
 const WRITE_BATCH_MAX: usize = 64;
 
+/// 写库串行,只合并已到达的结果。取消或写库失败后继续排空通道但不写入,
+/// 保证阻塞在有界 send 上的生产者能退出,也不提前宣告后台已结束。
+fn consume_results(
+    conn: &mut rusqlite::Connection,
+    run_id: i64,
+    rx: mpsc::Receiver<FileResult>,
+    counts: &mut ImportCounts,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(ImportEvent),
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    while let Ok(first) = rx.recv() {
+        if first_error.is_some() || cancel.load(Ordering::Relaxed) {
+            continue;
+        }
+        let mut batch = Vec::with_capacity(WRITE_BATCH_MAX);
+        batch.push(first);
+        while batch.len() < WRITE_BATCH_MAX {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
+            }
+        }
+        match write_batch(conn, run_id, batch, *counts, cancel) {
+            Ok((new_counts, events)) => {
+                *counts = new_counts;
+                for (path, outcome, event_counts) in events {
+                    on_event(ImportEvent::FileDone {
+                        path,
+                        outcome,
+                        counts: event_counts,
+                    });
+                }
+            }
+            Err(error) if error.is::<Cancelled>() => {}
+            Err(error) => {
+                first_error = Some(error);
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// 一批结果消费后待回放的 FileDone 事件(path、outcome、消费该条时的计数快照)。
 type BatchEvents = Vec<(PathBuf, FileOutcome, ImportCounts)>;
 
 /// 一批 worker 结果在同一个 BEGIN IMMEDIATE 事务里落库。
 ///
 /// commit 成功才返回 (新计数, 逐条 FileDone 事件缓存);任何一步出错事务随
-/// drop 回滚,计数与事件都不发布。`on_event` 由调用方在提交后逐条回放,
-/// 不在持锁期间调用。
+/// drop 回滚,计数与事件都不发布。取消也回滚整个未提交批次,保留旧缓存。
+/// 提交后即使收到取消也回放本批事件,使 GUI 计数与已提交数据一致。
 fn write_batch(
     conn: &mut rusqlite::Connection,
     run_id: i64,
     batch: Vec<FileResult>,
     counts: ImportCounts,
+    cancel: &AtomicBool,
 ) -> anyhow::Result<(ImportCounts, BatchEvents)> {
+    check_cancel(cancel)?;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .context("开启写入事务失败")?;
@@ -828,6 +999,7 @@ fn write_batch(
     let mut events = Vec::with_capacity(batch.len());
     let mut published = Vec::new();
     for msg in batch {
+        check_cancel(cancel)?;
         let reuse = match &msg {
             FileResult::Done {
                 reuse,
@@ -842,6 +1014,7 @@ fn write_batch(
         }
         events.push((path, outcome, counts));
     }
+    check_cancel(cancel)?;
     tx.commit().context("提交写入事务失败")?;
     // 提交后才能把内存产物替换为 ID,否则读连接会看不到尚未提交的正文。
     for (entry, id) in published {
@@ -953,6 +1126,8 @@ mod tests {
     use super::*;
     use crate::store;
 
+    static NOT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
     fn file_meta(path: &str) -> FileMeta {
         FileMeta {
             path: path.into(),
@@ -976,6 +1151,7 @@ mod tests {
                 parser_name: "text",
                 parser_version: "text.v1",
             },
+            &NOT_CANCELLED,
         )
         .unwrap();
         FileResult::Done {
@@ -1001,7 +1177,13 @@ mod tests {
         ));
         let path = dir.join("index.sqlite3");
         let conn = store::open(&path, store::OpenMode::ReadWrite).unwrap();
-        let cache = ReuseCache::new(&path, &load_existing(&conn).unwrap(), false).unwrap();
+        let cache = ReuseCache::new(
+            &path,
+            &load_existing(&conn, &NOT_CANCELLED).unwrap(),
+            false,
+            &NOT_CANCELLED,
+        )
+        .unwrap();
         (path, conn, cache)
     }
 
@@ -1014,6 +1196,7 @@ mod tests {
                 parser_name: "text",
                 parser_version: "text.v1",
             },
+            &NOT_CANCELLED,
         )
         .unwrap()
     }
@@ -1029,21 +1212,24 @@ mod tests {
         pool.install(|| {
             (0..32).into_par_iter().for_each(|i| {
                 let meta = file_meta(&format!("/d/{i}.{}", if i % 2 == 0 { "txt" } else { "md" }));
-                let (parsed, _) = cache.resolve(&meta, "same-hash", || {
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    Ok(parsed_text(&meta, "# 正文标题\n\n正文"))
-                });
+                let (parsed, _) = cache
+                    .resolve(&meta, "same-hash", &NOT_CANCELLED, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        Ok(Ok(parsed_text(&meta, "# 正文标题\n\n正文")))
+                    })
+                    .unwrap();
                 assert_eq!(parsed.unwrap().title, "正文标题");
             });
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         let meta = file_meta("/d/a.csv");
         cache
-            .resolve(&meta, "same-hash", || {
+            .resolve(&meta, "same-hash", &NOT_CANCELLED, || {
                 calls.fetch_add(1, Ordering::Relaxed);
-                Ok(parsed_text(&meta, "不同解析路由"))
+                Ok(Ok(parsed_text(&meta, "不同解析路由")))
             })
+            .unwrap()
             .0
             .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -1054,9 +1240,11 @@ mod tests {
         let (path, mut conn, cache) = test_cache();
         let hash = "a".repeat(64);
         let source = file_meta("/d/原件.txt");
-        let (parsed, entry) = cache.resolve(&source, &hash, || {
-            Ok(parsed_text(&source, "### 原件\n\n正文"))
-        });
+        let (parsed, entry) = cache
+            .resolve(&source, &hash, &NOT_CANCELLED, || {
+                Ok(Ok(parsed_text(&source, "### 原件\n\n正文")))
+            })
+            .unwrap();
         let parsed = parsed.unwrap();
         let weak = Arc::downgrade(&parsed);
         let run_id = repo::create_run(&conn, "files", None, 1, 1_000).unwrap();
@@ -1070,6 +1258,7 @@ mod tests {
                 reuse: Some(entry.clone()),
             }],
             ImportCounts::default(),
+            &NOT_CANCELLED,
         )
         .unwrap();
         assert!(matches!(*entry.lock().unwrap(), Some(Reusable::Stored(_))));
@@ -1077,9 +1266,19 @@ mod tests {
 
         let copy = file_meta("/d/副本.md");
         // 覆盖同批提交后复用和重新启动导入后的跨批复用。
-        let reopened = ReuseCache::new(&path, &load_existing(&conn).unwrap(), false).unwrap();
+        let reopened = ReuseCache::new(
+            &path,
+            &load_existing(&conn, &NOT_CANCELLED).unwrap(),
+            false,
+            &NOT_CANCELLED,
+        )
+        .unwrap();
         for cache in [&cache, &reopened] {
-            let (parsed, _) = cache.resolve(&copy, &hash, || panic!("相同内容不应再解析"));
+            let (parsed, _) = cache
+                .resolve(&copy, &hash, &NOT_CANCELLED, || {
+                    panic!("相同内容不应再解析")
+                })
+                .unwrap();
             let parsed = parsed.unwrap();
             assert_eq!(parsed.title, "副本");
             assert_eq!(parsed.plain.text, "原件\n\n正文");
@@ -1095,7 +1294,11 @@ mod tests {
             [stored_id],
         )
         .unwrap();
-        let (parsed, _) = cache.resolve(&copy, &hash, || Ok(parsed_text(&copy, "回退重新解析")));
+        let (parsed, _) = cache
+            .resolve(&copy, &hash, &NOT_CANCELLED, || {
+                Ok(Ok(parsed_text(&copy, "回退重新解析")))
+            })
+            .unwrap();
         assert_eq!(
             parsed.unwrap().plain.text,
             "回退重新解析",
@@ -1107,15 +1310,21 @@ mod tests {
     fn failures_are_not_cached_and_rollback_does_not_publish_ids() {
         let (_path, mut conn, cache) = test_cache();
         let meta = file_meta("/d/甲.txt");
-        let (result, _) = cache.resolve(&meta, "hash", || {
-            Err(ParseError {
-                code: parse::ParseErrorCode::Empty,
-                message: "空文件".into(),
-                detail: String::new(),
+        let (result, _) = cache
+            .resolve(&meta, "hash", &NOT_CANCELLED, || {
+                Ok(Err(ParseError {
+                    code: parse::ParseErrorCode::Empty,
+                    message: "空文件".into(),
+                    detail: String::new(),
+                }))
             })
-        });
+            .unwrap();
         assert!(result.is_err());
-        let (result, entry) = cache.resolve(&meta, "hash", || Ok(parsed_text(&meta, "正常重试")));
+        let (result, entry) = cache
+            .resolve(&meta, "hash", &NOT_CANCELLED, || {
+                Ok(Ok(parsed_text(&meta, "正常重试")))
+            })
+            .unwrap();
         assert!(result.is_ok());
         conn.execute_batch(
             "CREATE TEMP TRIGGER fail_item BEFORE INSERT ON import_items \
@@ -1133,7 +1342,8 @@ mod tests {
                     result,
                     reuse: Some(entry.clone()),
                 }],
-                ImportCounts::default()
+                ImportCounts::default(),
+                &NOT_CANCELLED
             )
             .is_err()
         );
@@ -1162,7 +1372,7 @@ mod tests {
             done_result("/d/坏.txt", "h2"),
             done_result("/d/丙.txt", "h3"),
         ];
-        let result = write_batch(&mut conn, run_id, batch, counts);
+        let result = write_batch(&mut conn, run_id, batch, counts, &NOT_CANCELLED);
         assert!(result.is_err(), "触发器应让整批失败");
         // 整批回滚:触发器之前已写成功的 甲.txt 也不能留。
         assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
@@ -1175,11 +1385,342 @@ mod tests {
             done_result("/d/甲.txt", "h1"),
             done_result("/d/丙.txt", "h3"),
         ];
-        let (counts, events) = write_batch(&mut conn, run_id, batch, counts).unwrap();
+        let (counts, events) =
+            write_batch(&mut conn, run_id, batch, counts, &NOT_CANCELLED).unwrap();
         assert_eq!(counts.ok, 2);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].2.processed, 1);
         assert_eq!(events[1].2.processed, 2);
         assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 2);
+    }
+
+    /// 在指定 SQL 操作次数后置位,精确覆盖事务中途/提交前取消,不依赖机器速度。
+    fn cancel_after_sql_calls(
+        conn: &rusqlite::Connection,
+        cancel: &Arc<AtomicBool>,
+        after: usize,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        let cancel = Arc::clone(cancel);
+        conn.create_scalar_function(
+            "cancel_import",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            move |_| {
+                if called.fetch_add(1, Ordering::Relaxed) + 1 == after {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                Ok(0i64)
+            },
+        )
+        .unwrap();
+        calls
+    }
+
+    #[test]
+    fn cancellation_rolls_back_uncommitted_batch_and_preserves_prior_data_and_cache() {
+        // 第 1 条后取消,以及最后一条写完、commit 之前取消。
+        for after in [1, 3] {
+            let (_path, mut conn, _cache) = test_cache();
+            let run_id = repo::create_run(&conn, "files", None, 4, 1_000).unwrap();
+            let (counts, _) = write_batch(
+                &mut conn,
+                run_id,
+                vec![done_result("/d/保留.txt", "old")],
+                ImportCounts {
+                    total: 4,
+                    ..Default::default()
+                },
+                &NOT_CANCELLED,
+            )
+            .unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let calls = cancel_after_sql_calls(&conn, &cancel, after);
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER cancel_item AFTER INSERT ON import_items \
+                 BEGIN SELECT cancel_import(); END;",
+            )
+            .unwrap();
+            let mut first = done_result("/d/新文件.txt", "new");
+            let entry = if let FileResult::Done {
+                result: Ok(parsed),
+                reuse,
+                ..
+            } = &mut first
+            {
+                let entry = Arc::new(Mutex::new(Some(Reusable::Parsed(Arc::clone(parsed)))));
+                *reuse = Some(Arc::clone(&entry));
+                entry
+            } else {
+                unreachable!()
+            };
+            let result = write_batch(
+                &mut conn,
+                run_id,
+                vec![
+                    first,
+                    done_result("/d/乙.txt", "b"),
+                    done_result("/d/丙.txt", "c"),
+                ],
+                counts,
+                &cancel,
+            );
+            assert!(matches!(result, Err(error) if error.is::<Cancelled>()));
+            assert_eq!(calls.load(Ordering::Relaxed), after);
+            assert_eq!(counts.processed, 1, "取消不能发布回滚批次的计数");
+            assert!(conn.is_autocommit());
+            for table in [
+                "documents",
+                "document_contents",
+                "documents_fts",
+                "import_items",
+            ] {
+                assert_eq!(
+                    row_count(&conn, &format!("SELECT count(*) FROM {table}")),
+                    1
+                );
+            }
+            assert!(matches!(*entry.lock().unwrap(), Some(Reusable::Parsed(_))));
+            assert!(
+                crate::maintain::check_integrity(&conn)
+                    .unwrap()
+                    .is_consistent()
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_during_seed_rolls_back_pending_items() {
+        for after in [1, 3] {
+            let mut conn = store::open_in_memory().unwrap();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let calls = cancel_after_sql_calls(&conn, &cancel, after);
+            conn.execute_batch(
+                "CREATE TEMP TRIGGER cancel_pending AFTER INSERT ON import_items \
+                 BEGIN SELECT cancel_import(); END;",
+            )
+            .unwrap();
+            let id = repo::create_run(&conn, "files", None, 3, 1_000).unwrap();
+            let files = vec!["/a.txt".into(), "/b.txt".into(), "/c.txt".into()];
+            let error = seed_items(&mut conn, id, &files, 1_000, &cancel).unwrap_err();
+            assert!(error.is::<Cancelled>());
+            assert_eq!(calls.load(Ordering::Relaxed), after);
+            assert_eq!(row_count(&conn, "SELECT count(*) FROM import_items"), 0);
+            assert!(conn.is_autocommit());
+        }
+    }
+
+    #[test]
+    fn cancellation_while_loading_existing_stops_reading_rows() {
+        let mut conn = store::open_in_memory().unwrap();
+        let id = repo::create_run(&conn, "files", None, 3, 1_000).unwrap();
+        write_batch(
+            &mut conn,
+            id,
+            vec![
+                done_result("/a.txt", "a"),
+                done_result("/b.txt", "b"),
+                done_result("/c.txt", "c"),
+            ],
+            ImportCounts::default(),
+            &NOT_CANCELLED,
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = cancel_after_sql_calls(&conn, &cancel, 2);
+        // 只在本连接替换读取视图,每读一行都会执行一次测试函数。
+        conn.execute_batch(
+            "CREATE TEMP VIEW documents AS SELECT id + cancel_import() AS id, \
+             canonical_path, file_size, file_mtime_ms, content_hash, parse_status, \
+             source_root, parse_error_code, file_type, ext FROM main.documents",
+        )
+        .unwrap();
+        assert!(matches!(load_existing(&conn, &cancel), Err(error) if error.is::<Cancelled>()));
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn cancellation_during_directory_enumeration_discards_partial_scan() {
+        let (db, _conn, _cache) = test_cache();
+        let dir = db.parent().unwrap().join("docs");
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("{i}.txt")), "正文").unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let mut checks = 0;
+        let scanned = scan_paths_filtered(std::slice::from_ref(&dir), None, || {
+            checks += 1;
+            // 已进入 read_dir,但尚未遍历完目录。
+            if checks == 10 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            check_cancel(&cancel)
+        });
+        assert!(scanned.is_err());
+        assert_eq!(checks, 10);
+        assert_eq!(scan_paths(&[dir]).len(), 40);
+    }
+
+    #[test]
+    fn cancelled_parser_return_is_discarded_not_converted_or_cached() {
+        let (_path, _conn, cache) = test_cache();
+        let meta = file_meta("/d/甲.txt");
+        for succeeds in [true, false] {
+            let cancel = AtomicBool::new(false);
+            let result = cache.resolve(&meta, "hash", &cancel, || {
+                parse_document(&meta, &cancel, || {
+                    // 模拟不可中断解析器返回前收到取消,覆盖成功与失败返回。
+                    cancel.store(true, Ordering::Relaxed);
+                    if succeeds {
+                        Ok(parse::Parsed {
+                            markdown: "正文".into(),
+                            warnings: vec![],
+                            parser_name: "test",
+                            parser_version: "1",
+                        })
+                    } else {
+                        Err(ParseError {
+                            code: parse::ParseErrorCode::Malformed,
+                            message: "损坏".into(),
+                            detail: String::new(),
+                        })
+                    }
+                })
+            });
+            assert!(matches!(result, Err(Cancelled)));
+            let entry = cache
+                .entries
+                .lock()
+                .unwrap()
+                .get(&("hash".into(), "text".into()))
+                .unwrap()
+                .clone();
+            assert!(entry.lock().unwrap().is_none(), "取消产物不能发布到缓存");
+            assert!(
+                cache
+                    .resolve(&meta, "hash", &cancel, || panic!("取消后不能重试副本"))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_waiters_do_not_retry_after_inflight_parse_is_cancelled() {
+        let (_path, _conn, cache) = test_cache();
+        let cancel = AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let ready = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let cache = &cache;
+            let cancel = &cancel;
+            let calls = &calls;
+            scope.spawn(move || {
+                let meta = file_meta("/d/原件.txt");
+                let result = cache.resolve(&meta, "same", cancel, || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    // 此时仍持有内容键的锁,其他副本不能开始解析。
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    Ok(Err(ParseError {
+                        code: parse::ParseErrorCode::Malformed,
+                        message: "损坏".into(),
+                        detail: String::new(),
+                    }))
+                });
+                assert!(matches!(result, Err(Cancelled)));
+            });
+            started
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            for _ in 0..3 {
+                let ready = &ready;
+                scope.spawn(move || {
+                    ready.wait();
+                    let meta = file_meta("/d/副本.txt");
+                    let result = cache.resolve(&meta, "same", cancel, || {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        panic!("取消后拿到缓存锁也不能重试失败副本")
+                    });
+                    assert!(matches!(result, Err(Cancelled)));
+                });
+            }
+            ready.wait();
+            cancel.store(true, Ordering::Relaxed);
+            release.send(()).unwrap();
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn actual_write_error_is_not_hidden_by_concurrent_cancellation() {
+        let mut conn = store::open_in_memory().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        cancel_after_sql_calls(&conn, &cancel, 1);
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER cancel_and_fail BEFORE INSERT ON import_items \
+             BEGIN SELECT cancel_import(); SELECT RAISE(ABORT, '实际写库错误'); END;",
+        )
+        .unwrap();
+        let id = repo::create_run(&conn, "files", None, 2, 1_000).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(done_result("/a.txt", "a")).unwrap();
+        tx.send(done_result("/b.txt", "b")).unwrap();
+        drop(tx);
+        let mut counts = ImportCounts::default();
+        let error = consume_results(&mut conn, id, rx, &mut counts, &cancel, &mut |_| {
+            panic!("不能发布失败事务的事件")
+        })
+        .unwrap_err();
+        assert!(!error.is::<Cancelled>());
+        assert!(format!("{error:#}").contains("实际写库错误"));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(counts.processed, 0);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
+    }
+
+    #[test]
+    fn cancellation_drains_full_channel_without_writing_or_blocking_sender() {
+        let mut conn = store::open_in_memory().unwrap();
+        let id = repo::create_run(&conn, "files", None, 4, 1_000).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut counts = ImportCounts {
+            total: 4,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (start, wait) = mpsc::channel();
+        let (full, filled) = mpsc::channel();
+        let (ended, joined) = mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            tx.send(done_result("/a.txt", "a")).unwrap();
+            wait.recv().unwrap();
+            tx.send(done_result("/b.txt", "b")).unwrap();
+            full.send(()).unwrap();
+            // 队列已满,这里的发送只能等消费者取消后继续排空才能返回。
+            tx.send(done_result("/c.txt", "c")).unwrap();
+            tx.send(done_result("/d.txt", "d")).unwrap();
+            ended.send(()).unwrap();
+        });
+        let mut events = 0;
+        consume_results(&mut conn, id, rx, &mut counts, &cancel, &mut |_| {
+            events += 1;
+            start.send(()).unwrap();
+            filled
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            cancel.store(true, Ordering::Relaxed);
+        })
+        .unwrap();
+        joined
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        sender.join().unwrap();
+        assert_eq!(events, 1);
+        assert_eq!((counts.processed, counts.ok, counts.failed), (1, 1, 0));
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 1);
     }
 }

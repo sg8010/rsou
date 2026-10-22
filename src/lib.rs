@@ -7,6 +7,8 @@ pub mod chunk;
 pub mod dict;
 pub mod filebrowser;
 pub mod import;
+pub mod import_process;
+mod ipc_path;
 pub mod maintain;
 pub mod normalize;
 pub mod ocr;

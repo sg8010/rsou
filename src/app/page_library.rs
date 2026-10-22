@@ -179,18 +179,23 @@ impl RsouApp {
         // ---------- 导入进度卡(仅导入中出现) ----------
         if self.import_active {
             let mut cancel = false;
+            let cancelling = self.import_progress.cancelling;
             Self::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     Self::card_title(
                         ui,
-                        if self.import_progress.is_ocr {
+                        if cancelling {
+                            "正在取消"
+                        } else if self.import_progress.is_ocr {
                             "正在 OCR"
                         } else {
                             "正在导入"
                         },
                     );
                     ui.label(
-                        egui::RichText::new(if self.import_progress.is_ocr {
+                        egui::RichText::new(if cancelling {
+                            "正在停止后台任务，已入库数据将保留"
+                        } else if self.import_progress.is_ocr {
                             "识别完成后自动加入全文索引"
                         } else {
                             "正在解析文档并建立全文索引"
@@ -199,7 +204,15 @@ impl RsouApp {
                         .color(Self::text_muted()),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if Self::small_secondary_button(ui, None, "取消", 72.0, true).clicked() {
+                        if Self::small_secondary_button(
+                            ui,
+                            None,
+                            if cancelling { "取消中" } else { "取消" },
+                            72.0,
+                            !cancelling,
+                        )
+                        .clicked()
+                        {
                             cancel = true;
                         }
                     });
@@ -1273,6 +1286,46 @@ mod tests {
                 });
             });
             out.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn cancelling_progress_card_shows_waiting_state() {
+        fn collect_text(shape: &egui::epaint::Shape, labels: &mut Vec<String>) {
+            match shape {
+                egui::epaint::Shape::Text(text) => labels.push(text.galley.job.text.clone()),
+                egui::epaint::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text(shape, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        app.import_active = true;
+        app.import_progress.cancelling = true;
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 800.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.ui_page_library(ui),
+            );
+            let mut labels = Vec::new();
+            for shape in &output.shapes {
+                collect_text(&shape.shape, &mut labels);
+            }
+            assert!(labels.iter().any(|s| s == "正在取消"));
+            assert!(labels.iter().any(|s| s == "取消中"));
+            assert!(labels.iter().any(|s| s.contains("正在停止后台任务")));
+            assert!(!labels.iter().any(|s| s == "正在导入"));
+            output.textures_delta.clear();
         }
     }
 

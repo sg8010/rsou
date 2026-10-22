@@ -46,6 +46,24 @@ fn scanned_pdf_reports_needs_ocr() {
         .expect_err("扫描 PDF 应报需要 OCR");
     assert_eq!(error.code, ParseErrorCode::NeedsOcr);
     assert!(error.message.contains("OCR"));
+    assert!(error.detail.is_empty());
+    assert_eq!(error.to_string(), error.message);
+}
+
+#[test]
+fn needs_ocr_message_does_not_list_page_numbers() {
+    for page_count in [1, 378] {
+        let error = parse::map_convert_error(&ConvertError::NeedsOcr {
+            pages: (1..=page_count).collect(),
+            page_count,
+        });
+        assert_eq!(error.code, ParseErrorCode::NeedsOcr);
+        assert!(error.detail.is_empty());
+        assert_eq!(
+            error.to_string(),
+            "该 PDF 需要 OCR,可在失败清单中点击“全部 OCR”"
+        );
+    }
 }
 
 #[test]

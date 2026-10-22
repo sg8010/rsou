@@ -273,10 +273,10 @@ pub fn map_convert_error(error: &ConvertError) -> ParseError {
             "文件超出安全上限(解压体积/节点数/表格格数)",
             format!("{limit}: {detail}"),
         ),
-        ConvertError::NeedsOcr { pages, page_count } => ParseError::new(
+        ConvertError::NeedsOcr { .. } => ParseError::new(
             ParseErrorCode::NeedsOcr,
             "该 PDF 需要 OCR,可在失败清单中点击“全部 OCR”",
-            format!("{pages:?}/{page_count} 页需要 OCR"),
+            "",
         ),
         ConvertError::Io(e) => ParseError::new(
             ParseErrorCode::Io,
