@@ -30,16 +30,46 @@ impl FolderImport {
             FileType::Text,
             FileType::Epub,
         ] {
-            ui.label(
-                egui::RichText::new(kind.label())
-                    .strong()
-                    .color(RsouApp::text_secondary()),
-            );
+            self.ui_type(ui, kind);
+        }
+    }
+
+    fn ui_type(&mut self, ui: &mut egui::Ui, kind: FileType) -> egui::Response {
+        let extensions: Vec<_> = parse::supported_extensions()
+            .iter()
+            .copied()
+            .filter(|ext| parse::file_type_of(&PathBuf::from(format!("file.{ext}"))) == Some(kind))
+            .collect();
+        let selected_count = extensions
+            .iter()
+            .filter(|ext| self.extensions.contains(**ext))
+            .count();
+        // 大类状态始终由扩展名推导,不另存状态,避免与单项选择或持久化设置不同步。
+        let mut all_selected = selected_count == extensions.len();
+        let partially_selected = selected_count > 0 && !all_selected;
+        let response = ui
+            .add(
+                egui::Checkbox::new(
+                    &mut all_selected,
+                    egui::RichText::new(kind.label())
+                        .strong()
+                        .color(RsouApp::text_secondary()),
+                )
+                .indeterminate(partially_selected),
+            )
+            .on_hover_text("全选或取消此类格式；部分选中时点击全选。");
+        if response.changed() {
+            for &ext in &extensions {
+                if all_selected {
+                    self.extensions.insert(ext.to_owned());
+                } else {
+                    self.extensions.remove(ext);
+                }
+            }
+        }
+        ui.indent(kind.as_str(), |ui| {
             ui.horizontal_wrapped(|ui| {
-                for &ext in parse::supported_extensions() {
-                    if parse::file_type_of(&PathBuf::from(format!("file.{ext}"))) != Some(kind) {
-                        continue;
-                    }
+                for ext in extensions {
                     let mut selected = self.extensions.contains(ext);
                     if ui
                         .checkbox(&mut selected, ext.to_ascii_uppercase())
@@ -53,8 +83,9 @@ impl FolderImport {
                     }
                 }
             });
-            ui.add_space(4.0);
-        }
+        });
+        ui.add_space(4.0);
+        response
     }
 }
 
@@ -154,6 +185,125 @@ impl RsouApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn category_frame(
+        ctx: &egui::Context,
+        pending: &mut FolderImport,
+        kind: FileType,
+        events: Vec<egui::Event>,
+    ) -> egui::Rect {
+        let mut rect = egui::Rect::NOTHING;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| rect = pending.ui_type(ui, kind).rect,
+        );
+        output.textures_delta.clear();
+        rect
+    }
+
+    fn click_category(ctx: &egui::Context, pending: &mut FolderImport, kind: FileType) {
+        category_frame(ctx, pending, kind, vec![]);
+        let pos = category_frame(ctx, pending, kind, vec![]).center();
+        for pressed in [true, false] {
+            category_frame(
+                ctx,
+                pending,
+                kind,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn category_checkbox_toggles_only_its_extensions() {
+        for kind in [
+            FileType::Word,
+            FileType::Excel,
+            FileType::Ppt,
+            FileType::Pdf,
+            FileType::Text,
+            FileType::Epub,
+        ] {
+            let ctx = egui::Context::default();
+            let all = FolderImport::all_extensions();
+            let mut pending = FolderImport {
+                path: PathBuf::new(),
+                extensions: all.clone(),
+            };
+            click_category(&ctx, &mut pending, kind);
+            for ext in &all {
+                let in_category =
+                    parse::file_type_of(&PathBuf::from(format!("file.{ext}"))) == Some(kind);
+                assert_eq!(
+                    pending.extensions.contains(ext),
+                    !in_category,
+                    "{kind:?}: {ext}"
+                );
+            }
+            click_category(&ctx, &mut pending, kind);
+            assert_eq!(pending.extensions, all);
+        }
+    }
+
+    #[test]
+    fn partial_category_click_selects_all_and_tracks_individual_changes() {
+        let ctx = egui::Context::default();
+        let mut pending = FolderImport {
+            path: PathBuf::new(),
+            extensions: BTreeSet::from(["csv".to_owned(), "pdf".to_owned()]),
+        };
+        let expected: BTreeSet<_> = ["xls", "xlsx", "xlsm", "xlsb", "ods", "csv", "pdf"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        click_category(&ctx, &mut pending, FileType::Excel);
+        assert_eq!(pending.extensions, expected);
+
+        // 单项取消后,大类重新变为半选;点击应补齐而非全部取消。
+        pending.extensions.remove("xlsx");
+        click_category(&ctx, &mut pending, FileType::Excel);
+        assert_eq!(pending.extensions, expected);
+        click_category(&ctx, &mut pending, FileType::Excel);
+        assert_eq!(pending.extensions, BTreeSet::from(["pdf".to_owned()]));
+        click_category(&ctx, &mut pending, FileType::Pdf);
+        assert!(pending.extensions.is_empty());
+    }
+
+    #[test]
+    fn category_choice_round_trips_through_existing_folder_settings() {
+        let ctx = egui::Context::default();
+        let mut app = RsouApp::new_state(&ctx);
+        app.db = Some(store::open_in_memory().unwrap());
+        let root = dunce::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        app.prepare_folder_import(root.clone());
+        let pending = app.folder_import.as_mut().unwrap();
+        click_category(&ctx, pending, FileType::Excel);
+        let expected = pending.extensions.clone();
+        repo::set_folder_import_extensions(
+            app.db.as_ref().unwrap(),
+            &root.to_string_lossy(),
+            &expected,
+        )
+        .unwrap();
+
+        app.prepare_folder_import(root);
+        let pending = app.folder_import.as_mut().unwrap();
+        assert_eq!(pending.extensions, expected);
+        click_category(&ctx, pending, FileType::Excel);
+        assert_eq!(pending.extensions, FolderImport::all_extensions());
+        assert!(!app.import_active);
+    }
 
     #[test]
     fn new_folder_defaults_to_all_formats_without_starting_import() {
