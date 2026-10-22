@@ -133,6 +133,79 @@ fn assert_fts_matches_plain(conn: &rusqlite::Connection) {
 }
 
 #[test]
+fn folder_management_snapshot_keeps_summaries_failures_and_searchable_contents() {
+    let dir = common::temp_dir("e2e-folder-summary");
+    let db = dir.join("index.sqlite3");
+    let folder = dir.join("资料");
+    std::fs::create_dir_all(folder.join("子目录")).unwrap();
+    std::fs::write(folder.join("甲.txt"), "文件夹汇总验证").unwrap();
+    std::fs::write(folder.join("子目录/乙.txt"), "子文件仍能检索").unwrap();
+    let failed = folder.join("空文件.txt");
+    std::fs::write(&failed, "").unwrap();
+    let (counts, _) = run(&db, vec![folder.clone()], false);
+    assert_eq!((counts.total, counts.ok, counts.failed), (3, 2, 1));
+
+    let standalone = dir.join("单独文件.txt");
+    std::fs::write(&standalone, "单独添加的正文").unwrap();
+    assert_eq!(run(&db, vec![standalone], false).0.ok, 1);
+    let root = dunce::canonicalize(&folder)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let conn = store::open(&db, OpenMode::ReadOnly).unwrap();
+    let snapshot = repo::library_snapshot(&conn).unwrap();
+    assert_eq!(snapshot.standalone.len(), 1);
+    assert_eq!(snapshot.standalone[0].file_name, "单独文件.txt");
+    assert_eq!(snapshot.failed.len(), 1);
+    assert_eq!(
+        snapshot.failed[0].source_root.as_deref(),
+        Some(root.as_str())
+    );
+    assert_eq!(
+        snapshot.folders,
+        vec![repo::SourceRootSummary {
+            root: root.clone(),
+            total: 3,
+            parsed: 2,
+            failed: 1,
+        }]
+    );
+    assert!(conn.is_autocommit(), "管理快照不得长期占用 WAL 读事务");
+    let matches: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH '\"汇总\"'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(matches, 1, "文件夹成功文档不预载到 GUI 也必须可检索");
+
+    std::fs::write(&failed, "修复后的正文").unwrap();
+    let (counts, _) = run_with_options(
+        &db,
+        vec![failed],
+        ImportOptions {
+            preserve_source_root: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(counts.ok, 1);
+    let snapshot = repo::library_snapshot(&conn).unwrap();
+    assert!(snapshot.failed.is_empty());
+    assert_eq!(snapshot.folders[0].parsed, 3);
+    assert_eq!(snapshot.folders[0].failed, 0);
+    assert_eq!(run(&db, vec![folder], true).0.ok, 3);
+
+    let mut writer = store::open(&db, OpenMode::ReadWrite).unwrap();
+    assert_eq!(repo::delete_source_root(&mut writer, &root).unwrap(), 3);
+    let snapshot = repo::library_snapshot(&conn).unwrap();
+    assert!(snapshot.folders.is_empty());
+    assert!(snapshot.failed.is_empty());
+    assert_eq!(snapshot.standalone.len(), 1);
+    assert_fts_matches_plain(&conn);
+}
+
+#[test]
 fn unchanged_content_with_new_mtime_is_skipped() {
     let dir = common::temp_dir("e2e-mtime");
     let db_path = dir.join("index.sqlite3");

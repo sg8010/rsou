@@ -339,16 +339,7 @@ impl RsouApp {
             .spawn(move || {
                 // 读取线程自己开只读连接;库不可用时把中文原因带回。
                 let result = store::open(&db_path, OpenMode::ReadOnly)
-                    .and_then(|conn| {
-                        Ok(DocsSnapshot {
-                            documents: repo::list_documents(&conn)?,
-                            failed: repo::list_failed_documents(&conn)?,
-                            folder_groups: repo::list_documents_by_source_root(&conn)?
-                                .into_iter()
-                                .map(|(root, documents)| FolderGroup { root, documents })
-                                .collect(),
-                        })
-                    })
+                    .and_then(|conn| repo::library_snapshot(&conn))
                     .map_err(|error| format!("{error:#}"));
                 if tx.send(DocsMsg { generation, result }).is_ok() {
                     ctx.request_repaint();
@@ -378,10 +369,15 @@ impl RsouApp {
         match repo::delete_source_root(conn, source_root) {
             Ok(removed) => {
                 self.library_notice = Some(format!("已移除文件夹索引(共 {removed} 篇文档)"));
-                // 先从缓存里摘掉,避免后台读取落地前树里还显示已删项。
-                self.folder_groups.retain(|g| g.root != source_root);
-                self.documents
-                    .retain(|d| d.source_root.as_deref() != Some(source_root));
+                // 先从缓存里摘掉,避免后台读取落地前列表里还显示已删项。
+                self.folder_summaries
+                    .retain(|folder| folder.root != source_root);
+                if self.selected_library_folder.as_deref() == Some(source_root) {
+                    self.selected_library_folder = None;
+                }
+                if self.pending_library_folder.as_deref() == Some(source_root) {
+                    self.pending_library_folder = None;
+                }
                 self.failed_documents
                     .retain(|d| d.source_root.as_deref() != Some(source_root));
                 self.documents_version += 1;
@@ -401,7 +397,7 @@ impl RsouApp {
             Ok(()) => {
                 self.library_notice = Some("已移除文档".to_owned());
                 // 先从缓存里摘掉,避免后台读取落地前表格还显示已删行
-                self.documents.retain(|d| d.id != id);
+                self.standalone_documents.retain(|d| d.id != id);
                 self.failed_documents.retain(|d| d.id != id);
                 self.documents_version += 1;
                 self.invalidate_documents_snapshot();
@@ -844,11 +840,19 @@ impl RsouApp {
                 Ok(snapshot) => {
                     // 三份旧列表一起移交后台,失败清单也可能有上千条长路径/错误。
                     let old = (
-                        std::mem::replace(&mut self.documents, snapshot.documents),
+                        std::mem::replace(&mut self.standalone_documents, snapshot.standalone),
                         std::mem::replace(&mut self.failed_documents, snapshot.failed),
-                        std::mem::replace(&mut self.folder_groups, snapshot.folder_groups),
+                        std::mem::replace(&mut self.folder_summaries, snapshot.folders),
                     );
                     drop_in_background(old);
+                    if self.selected_library_folder.as_ref().is_some_and(|root| {
+                        !self
+                            .folder_summaries
+                            .iter()
+                            .any(|folder| &folder.root == root)
+                    }) {
+                        self.selected_library_folder = None;
+                    }
                     self.documents_version += 1;
                 }
                 Err(error) => {

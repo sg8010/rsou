@@ -51,6 +51,23 @@ pub struct DocumentRow {
     pub updated_at: i64,
 }
 
+/// 来源文件夹的汇总信息,不携带子文件元数据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceRootSummary {
+    pub root: String,
+    pub total: u64,
+    pub parsed: u64,
+    pub failed: u64,
+}
+
+/// 资料库管理列表的只读快照。文件夹文档仅保留汇总,失败清单单独读取。
+#[derive(Debug)]
+pub struct LibrarySnapshot {
+    pub standalone: Vec<DocumentRow>,
+    pub failed: Vec<DocumentRow>,
+    pub folders: Vec<SourceRootSummary>,
+}
+
 const DOCUMENT_COLS: &str = "id, path, file_name, title, ext, file_type, file_size, \
      file_mtime_ms, parse_status, parse_error_code, parse_error_message, \
      text_length, chunk_count, indexed_at, source_root, updated_at";
@@ -179,8 +196,8 @@ pub fn list_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRow>> {
 
 /// 来自「添加文件夹」的文档,按来源文件夹分组(文件夹按路径排序)。
 ///
-/// 资料库页用它建树:外层是文件夹,内层是该文件夹下的文档。只返回
-/// `source_root` 非空的行;单独添加的文件走 `list_documents` 那一侧。
+/// 全量分组接口,只返回 `source_root` 非空的行。资料库管理界面应改用
+/// `library_snapshot`,避免为每个文件夹加载全部子文件。
 pub fn list_documents_by_source_root(
     conn: &Connection,
 ) -> anyhow::Result<Vec<(String, Vec<DocumentRow>)>> {
@@ -228,6 +245,42 @@ pub fn list_failed_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRo
         .query_map([], row_to_document)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 按来源文件夹汇总数量,按路径排序;不读取文件名、标题、错误文本或正文。
+pub fn list_source_root_summaries(conn: &Connection) -> anyhow::Result<Vec<SourceRootSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT source_root, count(*), \
+         count(*) FILTER (WHERE parse_status = 'parsed'), \
+         count(*) FILTER (WHERE parse_status = 'failed') \
+         FROM documents WHERE source_root IS NOT NULL \
+         GROUP BY source_root ORDER BY source_root ASC",
+    )?;
+    let summaries = statement
+        .query_map([], |row| {
+            Ok(SourceRootSummary {
+                root: row.get(0)?,
+                // COUNT 恒非负;保留 64 位计数,不受 32 位进程的 usize 宽度限制。
+                total: row.get::<_, i64>(1)? as u64,
+                parsed: row.get::<_, i64>(2)? as u64,
+                failed: row.get::<_, i64>(3)? as u64,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(summaries)
+}
+
+/// 在同一个短读事务里读取管理列表,避免导入期间汇总与失败清单来自不同快照。
+/// GUI 不需要、也不应为文件夹页面预载成功子文件的 `DocumentRow`。
+pub fn library_snapshot(conn: &Connection) -> anyhow::Result<LibrarySnapshot> {
+    let transaction = conn.unchecked_transaction()?;
+    let snapshot = LibrarySnapshot {
+        standalone: list_standalone_documents(&transaction)?,
+        failed: list_failed_documents(&transaction)?,
+        folders: list_source_root_summaries(&transaction)?,
+    };
+    transaction.commit()?;
+    Ok(snapshot)
 }
 
 /// 按 id 批量取文档(检索结果回填元数据用);分批避免占位符过多。
@@ -908,6 +961,161 @@ mod tests {
             parser_version: "t".into(),
         };
         save_parsed(conn, &meta, "h", &parsed, 1).unwrap()
+    }
+
+    fn fail_doc(conn: &mut Connection, path: &str, source_root: Option<&str>) -> i64 {
+        let meta = FileMeta {
+            path: path.into(),
+            canonical_path: path.into(),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            ext: "txt".to_owned(),
+            file_type: FileType::Text,
+            file_size: 1,
+            file_mtime_ms: 1,
+            source_root: source_root.map(str::to_owned),
+        };
+        let error = ParseError {
+            code: crate::parse::ParseErrorCode::Malformed,
+            message: "文件结构损坏".to_owned(),
+            detail: "测试失败记录".to_owned(),
+        };
+        save_failed(conn, &meta, "h", &error, 2).unwrap()
+    }
+
+    #[test]
+    fn library_snapshot_is_empty_for_an_empty_library() {
+        let conn = crate::store::open_in_memory().unwrap();
+        let snapshot = library_snapshot(&conn).unwrap();
+        assert!(snapshot.standalone.is_empty());
+        assert!(snapshot.failed.is_empty());
+        assert!(snapshot.folders.is_empty());
+        assert!(conn.is_autocommit(), "快照读取结束后必须释放读事务");
+    }
+
+    #[test]
+    fn source_root_summaries_count_statuses_and_exact_roots() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        save_doc(&mut conn, "/a/nested/2.txt", Some("/a"));
+        fail_doc(&mut conn, "/a/3.txt", Some("/a"));
+        fail_doc(&mut conn, "/a-b/4.txt", Some("/a-b"));
+        save_doc(&mut conn, "/a/sub/5.txt", Some("/a/sub"));
+        save_doc(&mut conn, "/loose.txt", None);
+
+        assert_eq!(
+            list_source_root_summaries(&conn).unwrap(),
+            vec![
+                SourceRootSummary {
+                    root: "/a".to_owned(),
+                    total: 3,
+                    parsed: 2,
+                    failed: 1
+                },
+                SourceRootSummary {
+                    root: "/a-b".to_owned(),
+                    total: 1,
+                    parsed: 0,
+                    failed: 1
+                },
+                SourceRootSummary {
+                    root: "/a/sub".to_owned(),
+                    total: 1,
+                    parsed: 1,
+                    failed: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn library_snapshot_does_not_load_successful_folder_documents() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        save_doc(&mut conn, "/a/parsed.txt", Some("/a"));
+        let failed_folder = fail_doc(&mut conn, "/a/failed.txt", Some("/a"));
+        let standalone = save_doc(&mut conn, "/standalone.txt", None);
+        let failed_standalone = fail_doc(&mut conn, "/failed.txt", None);
+
+        let snapshot = library_snapshot(&conn).unwrap();
+        let mut ids: Vec<_> = snapshot.standalone.iter().map(|doc| doc.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![standalone, failed_standalone]);
+        assert!(
+            snapshot
+                .standalone
+                .iter()
+                .all(|doc| doc.source_root.is_none())
+        );
+        let mut failures: Vec<_> = snapshot.failed.iter().map(|doc| doc.id).collect();
+        failures.sort();
+        assert_eq!(failures, vec![failed_folder, failed_standalone]);
+        assert_eq!(
+            snapshot.folders,
+            vec![SourceRootSummary {
+                root: "/a".to_owned(),
+                total: 2,
+                parsed: 1,
+                failed: 1,
+            }]
+        );
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn source_root_summaries_follow_retry_reassignment_and_removal() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        fail_doc(&mut conn, "/a/1.txt", Some("/a"));
+        assert_eq!(list_source_root_summaries(&conn).unwrap()[0].failed, 1);
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        let snapshot = library_snapshot(&conn).unwrap();
+        assert!(snapshot.failed.is_empty());
+        assert_eq!(snapshot.folders[0].parsed, 1);
+        assert_eq!(snapshot.folders[0].failed, 0);
+
+        save_doc(&mut conn, "/a/1.txt", None);
+        let snapshot = library_snapshot(&conn).unwrap();
+        assert!(snapshot.folders.is_empty());
+        assert_eq!(snapshot.standalone.len(), 1);
+
+        save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        assert_eq!(delete_source_root(&mut conn, "/a").unwrap(), 1);
+        assert!(library_snapshot(&conn).unwrap().folders.is_empty());
+        assert!(
+            crate::maintain::check_integrity(&conn)
+                .unwrap()
+                .is_consistent()
+        );
+    }
+
+    #[test]
+    fn source_root_summaries_return_one_row_per_folder_for_many_documents() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let transaction = conn.transaction().unwrap();
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO documents(path, canonical_path, file_name, ext, file_type, \
+                 file_size, file_mtime_ms, content_hash, parse_status, source_root, created_at, updated_at) \
+                 VALUES (?1, ?1, '失败.txt', 'txt', 'text', 1, 1, '', 'failed', ?2, 1, 1)",
+            ).unwrap();
+            for i in 0..4096 {
+                let root = if i % 2 == 0 {
+                    "/资料甲"
+                } else {
+                    "/资料乙"
+                };
+                insert
+                    .execute(params![format!("{root}/{i}.txt"), root])
+                    .unwrap();
+            }
+        }
+        transaction.commit().unwrap();
+
+        let summaries = list_source_root_summaries(&conn).unwrap();
+        assert_eq!(summaries.len(), 2);
+        for summary in summaries {
+            assert_eq!(summary.total, 2048);
+            assert_eq!(summary.parsed, 0);
+            assert_eq!(summary.failed, 2048);
+        }
     }
 
     #[test]

@@ -27,7 +27,7 @@ use rsou_lib::dict::DictReport;
 use rsou_lib::import::ImportEvent;
 use rsou_lib::maintain::IndexStats;
 use rsou_lib::query::Scope;
-use rsou_lib::repo::{DocumentRow, ImportCounts};
+use rsou_lib::repo::{DocumentRow, ImportCounts, LibrarySnapshot, SourceRootSummary};
 use rsou_lib::search::{SearchResponse, Span};
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
@@ -87,42 +87,7 @@ pub(crate) enum LibraryTab {
     Files,
 }
 
-/// 一个「已添加文件夹」及其下属文档。
-#[derive(Debug, Clone)]
-pub(crate) struct FolderGroup {
-    /// 规范化绝对路径(即 documents.source_root)
-    pub root: String,
-    pub documents: Vec<DocumentRow>,
-}
-
-impl FolderGroup {
-    /// 未命中过滤(或原名包含过滤词)的文档数。
-    pub fn matched(&self, filter: &str) -> usize {
-        self.documents
-            .iter()
-            .filter(|d| file_name_matches(&d.file_name, filter))
-            .count()
-    }
-}
-
-/// 树形视图的节点标识(egui_ltreeview 需要 Clone+Eq+Hash)。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum LibraryNode {
-    /// 一个来源文件夹(值是 source_root 路径)
-    Folder(String),
-    /// 一篇文档(值是 documents.id)
-    Document(i64),
-}
-
-/// 「单独文件」页该展示哪些文档——返回在 `documents` 里的下标。
-///
-/// 抽成纯函数是因为这条规则很容易写漏:`documents` 里同时含文件夹带来的文档,
-/// 本页必须**只**保留 `source_root` 为空的。漏掉这一条的表现是「数目对、
-/// 但列表把文件夹的子文件也列了出来」——数目由另一处算出,列表却来自这里,
-/// 所以表面上不容易发现。
-///
-/// 注意这个函数不管「文件夹」页:那一页是树,数据来自 `folder_groups`
-/// (已按 source_root 分组),不走下标过滤。
+/// 「单独文件」页的可见下标。查询只读取单独文件,这里保留归属检查作为防线。
 pub(crate) fn standalone_document_indices(documents: &[DocumentRow], filter: &str) -> Vec<usize> {
     documents
         .iter()
@@ -132,10 +97,17 @@ pub(crate) fn standalone_document_indices(documents: &[DocumentRow], filter: &st
         .collect()
 }
 
+/// 文件夹页只按来源路径过滤摘要,不查询或匹配子文件名。
+pub(crate) fn folder_summary_indices(folders: &[SourceRootSummary], filter: &str) -> Vec<usize> {
+    folders
+        .iter()
+        .enumerate()
+        .filter(|(_, folder)| filter.is_empty() || folder.root.to_lowercase().contains(filter))
+        .map(|(index, _)| index)
+        .collect()
+}
+
 /// 文档文件名是否命中过滤词(空词 = 全部命中)。
-///
-/// 抽成函数是为了让「文件夹页按匹配数隐藏空文件夹」与「单独文件页过滤」
-/// 用同一条规则,不会出现两处不一致。
 pub(crate) fn file_name_matches(file_name: &str, filter: &str) -> bool {
     filter.is_empty() || file_name.to_lowercase().contains(filter)
 }
@@ -154,7 +126,7 @@ pub(crate) enum PendingConfirm {
     /// 移除整个文件夹(连同其下全部文档的索引)
     RemoveFolder {
         root: String,
-        doc_count: usize,
+        doc_count: u64,
     },
     ClearMissing {
         doc_count: usize,
@@ -199,22 +171,10 @@ pub(crate) struct PreviewRequest {
     cancel: Arc<AtomicBool>,
 }
 
-/// 一次文档列表读取的全部结果。
-///
-/// 一个结构体而不是元组:字段加到三个之后,元组位置靠数,很容易搞错顺序。
-pub(crate) struct DocsSnapshot {
-    /// 全部文档(单独文件页与旧调用方用)
-    pub documents: Vec<DocumentRow>,
-    /// 失败清单
-    pub failed: Vec<DocumentRow>,
-    /// 文件夹页用的分组
-    pub folder_groups: Vec<FolderGroup>,
-}
-
-/// 文档列表 worker 回传的消息(文档列表 + 失败清单 + 文件夹分组)。
+/// 文档列表 worker 回传的消息(单独文件 + 失败清单 + 文件夹摘要)。
 pub(crate) struct DocsMsg {
     pub generation: u64,
-    pub result: Result<DocsSnapshot, String>,
+    pub result: Result<LibrarySnapshot, String>,
 }
 
 /// 预览高亮定位缓存:同一预览文本、同一窗口、同一组字面量时不重算 locate_literals。
@@ -289,16 +249,16 @@ pub struct RsouApp {
     startup_log_path: Option<PathBuf>,
     /// 资料库页的操作提示(文件已选中等)
     library_notice: Option<String>,
-    /// 文档列表缓存(资料库页表格;后台线程读取,按事件刷新)
-    documents: Vec<DocumentRow>,
-    /// 解析失败的文档(失败清单抽屉;与 documents 同一次刷新)
+    /// 仅单独添加的文档;文件夹里的成功文档不预载到 GUI。
+    standalone_documents: Vec<DocumentRow>,
+    /// 解析失败的文档(失败清单抽屉;与单独文件、文件夹摘要同一次刷新)
     failed_documents: Vec<DocumentRow>,
-    /// documents 换代号:每次替换/修改 +1,过滤缓存据它失效
+    /// 管理列表换代号:每次替换/修改 +1,过滤缓存据它失效
     documents_version: u64,
-    /// 过滤后的 documents 下标(表格渲染复用;filtered_key 命中时不重算)
-    filtered_docs: Vec<usize>,
-    /// 过滤缓存键:(小写过滤词, documents_version)
-    filtered_key: Option<(String, u64)>,
+    /// 当前页签的可见下标,不复制行数据。
+    filtered_rows: Vec<usize>,
+    /// 过滤缓存键:(页签,小写过滤词, documents_version)
+    filtered_key: Option<(LibraryTab, String, u64)>,
     /// 文档列表后台读取通道(世代号随通道存)
     docs_rx: Option<(u64, Receiver<DocsMsg>)>,
     /// 文档列表读取世代号
@@ -311,19 +271,16 @@ pub struct RsouApp {
     docs_dirty: bool,
     /// 上次文档列表读取落地时间(节流用)
     docs_last_refresh: Option<std::time::Instant>,
-    /// 文件名过滤(内存过滤缓存列表)
+    /// 当前页签的过滤词(文件夹路径 / 单独文件名)
     doc_filter: String,
     /// 资料库列表页签:文件夹 / 单独文件
     library_tab: LibraryTab,
-    /// 来源文件夹分组缓存(文件夹页树形视图)
-    folder_groups: Vec<FolderGroup>,
-    /// 树形视图的折叠/选择状态(egui_ltreeview,跨帧保留)
-    library_tree_state: egui_ltreeview::TreeViewState<LibraryNode>,
-    /// 从失败清单定位后,下一次绘制树时滚动到该来源文件夹。
+    /// 来源文件夹摘要,数量随来源文件夹数增长,不持有子文件列表。
+    folder_summaries: Vec<SourceRootSummary>,
+    /// 从失败清单定位的文件夹,在表格中高亮。
+    selected_library_folder: Option<String>,
+    /// 从失败清单定位后,下一次绘制表格时滚动到该来源文件夹。
     pending_library_folder: Option<String>,
-    /// 过滤期间被自动展开的文件夹节点;过滤清空后收回为关,
-    /// 只记「原本没开」的节点,不覆盖用户手动展开的状态
-    filter_auto_opened: Vec<LibraryNode>,
     /// 右侧失败清单开关,仅由用户操作改变
     show_failures: bool,
     failure_filter: Option<page_library::FailureCategory>,
@@ -453,10 +410,10 @@ impl RsouApp {
             egui_ctx: ctx.clone(),
             startup_log_path: None,
             library_notice: None,
-            documents: Vec::new(),
+            standalone_documents: Vec::new(),
             failed_documents: Vec::new(),
             documents_version: 0,
-            filtered_docs: Vec::new(),
+            filtered_rows: Vec::new(),
             filtered_key: None,
             docs_rx: None,
             docs_gen: 0,
@@ -466,10 +423,9 @@ impl RsouApp {
             docs_last_refresh: None,
             doc_filter: String::new(),
             library_tab: LibraryTab::default(),
-            folder_groups: Vec::new(),
-            library_tree_state: egui_ltreeview::TreeViewState::default(),
+            folder_summaries: Vec::new(),
+            selected_library_folder: None,
             pending_library_folder: None,
-            filter_auto_opened: Vec::new(),
             show_failures: false,
             failure_filter: None,
             failure_list_cache: page_library::FailureListCache::default(),

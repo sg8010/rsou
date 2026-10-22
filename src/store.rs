@@ -391,7 +391,7 @@ DROP INDEX IF EXISTS idx_documents_canonical_path;
 DROP INDEX IF EXISTS idx_chunks_document_id;
 DROP INDEX IF EXISTS idx_import_items_run_status;
 
--- 资料库页按 source_root 分页签/建树,加索引避免每次全表扫。
+-- 资料库页按 source_root 区分单独文件并汇总文件夹,复用来源索引。
 CREATE INDEX IF NOT EXISTS idx_documents_source_root ON documents(source_root);
 CREATE INDEX IF NOT EXISTS idx_documents_parse_status ON documents(parse_status);
 CREATE INDEX IF NOT EXISTS idx_import_items_document_id ON import_items(document_id);
