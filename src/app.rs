@@ -6,10 +6,12 @@
 //! - `workers`:构造、索引库打开、后台任务轮询与对话框编排
 //! - `page_library`/`page_search`/`page_settings`:三个页面
 
+mod folder_import;
 mod page_library;
 mod page_search;
 mod page_settings;
 mod platform;
+mod search_results;
 mod shell;
 mod theme;
 mod util;
@@ -28,9 +30,10 @@ use rsou_lib::import::ImportEvent;
 use rsou_lib::maintain::IndexStats;
 use rsou_lib::query::Scope;
 use rsou_lib::repo::{DocumentRow, ImportCounts, LibrarySnapshot, SourceRootSummary};
-use rsou_lib::search::{SearchResponse, Span};
+use rsou_lib::search::Span;
 use rsou_lib::store::{self, DataDirs, OpenMode};
 use rusqlite::Connection;
+use search_results::SearchResults;
 use shell::SIDEBAR_MARGIN;
 
 #[cfg(target_os = "linux")]
@@ -148,7 +151,7 @@ pub(crate) struct ImportProgress {
 /// 检索 worker 回传的消息(带世代号,过期结果丢弃)。
 pub(crate) struct SearchMsg {
     pub generation: u64,
-    pub result: Result<SearchResponse, String>,
+    pub result: Result<SearchResults, String>,
 }
 
 /// 预览文本 worker 回传的消息。
@@ -290,6 +293,8 @@ pub struct RsouApp {
     prev_page: Page,
     /// 导入进度(进度卡与顶栏徽标)
     import_progress: ImportProgress,
+    /// 选定文件夹后,确认要索引的扩展名;确认前不启动扫描。
+    folder_import: Option<folder_import::FolderImport>,
     /// 导入线程事件通道(世代号随通道存,防上一轮残留接收端被误用)
     import_rx: Option<(u64, Receiver<ImportEvent>)>,
     /// 导入取消标志(GUI 置位,worker 在文件粒度上停)
@@ -315,7 +320,9 @@ pub struct RsouApp {
     /// 时间范围过滤(None = 全部;Some(N) = 最近 N 天)
     search_mtime_days: Option<u64>,
     /// 最近一次检索结果(新结果回来前保留展示)
-    search_result: Option<SearchResponse>,
+    search_result: Option<SearchResults>,
+    /// 结果卡片的实际尺寸,仅跳过屏外卡片布局,不改变可变行高。
+    search_card_cache: page_search::SearchCardCache,
     /// 检索/语法错误文案(状态行显示,不弹窗)
     search_error: Option<String>,
     /// 检索结果通道(世代号随通道存)
@@ -431,6 +438,7 @@ impl RsouApp {
             failure_list_cache: page_library::FailureListCache::default(),
             prev_page: Page::Search,
             import_progress: ImportProgress::default(),
+            folder_import: None,
             import_rx: None,
             import_cancel: None,
             import_gen: 0,
@@ -444,6 +452,7 @@ impl RsouApp {
             search_path_prefix: String::new(),
             search_mtime_days: None,
             search_result: None,
+            search_card_cache: page_search::SearchCardCache::default(),
             search_error: None,
             search_rx: None,
             search_gen: 0,
@@ -593,6 +602,7 @@ impl eframe::App for RsouApp {
         self.poll_workers();
         // 帧末:处理对话框(rfd 是阻塞调用,必须放在帧末;内置对话框也统一在这里画)
         self.drive_dialog(ui.ctx());
+        self.ui_folder_import(ui.ctx());
         // 只有在途任务需要主动重绘;空闲时不要求帧,避免无谓占 CPU。
         if self.has_inflight() {
             ui.ctx().request_repaint();

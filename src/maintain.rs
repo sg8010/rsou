@@ -292,7 +292,7 @@ pub fn optimize(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// 清空资料库:一个事务清空 FTS 索引、全部文档(级联 contents/chunks)、
-/// 全部导入记录(级联 import_items);settings(含 schema_version)保留。
+/// 全部导入记录(级联 import_items)与文件夹索引类型;全局 settings 保留。
 pub fn clear_all(conn: &mut Connection) -> anyhow::Result<()> {
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -307,6 +307,10 @@ pub fn clear_all(conn: &mut Connection) -> anyhow::Result<()> {
         .context("清空文档表失败")?;
     tx.execute("DELETE FROM import_runs", [])
         .context("清空导入记录失败")?;
+    tx.execute(
+        "DELETE FROM settings WHERE substr(key, 1, length(?1)) = ?1",
+        [repo::FOLDER_EXTENSIONS_PREFIX],
+    )?;
     tx.execute(
         "DELETE FROM settings WHERE key = ?1",
         [crate::store::FTS_REBUILD_PENDING_KEY],

@@ -9,7 +9,7 @@
 //! 取消:worker 在每个文件开工前检查 cancel 标志;单文件解析不可中断
 //! (anydoc 没有取消接口),置位后已开始的文件会跑完,未开始的直接不开工。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -29,6 +29,9 @@ pub use crate::repo::ImportCounts;
 /// 导入参数。
 #[derive(Debug, Clone)]
 pub struct ImportOptions {
+    /// 只导入这些扩展名(不含点,忽略大小写)。None 沿用文件夹设置,
+    /// 没有设置时导入全部支持格式;显式空集合不允许启动导入。
+    pub extensions: Option<BTreeSet<String>>,
     /// 单文件字节上限(默认 100 MiB)
     pub max_file_bytes: u64,
     /// 显式 OCR 批次:只处理库中 NEEDS_OCR 的失败 PDF,普通导入为 None。
@@ -46,6 +49,7 @@ pub struct ImportOptions {
 impl Default for ImportOptions {
     fn default() -> Self {
         Self {
+            extensions: None,
             max_file_bytes: 100 * 1024 * 1024,
             ocr_base_url: None,
             force: false,
@@ -90,6 +94,18 @@ pub enum FileOutcome {
 ///   `System Volume Information`,不跟随符号链接;
 /// - 只收 `file_type_of` 支持的文件;按规范化路径去重、排序。
 pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    scan_paths_filtered(inputs, None)
+}
+
+fn extension_selected(path: &Path, extensions: Option<&BTreeSet<String>>) -> bool {
+    extensions.is_none_or(|selected| {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| selected.iter().any(|s| s.eq_ignore_ascii_case(ext)))
+    })
+}
+
+fn scan_paths_filtered(inputs: &[PathBuf], extensions: Option<&BTreeSet<String>>) -> Vec<PathBuf> {
     const SKIP_DIRS: &[&str] = &["node_modules", "$RECYCLE.BIN", "System Volume Information"];
     let mut files = Vec::new();
     let mut seen = HashSet::new();
@@ -122,7 +138,7 @@ pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
         if !meta.is_file() {
             continue;
         }
-        if parse::file_type_of(&path).is_none() {
+        if parse::file_type_of(&path).is_none() || !extension_selected(&path, extensions) {
             continue;
         }
         // 规范化用于去重与入库;失败时退回绝对路径。
@@ -321,6 +337,38 @@ pub fn run_import(
         .map(crate::ocr::Client::new)
         .transpose()?;
     let mut options = options;
+    let (kind, root) = classify_inputs(&inputs);
+    // 只有单个目录输入有唯一的文件夹归属。设置与文档都用规范化路径作键。
+    let source_root = if kind == "folder" {
+        root.as_ref().map(|dir| {
+            dunce::canonicalize(dir)
+                .unwrap_or_else(|_| absolute(dir))
+                .to_string_lossy()
+                .into_owned()
+        })
+    } else {
+        None
+    };
+    if ocr.is_none() {
+        if options.extensions.is_none()
+            && let Some(root) = &source_root
+        {
+            options.extensions = repo::folder_import_extensions(&conn, root)?;
+        }
+        if let Some(extensions) = &mut options.extensions {
+            *extensions = extensions
+                .iter()
+                .map(|ext| ext.to_ascii_lowercase())
+                .collect();
+            anyhow::ensure!(!extensions.is_empty(), "请至少选择一种要索引的文件类型");
+            for ext in extensions.iter() {
+                anyhow::ensure!(
+                    parse::supported_extensions().contains(&ext.as_str()),
+                    "不支持的索引文件类型: {ext}"
+                );
+            }
+        }
+    }
     let mut files = if ocr.is_some() {
         options.force = true;
         options.preserve_source_root = true;
@@ -337,10 +385,10 @@ pub fn run_import(
         files.sort();
         files
     } else {
-        scan_paths(&inputs)
+        scan_paths_filtered(&inputs, options.extensions.as_ref())
     };
     let missing = if options.detect_missing && ocr.is_none() {
-        collect_missing(&inputs, &existing, &cancel)?
+        collect_missing(&inputs, &existing, &cancel, options.extensions.as_ref())?
     } else {
         HashMap::new()
     };
@@ -360,22 +408,12 @@ pub fn run_import(
     on_event(ImportEvent::Scanned { total: files.len() });
 
     let now = repo::now_ms();
-    let (kind, root) = classify_inputs(&inputs);
     let run_id = repo::create_run(&conn, kind, root.as_deref(), files.len(), now)?;
-    // 本次导入的「来源文件夹」:只有「单个目录」这种输入才算文件夹导入。
-    // 选多个文件、或「文件+文件夹」混合时,一律按单独文件处理——那种混合
-    // 输入没有唯一的归属,硬指定会让树形归属失真。
-    //
-    // 注意 root 是**输入时用户选的**路径,可能与文档的 canonical 路径不同形
-    // (符号链接/相对路径)。这里统一用 dunce 规范化一次,保证与 documents.path
-    // 同口径,树形分组才能对得上。
-    let source_root: Option<String> = match (&kind, &root) {
-        (&"folder", Some(dir)) => {
-            let normalized = dunce::canonicalize(dir).unwrap_or_else(|_| dir.clone());
-            Some(normalized.to_string_lossy().into_owned())
-        }
-        _ => None,
-    };
+    if ocr.is_none()
+        && let (Some(root), Some(extensions)) = (&source_root, &options.extensions)
+    {
+        repo::set_folder_import_extensions(&conn, root, extensions)?;
+    }
     // 全部 item 先记 pending,跑完/失败/跳过时逐个改写。
     seed_items(&mut conn, run_id, &files, now)?;
 
@@ -503,6 +541,7 @@ fn collect_missing(
     inputs: &[PathBuf],
     existing: &HashMap<String, Existing>,
     cancel: &AtomicBool,
+    extensions: Option<&BTreeSet<String>>,
 ) -> anyhow::Result<HashMap<PathBuf, i64>> {
     let mut scopes = Vec::new();
     for input in inputs {
@@ -528,6 +567,9 @@ fn collect_missing(
             break;
         }
         let path = Path::new(path);
+        if !extension_selected(path, extensions) {
+            continue;
+        }
         if scopes
             .iter()
             .any(|(input, is_dir)| path == input || (*is_dir && path.starts_with(input)))

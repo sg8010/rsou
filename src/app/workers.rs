@@ -235,7 +235,7 @@ impl RsouApp {
         );
     }
 
-    fn start_import_with_options(
+    pub(super) fn start_import_with_options(
         &mut self,
         ctx: &egui::Context,
         inputs: Vec<PathBuf>,
@@ -459,6 +459,7 @@ impl RsouApp {
                 // 检索线程自己开只读连接;库不存在时把中文原因带回状态行。
                 let result = store::open(&db_path, OpenMode::ReadOnly)
                     .and_then(|conn| search::search_for_listing(&conn, &request))
+                    .map(SearchResults::new)
                     .map_err(|error| format!("{error:#}"));
                 if tx.send(SearchMsg { generation, result }).is_ok() {
                     ctx.request_repaint();
@@ -597,12 +598,11 @@ impl RsouApp {
 
     /// 切到该文档预览的指定命中批次,并记录滚动目标(plain_text 字节偏移)。
     pub(crate) fn focus_preview(&mut self, document_id: i64, hit_index: usize, byte_offset: usize) {
-        if let Some(hit) = self.search_result.as_ref().and_then(|result| {
-            result
-                .documents
-                .iter()
-                .find(|hit| hit.document.id == document_id)
-        }) {
+        if let Some(hit) = self
+            .search_result
+            .as_ref()
+            .and_then(|result| result.document(document_id))
+        {
             self.search_locations.insert(hit.group_id, document_id);
             if self.location_popup_group != Some(hit.group_id) {
                 self.location_popup_group = None;
@@ -884,6 +884,7 @@ impl RsouApp {
                 match result {
                     Ok(response) => {
                         self.search_error = None;
+                        self.search_card_cache = page_search::SearchCardCache::default();
                         self.search_locations.clear();
                         self.location_popup_group = None;
                         if let Some(hit) = response
@@ -1078,7 +1079,7 @@ impl RsouApp {
                     file_dialog::document_filters(),
                 ),
                 DialogRequest::ImportFolder => {
-                    FileDialog::pick_folder("选择要导入的文件夹", "添加到资料库", dir)
+                    FileDialog::pick_folder("选择要导入的文件夹", "选择索引类型", dir)
                 }
             };
             self.dialog = Some(ActiveDialog { request, dialog });
@@ -1097,9 +1098,10 @@ impl RsouApp {
             DialogAction::Picked(path) => {
                 self.dialog = None;
                 match request {
-                    DialogRequest::ImportFiles | DialogRequest::ImportFolder => {
+                    DialogRequest::ImportFiles => {
                         self.start_import(ctx, vec![path], false);
                     }
+                    DialogRequest::ImportFolder => self.prepare_folder_import(path),
                 }
             }
         }
@@ -1127,7 +1129,7 @@ impl RsouApp {
             DialogRequest::ImportFolder => {
                 let picked = rfd::FileDialog::new().pick_folder();
                 if let Some(path) = picked {
-                    self.start_import(ctx, vec![path], false);
+                    self.prepare_folder_import(path);
                 }
             }
         }
@@ -1136,9 +1138,9 @@ impl RsouApp {
 
 #[cfg(test)]
 mod tests {
+    use super::super::search_results::tests::response;
     use super::*;
-    use rsou_lib::query::CompiledQuery;
-    use rsou_lib::search::DocumentHit;
+    use rsou_lib::search::SearchResponse;
 
     #[test]
     fn pending_and_failed_indexes_block_search_until_successful_rebuild() {
@@ -1188,49 +1190,6 @@ mod tests {
         assert!(app.fts_ready(), "清空资料库同时解除 pending");
     }
 
-    fn doc(id: i64) -> DocumentHit {
-        DocumentHit {
-            group_id: id,
-            document: DocumentRow {
-                id,
-                path: format!("/doc{id}.txt"),
-                file_name: format!("doc{id}.txt"),
-                title: String::new(),
-                ext: "txt".to_owned(),
-                file_type: "text".to_owned(),
-                file_size: 1,
-                file_mtime_ms: 0,
-                parse_status: "parsed".to_owned(),
-                parse_error_code: None,
-                parse_error_message: None,
-                text_length: 1,
-                chunk_count: 1,
-                indexed_at: None,
-                source_root: None,
-                updated_at: 0,
-            },
-            title_highlights: Vec::new(),
-            hits: Vec::new(),
-            total_hits: 0,
-            best_rank: 0.0,
-        }
-    }
-
-    fn response(ids: &[i64]) -> SearchResponse {
-        SearchResponse {
-            locations_complete: false,
-            documents: ids.iter().map(|&id| doc(id)).collect(),
-            total_hits: 0,
-            total_documents: ids.len(),
-            total_groups: ids.len(),
-            elapsed_ms: 0.0,
-            compiled: CompiledQuery {
-                match_expr: String::new(),
-                literals: Vec::new(),
-            },
-        }
-    }
-
     /// 以检索线程相同的方式把一条结果送进通道并消费。
     fn push_result(app: &mut RsouApp, result: SearchResponse) {
         app.search_gen += 1;
@@ -1239,10 +1198,33 @@ mod tests {
         app.search_active = true;
         tx.send(SearchMsg {
             generation: app.search_gen,
-            result: Ok(result),
+            result: Ok(SearchResults::new(result)),
         })
         .unwrap();
         app.poll_search();
+    }
+
+    #[test]
+    fn search_index_is_replaced_with_each_accepted_snapshot() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        let mut grouped = response(&[1, 2, 3]);
+        grouped.documents[1].group_id = 1;
+        push_result(&mut app, grouped);
+        let result = app.search_result.as_ref().unwrap();
+        assert_eq!(result.groups.len(), 2);
+        assert_eq!(result.group(1).unwrap().locations, [0, 1]);
+
+        // 数量不变但成员、顺序和分组都变化,不能按数量复用下标。
+        push_result(&mut app, response(&[3, 2, 4]));
+        let result = app.search_result.as_ref().unwrap();
+        assert_eq!(result.groups.len(), 3);
+        assert!(result.document(1).is_none());
+        assert!(result.group(1).is_none());
+        assert_eq!(result.group(2).unwrap().locations, [1]);
+        assert_eq!(result.document(4).unwrap().document.id, 4);
+
+        push_result(&mut app, response(&[]));
+        assert!(app.search_result.as_ref().unwrap().groups.is_empty());
     }
 
     #[test]

@@ -706,6 +706,10 @@ pub fn delete_source_root(conn: &mut Connection, source_root: &str) -> anyhow::R
         "DELETE FROM documents WHERE source_root = ?1",
         params![source_root],
     )?;
+    tx.execute(
+        "DELETE FROM settings WHERE key = ?1",
+        [folder_extensions_key(source_root)],
+    )?;
     tx.commit().context("提交移除文件夹事务失败")?;
     Ok(deleted)
 }
@@ -835,6 +839,34 @@ pub fn finish_run(
 }
 
 // ---------- settings / stats ----------
+
+pub(crate) const FOLDER_EXTENSIONS_PREFIX: &str = "folder_import_extensions:";
+
+fn folder_extensions_key(source_root: &str) -> String {
+    format!("{FOLDER_EXTENSIONS_PREFIX}{source_root}")
+}
+
+/// source_root 必须与 documents.source_root 一样使用规范化绝对路径。
+pub fn folder_import_extensions(
+    conn: &Connection,
+    source_root: &str,
+) -> anyhow::Result<Option<std::collections::BTreeSet<String>>> {
+    get_setting(conn, &folder_extensions_key(source_root))?
+        .map(|value| serde_json::from_str(&value).context("读取文件夹索引类型失败"))
+        .transpose()
+}
+
+pub fn set_folder_import_extensions(
+    conn: &Connection,
+    source_root: &str,
+    extensions: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<()> {
+    set_setting(
+        conn,
+        &folder_extensions_key(source_root),
+        &serde_json::to_string(extensions)?,
+    )
+}
 
 pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     let value = conn

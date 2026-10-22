@@ -16,6 +16,48 @@ const RESULT_PANE_HEIGHT: f32 = 620.0;
 /// 左右分栏阈值:低于该宽度时结果/预览上下排。
 const TWO_PANE_MIN_WIDTH: f32 = 900.0;
 
+/// 缓存实际卡片尺寸,保留标题换行和多位置链接造成的可变行高。
+/// 首次/布局条件改变时测量全部卡片,普通重绘只构建视口内卡片。
+#[derive(Default)]
+pub(super) struct SearchCardCache {
+    width: f32,
+    pixels_per_point: f32,
+    style: Option<Arc<egui::Style>>,
+    sizes: std::collections::HashMap<i64, egui::Vec2>,
+}
+
+impl SearchCardCache {
+    fn prepare(&mut self, ui: &egui::Ui) {
+        let width = ui.available_width();
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        if self.width != width
+            || self.pixels_per_point != pixels_per_point
+            || self.style.as_ref() != Some(ui.style())
+        {
+            self.sizes.clear();
+            self.width = width;
+            self.pixels_per_point = pixels_per_point;
+            self.style = Some(Arc::clone(ui.style()));
+        }
+    }
+
+    fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        document_id: i64,
+        add_card: impl FnOnce(&mut egui::Ui) -> egui::Vec2,
+    ) {
+        if let Some(&size) = self.sizes.get(&document_id)
+            && !ui.is_rect_visible(egui::Rect::from_min_size(ui.next_widget_position(), size))
+        {
+            // 与真实 Frame 一样推进布局,保留滚动范围和后续卡片的位置。
+            ui.allocate_exact_size(size, egui::Sense::hover());
+        } else {
+            self.sizes.insert(document_id, add_card(ui));
+        }
+    }
+}
+
 /// 全部文档类型(类型过滤的复选框顺序)。
 const FILE_TYPES: [FileType; 6] = [
     FileType::Word,
@@ -257,7 +299,7 @@ impl RsouApp {
         } else if let Some(response) = &self.search_result {
             let summary = format!(
                 "展示 {} 组结果，共 {} 个文件位置 · 耗时 {:.0} ms{}",
-                response.representatives().count(),
+                response.groups.len(),
                 response.documents.len(),
                 response.elapsed_ms,
                 if response.total_documents > response.documents.len() {
@@ -351,25 +393,24 @@ impl RsouApp {
                                 );
                                 return;
                             }
-                            for representative in response.representatives() {
-                                let locations: Vec<_> =
-                                    response.locations(representative.group_id).collect();
-                                let doc_hit = self
-                                    .search_locations
-                                    .get(&representative.group_id)
-                                    .and_then(|id| {
-                                        locations.iter().find(|hit| hit.document.id == *id).copied()
-                                    })
-                                    .unwrap_or(representative);
+                            self.search_card_cache.prepare(ui);
+                            for group in &response.groups {
+                                let doc_hit = response
+                                    .selected(group, self.search_locations.get(&group.id).copied());
                                 let selected = self.preview_doc_id == Some(doc_hit.document.id);
-                                ui_doc_card(
-                                    ui,
-                                    doc_hit,
-                                    locations.len(),
-                                    selected,
-                                    &mut focus,
-                                    &mut open_locations,
-                                );
+                                // 屏外占位不能改变其余卡片内部控件的 ID。
+                                ui.push_id(group.id, |ui| {
+                                    self.search_card_cache.show(ui, doc_hit.document.id, |ui| {
+                                        ui_doc_card(
+                                            ui,
+                                            doc_hit,
+                                            group.locations.len(),
+                                            selected,
+                                            &mut focus,
+                                            &mut open_locations,
+                                        )
+                                    });
+                                });
                                 ui.add_space(8.0);
                             }
                         });
@@ -389,21 +430,13 @@ impl RsouApp {
         let document = self.preview_doc_id.and_then(|id| {
             self.search_result
                 .as_ref()?
-                .documents
-                .iter()
-                .find(|d| d.document.id == id)
+                .document(id)
                 .map(|d| d.document.clone())
         });
         let complete_locations = self.preview_locations.clone();
         let initial_offsets = self
             .preview_doc_id
-            .and_then(|id| {
-                self.search_result
-                    .as_ref()?
-                    .documents
-                    .iter()
-                    .find(|d| d.document.id == id)
-            })
+            .and_then(|id| self.search_result.as_ref()?.document(id))
             .map(preview_hit_offsets)
             .unwrap_or_default();
         let hit_offsets = complete_locations
@@ -447,13 +480,10 @@ impl RsouApp {
                         );
                         ui.horizontal(|ui| {
                             if let Some(response) = &self.search_result
-                                && let Some(current) = response
-                                    .documents
-                                    .iter()
-                                    .find(|hit| hit.document.id == doc.id)
+                                && let Some(current) = response.document(doc.id)
+                                && let Some(group) = response.group(current.group_id)
                             {
-                                let locations: Vec<_> =
-                                    response.locations(current.group_id).collect();
+                                let locations = &group.locations;
                                 if locations.len() > 1 {
                                     let mut open =
                                         self.location_popup_group == Some(current.group_id);
@@ -527,7 +557,8 @@ impl RsouApp {
                                                 .max_height(240.0)
                                                 .show(ui, |ui| {
                                                     ui.spacing_mut().item_spacing.y = 2.0;
-                                                    for location in locations {
+                                                    for &index in locations {
+                                                        let location = &response.documents[index];
                                                         let selected =
                                                             location.document.id == doc.id;
                                                         if Self::menu_row(
@@ -799,7 +830,7 @@ fn ui_doc_card(
     selected: bool,
     focus: &mut Option<(i64, usize, usize)>,
     open_locations: &mut Option<i64>,
-) {
+) -> egui::Vec2 {
     let doc = &doc_hit.document;
     let first_hit_offset = doc_hit.hits.iter().map(hit_offset).min().unwrap_or(0);
     let (icon, icon_color) = RsouApp::file_type_look(&doc.file_type);
@@ -895,11 +926,163 @@ fn ui_doc_card(
     if response.clicked() {
         *focus = Some((doc.id, 0, first_hit_offset));
     }
+    card.response.rect.size()
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::search_results::tests::doc;
     use super::*;
+
+    /// 使用真实卡片比较缓存前后的布局,同时计数实际构建的卡片。
+    fn draw_cards(
+        ctx: &egui::Context,
+        mut cache: Option<&mut SearchCardCache>,
+        documents: &[DocumentHit],
+        width: f32,
+        scroll: f32,
+    ) -> (Vec<egui::Rect>, Vec<i64>) {
+        let mut rects = Vec::new();
+        let mut built = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                rects.clear();
+                built.clear();
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .vertical_scroll_offset(scroll)
+                        .scroll_bar_visibility(
+                            egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                        )
+                        .show(ui, |ui| {
+                            if let Some(cache) = &mut cache {
+                                cache.prepare(ui);
+                            }
+                            for hit in documents {
+                                let response = ui.push_id(hit.group_id, |ui| {
+                                    let mut add_card = |ui: &mut egui::Ui| {
+                                        built.push(hit.document.id);
+                                        ui_doc_card(
+                                            ui,
+                                            hit,
+                                            if hit.document.id % 3 == 0 { 2 } else { 1 },
+                                            false,
+                                            &mut None,
+                                            &mut None,
+                                        )
+                                    };
+                                    if let Some(cache) = &mut cache {
+                                        cache.show(ui, hit.document.id, add_card);
+                                    } else {
+                                        add_card(ui);
+                                    }
+                                });
+                                rects.push(response.response.rect);
+                                ui.add_space(8.0);
+                            }
+                        });
+                });
+            },
+        );
+        output.textures_delta.clear();
+        (rects, built)
+    }
+
+    #[test]
+    fn cached_cards_skip_offscreen_layout_and_preserve_variable_heights() {
+        let ctx = egui::Context::default();
+        RsouApp::configure_ui_style(&ctx);
+        let documents: Vec<_> = (0..100)
+            .map(|id| {
+                let mut hit = doc(id);
+                if id % 4 == 0 {
+                    hit.document.title = "Long title with wrapping ".repeat(8);
+                }
+                hit
+            })
+            .collect();
+        let mut cache = SearchCardCache::default();
+        let (_, first_built) = draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+        assert_eq!(first_built.len(), 100);
+        for scroll in [0.0, 600.0, 2_000.0, 0.0] {
+            let (cached, built) = draw_cards(&ctx, Some(&mut cache), &documents, 480.0, scroll);
+            let (full, _) = draw_cards(&ctx, None, &documents, 480.0, scroll);
+            assert_eq!(cached, full, "屏外占位必须与实际卡片几何一致");
+            assert!(!built.is_empty());
+            assert!(
+                built.len() < 10,
+                "只应构建视口附近的卡片,实际 {}",
+                built.len()
+            );
+        }
+    }
+
+    #[test]
+    fn card_sizes_are_invalidated_on_width_style_and_scale_changes() {
+        let ctx = egui::Context::default();
+        let documents: Vec<_> = (0..20).map(doc).collect();
+        let mut cache = SearchCardCache::default();
+        draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+        let (_, built) = draw_cards(&ctx, Some(&mut cache), &documents, 360.0, 0.0);
+        assert_eq!(built.len(), 20);
+        ctx.global_style_mut(|style| style.spacing.item_spacing.y += 3.0);
+        let (_, built) = draw_cards(&ctx, Some(&mut cache), &documents, 360.0, 0.0);
+        assert_eq!(built.len(), 20);
+        ctx.set_pixels_per_point(1.5);
+        let (_, built) = draw_cards(&ctx, Some(&mut cache), &documents, 360.0, 0.0);
+        assert_eq!(built.len(), 20);
+    }
+
+    #[test]
+    fn switching_to_an_uncached_location_measures_its_own_title() {
+        let ctx = egui::Context::default();
+        let mut documents: Vec<_> = (0..20).map(doc).collect();
+        let mut cache = SearchCardCache::default();
+        draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+        // 同组副本可能有不同的标题和路径,不能沿用代表文档的尺寸。
+        documents[19].document.id = 200;
+        documents[19].document.title = "A much longer duplicate title ".repeat(20);
+        let (cached, built) = draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+        assert!(built.contains(&200), "屏外新位置也必须先测量");
+        let (full, _) = draw_cards(&ctx, None, &documents, 480.0, 0.0);
+        assert_eq!(cached, full);
+    }
+
+    #[test]
+    #[ignore = "手动对照搜索列表稳定重绘成本,不以运行时间作为 CI 断言"]
+    fn search_list_frame_benchmark() {
+        let ctx = egui::Context::default();
+        RsouApp::configure_ui_style(&ctx);
+        let documents: Vec<_> = (0..100).map(doc).collect();
+        let mut cache = SearchCardCache::default();
+        draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+        let frames = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            std::hint::black_box(draw_cards(&ctx, None, &documents, 480.0, 0.0));
+        }
+        let full = start.elapsed();
+        let start = std::time::Instant::now();
+        let mut built = 0;
+        for _ in 0..frames {
+            let frame = draw_cards(&ctx, Some(&mut cache), &documents, 480.0, 0.0);
+            built += frame.1.len();
+            std::hint::black_box(frame);
+        }
+        eprintln!(
+            "{frames} frames / 100 cards: full={full:?}, cached={:?}, built/frame={}",
+            start.elapsed(),
+            built / frames,
+        );
+    }
 
     #[test]
     fn preview_window_short_text_returns_whole() {
