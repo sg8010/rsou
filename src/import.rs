@@ -51,8 +51,14 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), Cancelled> {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportOptions {
     /// 只导入这些扩展名(不含点,忽略大小写)。None 沿用文件夹设置,
-    /// 没有设置时导入全部支持格式;显式空集合不允许启动导入。
+    /// 没有设置时导入全部支持格式;显式空集合只允许用于文件夹设置。
     pub extensions: Option<BTreeSet<String>>,
+    /// 保存单个来源文件夹的格式设置并移除未选格式的索引(可清空选择)。
+    /// 输入须为库中规范化的来源路径,允许原文件夹离线。
+    /// 新增格式时自动按增量更新处理;仅减少格式时不扫描原文件。
+    /// 设置和移除操作原子提交,后续增量更新被取消时保留已提交的设置。
+    #[serde(default)]
+    pub sync_folder_extensions: bool,
     /// 单文件字节上限(默认 100 MiB)
     pub max_file_bytes: u64,
     /// 显式 OCR 批次:只处理库中 NEEDS_OCR 的失败 PDF,普通导入为 None。
@@ -71,6 +77,7 @@ impl Default for ImportOptions {
     fn default() -> Self {
         Self {
             extensions: None,
+            sync_folder_extensions: false,
             max_file_bytes: 100 * 1024 * 1024,
             ocr_base_url: None,
             force: false,
@@ -397,16 +404,28 @@ pub(crate) fn run_import_in_run(
     let mut conn = crate::store::open(db_path, crate::store::OpenMode::ReadWrite)
         .context("导入前打开索引库失败")?;
 
-    let (kind, root) = classify_inputs(&inputs);
+    // 文件夹设置的目标是已保存的来源路径,即使原文件夹离线也允许减少格式。
+    let (kind, root) = if options.sync_folder_extensions && inputs.len() == 1 {
+        ("folder", Some(inputs[0].clone()))
+    } else {
+        classify_inputs(&inputs)
+    };
     let mut counts = ImportCounts::default();
+    let mut folder_settings_saved = false;
     // 统一收口准备阶段和处理阶段的取消,包括尚未创建 run 的目录扫描。
     let result = (|| -> anyhow::Result<()> {
         check_cancel(&cancel)?;
         if let Some(id) = run_id {
             repo::set_run_source(&conn, id, kind, root.as_deref())?;
         }
-        let existing = load_existing(&conn, &cancel)?;
-        check_cancel(&cancel)?;
+        if options.sync_folder_extensions {
+            anyhow::ensure!(inputs.len() == 1, "文件夹设置只能用于单个来源文件夹");
+            anyhow::ensure!(
+                options.ocr_base_url.is_none(),
+                "文件夹设置不能与 OCR 同时执行"
+            );
+            anyhow::ensure!(options.extensions.is_some(), "请指定文件夹要索引的文件类型");
+        }
         let ocr = options
             .ocr_base_url
             .as_deref()
@@ -416,15 +435,18 @@ pub(crate) fn run_import_in_run(
         // 只有单个目录输入有唯一的文件夹归属。设置与文档都用规范化路径作键。
         let source_root = if kind == "folder" {
             root.as_ref().map(|dir| {
-                dunce::canonicalize(dir)
-                    .unwrap_or_else(|_| absolute(dir))
-                    .to_string_lossy()
-                    .into_owned()
+                let path = if options.sync_folder_extensions {
+                    absolute(dir)
+                } else {
+                    dunce::canonicalize(dir).unwrap_or_else(|_| absolute(dir))
+                };
+                path.to_string_lossy().into_owned()
             })
         } else {
             None
         };
         if ocr.is_none() {
+            let explicit_extensions = options.extensions.is_some();
             if options.extensions.is_none()
                 && let Some(root) = &source_root
             {
@@ -435,7 +457,12 @@ pub(crate) fn run_import_in_run(
                     .iter()
                     .map(|ext| ext.to_ascii_lowercase())
                     .collect();
-                anyhow::ensure!(!extensions.is_empty(), "请至少选择一种要索引的文件类型");
+                anyhow::ensure!(
+                    !extensions.is_empty()
+                        || options.sync_folder_extensions
+                        || !explicit_extensions,
+                    "请至少选择一种要索引的文件类型"
+                );
                 for ext in extensions.iter() {
                     anyhow::ensure!(
                         parse::supported_extensions().contains(&ext.as_str()),
@@ -444,7 +471,42 @@ pub(crate) fn run_import_in_run(
                 }
             }
         }
-        let mut files = if ocr.is_some() {
+        let settings_only = if options.sync_folder_extensions {
+            let root = source_root.as_deref().expect("单个来源文件夹");
+            let extensions = options.extensions.as_ref().expect("已指定文件类型");
+            let previous = repo::folder_import_extensions(&conn, root)?.unwrap_or_else(|| {
+                parse::supported_extensions()
+                    .iter()
+                    .map(|ext| (*ext).to_owned())
+                    .collect()
+            });
+            let added = extensions
+                .iter()
+                .any(|ext| !previous.iter().any(|old| old.eq_ignore_ascii_case(ext)));
+            check_cancel(&cancel)?;
+            repo::sync_folder_import_extensions(&mut conn, root, extensions)?;
+            folder_settings_saved = true;
+            // 与「增量更新」一致,不重试未变化的失败文件、不强制重解析。
+            options.force = false;
+            options.skip_unchanged_failed = true;
+            options.preserve_source_root = true;
+            options.detect_missing = true;
+            !added
+        } else {
+            false
+        };
+        let no_files = settings_only
+            || (ocr.is_none() && options.extensions.as_ref().is_some_and(BTreeSet::is_empty));
+        // 必须在格式清理之后加载,避免复用刚移除文档的跳过信息或正文缓存。
+        let existing = if no_files {
+            HashMap::new()
+        } else {
+            load_existing(&conn, &cancel)?
+        };
+        check_cancel(&cancel)?;
+        let mut files = if no_files {
+            Vec::new()
+        } else if ocr.is_some() {
             options.force = true;
             options.preserve_source_root = true;
             // 以库中当前状态为准,防止 GUI 缓存过期后重写已成功的文档。
@@ -466,7 +528,7 @@ pub(crate) fn run_import_in_run(
             })?
         };
         check_cancel(&cancel)?;
-        let missing = if options.detect_missing && ocr.is_none() {
+        let missing = if !no_files && options.detect_missing && ocr.is_none() {
             collect_missing(&inputs, &existing, &cancel, options.extensions.as_ref())?
         } else {
             HashMap::new()
@@ -479,7 +541,7 @@ pub(crate) fn run_import_in_run(
         counts.total = files.len();
         check_cancel(&cancel)?;
         // force(含显式 OCR)保留逐文件重新解析语义,不复用任何旧结果。
-        let reuse = if options.force {
+        let reuse = if options.force || no_files {
             None
         } else {
             Some(ReuseCache::new(
@@ -501,6 +563,7 @@ pub(crate) fn run_import_in_run(
         run_id = Some(id);
         check_cancel(&cancel)?;
         if ocr.is_none()
+            && !options.sync_folder_extensions
             && let (Some(root), Some(extensions)) = (&source_root, &options.extensions)
         {
             repo::set_folder_import_extensions(&conn, root, extensions)?;
@@ -572,7 +635,16 @@ pub(crate) fn run_import_in_run(
             consume_results(&mut conn, id, rx, &mut counts, &cancel, on_event)
         })
     })();
-    let first_error = result.err().filter(|error| !error.is::<Cancelled>());
+    let first_error = result
+        .err()
+        .filter(|error| !error.is::<Cancelled>())
+        .map(|error| {
+            if folder_settings_saved {
+                error.context("文件夹设置已保存,但后续增量更新失败;可稍后重试「增量更新」")
+            } else {
+                error
+            }
+        });
     // 无法启动的真正错误保持原语义:由调用方报告 Error,不伪装成取消。
     if run_id.is_none()
         && let Some(error) = first_error

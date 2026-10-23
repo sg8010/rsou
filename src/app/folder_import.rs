@@ -1,4 +1,4 @@
-//! 文件夹导入前的扩展名选择;Linux 与原生文件夹对话框共用。
+//! 文件夹导入与设置共用的扩展名选择;Linux 与原生文件夹对话框共用。
 
 use std::collections::BTreeSet;
 
@@ -8,9 +8,16 @@ use rsou_lib::repo;
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FolderMode {
+    Import,
+    Settings,
+}
+
 pub(super) struct FolderImport {
     path: PathBuf,
     extensions: BTreeSet<String>,
+    mode: FolderMode,
 }
 
 impl FolderImport {
@@ -91,13 +98,30 @@ impl FolderImport {
 
 impl RsouApp {
     pub(super) fn prepare_folder_import(&mut self, path: PathBuf) {
+        self.prepare_folder_formats(path, FolderMode::Import);
+    }
+
+    pub(super) fn prepare_folder_settings(&mut self, path: PathBuf) {
+        self.prepare_folder_formats(path, FolderMode::Settings);
+    }
+
+    fn prepare_folder_formats(&mut self, path: PathBuf, mode: FolderMode) {
+        if self.import_active || self.maintenance_active {
+            return;
+        }
         let Some(conn) = &self.db else { return };
-        let path = dunce::canonicalize(&path).unwrap_or(path);
+        // 设置操作精确沿用列表中的来源键,不因原文件夹离线或路径变化改写归属。
+        let path = if mode == FolderMode::Import {
+            dunce::canonicalize(&path).unwrap_or(path)
+        } else {
+            path
+        };
         match repo::folder_import_extensions(conn, &path.to_string_lossy()) {
             Ok(extensions) => {
                 self.folder_import = Some(FolderImport {
                     path,
                     extensions: extensions.unwrap_or_else(FolderImport::all_extensions),
+                    mode,
                 });
             }
             Err(error) => {
@@ -111,15 +135,26 @@ impl RsouApp {
             return;
         };
         let busy = self.import_active || self.maintenance_active || self.db.is_none();
+        let settings = pending.mode == FolderMode::Settings;
         let mut confirm = false;
         let response =
             egui::Modal::new(egui::Id::new("rsou-folder-import-types")).show(ctx, |ui| {
                 ui.set_width(540.0_f32.min(ctx.content_rect().width() - 48.0));
-                Self::card_title(ui, "选择要索引的文件类型");
+                Self::card_title(
+                    ui,
+                    if settings {
+                        "文件夹设置"
+                    } else {
+                        "选择要索引的文件类型"
+                    },
+                );
                 ui.add_space(8.0);
                 ui.add(egui::Label::new(pending.path.display().to_string()).truncate())
                     .on_hover_text(pending.path.display().to_string());
                 ui.add_space(8.0);
+                if settings {
+                    ui.label(egui::RichText::new("索引文件格式").strong());
+                }
                 ui.label("递归扫描此文件夹及子文件夹,只导入勾选的格式。");
                 ui.horizontal(|ui| {
                     if Self::link_button(ui, "全选").clicked() {
@@ -139,16 +174,29 @@ impl RsouApp {
                     .show(ui, |ui| pending.ui_types(ui));
                 ui.separator();
                 ui.label(
-                    egui::RichText::new(concat!(
-                        "此选择会保存到该文件夹,重新扫描和重解析时沿用。\n",
-                        "取消勾选不会移除已入库文档;单独添加文件不受此限制。",
-                    ))
+                    egui::RichText::new(if settings {
+                        concat!(
+                            "新增格式时执行增量更新,跳过未变化的文件。\n",
+                            "取消勾选会移除此文件夹相应格式的索引及失败记录,不删除原文件。\n",
+                            "单独添加的文件不受影响;重新扫描和重解析时沿用此选择。",
+                        )
+                    } else {
+                        concat!(
+                            "此选择会保存到该文件夹,重新扫描和重解析时沿用。\n",
+                            "取消勾选不会移除已入库文档;单独添加文件不受此限制。",
+                        )
+                    })
                     .size(12.0)
                     .color(Self::text_secondary()),
                 );
                 if pending.extensions.is_empty() {
                     ui.label(
-                        egui::RichText::new("请至少选择一种文件类型。").color(Self::warning()),
+                        egui::RichText::new(if settings {
+                            "保存后将移除此文件夹的全部文档索引,保留文件夹设置与原文件。"
+                        } else {
+                            "请至少选择一种文件类型。"
+                        })
+                        .color(Self::warning()),
                     );
                 }
                 ui.add_space(12.0);
@@ -156,9 +204,13 @@ impl RsouApp {
                     confirm = Self::primary_button(
                         ui,
                         None,
-                        "开始索引",
+                        if settings {
+                            "保存设置"
+                        } else {
+                            "开始索引"
+                        },
                         100.0,
-                        !busy && !pending.extensions.is_empty(),
+                        !busy && (settings || !pending.extensions.is_empty()),
                     )
                     .clicked();
                     if Self::secondary_button(ui, None, "取消", 80.0, true).clicked() {
@@ -175,6 +227,7 @@ impl RsouApp {
                 vec![pending.path],
                 ImportOptions {
                     extensions: Some(pending.extensions),
+                    sync_folder_extensions: settings,
                     ..Default::default()
                 },
             );
@@ -240,6 +293,7 @@ mod tests {
             let mut pending = FolderImport {
                 path: PathBuf::new(),
                 extensions: all.clone(),
+                mode: FolderMode::Import,
             };
             click_category(&ctx, &mut pending, kind);
             for ext in &all {
@@ -262,6 +316,7 @@ mod tests {
         let mut pending = FolderImport {
             path: PathBuf::new(),
             extensions: BTreeSet::from(["csv".to_owned(), "pdf".to_owned()]),
+            mode: FolderMode::Import,
         };
         let expected: BTreeSet<_> = ["xls", "xlsx", "xlsm", "xlsb", "ods", "csv", "pdf"]
             .into_iter()

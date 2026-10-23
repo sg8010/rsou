@@ -140,6 +140,7 @@ pub(crate) enum PendingConfirm {
 #[derive(Default)]
 pub(crate) struct ImportProgress {
     pub is_ocr: bool,
+    pub is_folder_settings: bool,
     pub counts: ImportCounts,
     /// 最近处理完的文件
     pub current_path: Option<PathBuf>,
@@ -295,7 +296,7 @@ pub struct RsouApp {
     prev_page: Page,
     /// 导入进度(进度卡与顶栏徽标)
     import_progress: ImportProgress,
-    /// 选定文件夹后,确认要索引的扩展名;确认前不启动扫描。
+    /// 文件夹导入或设置的格式选择;确认前不扫描、不改库。
     folder_import: Option<folder_import::FolderImport>,
     /// 导入线程事件通道(世代号随通道存,防上一轮残留接收端被误用)
     import_rx: Option<(u64, Receiver<ImportEvent>)>,

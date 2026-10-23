@@ -69,6 +69,48 @@ fn isolated_import_reports_failures_and_preserves_options() {
 }
 
 #[test]
+fn isolated_folder_settings_add_remove_and_clear_formats() {
+    let dir = common::temp_dir("isolated-folder-settings");
+    let docs = dir.join("docs");
+    std::fs::create_dir(&docs).unwrap();
+    std::fs::write(docs.join("文本.TXT"), "文本正文").unwrap();
+    std::fs::write(docs.join("笔记.md"), "笔记正文").unwrap();
+    let db = dir.join("index.db");
+    for (extensions, sync, expected_ok, expected_documents) in [
+        (vec!["txt"], false, 1, 1),
+        (vec!["md"], true, 1, 1),
+        (vec![], true, 0, 0),
+    ] {
+        let selected = extensions.into_iter().map(str::to_owned).collect();
+        let counts = import_process::run_import(
+            Path::new(env!("CARGO_BIN_EXE_rsou-cli")),
+            &db,
+            vec![docs.clone()],
+            ImportOptions {
+                extensions: Some(selected),
+                sync_folder_extensions: sync,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(counts.ok, expected_ok);
+        let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+        let snapshot = repo::library_snapshot(&conn).unwrap();
+        assert_eq!(snapshot.folders.len(), 1);
+        assert_eq!(snapshot.folders[0].total, expected_documents);
+        assert_eq!(
+            repo::list_documents(&conn).unwrap().len() as u64,
+            expected_documents
+        );
+        assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+    }
+    assert!(docs.join("文本.TXT").exists());
+    assert!(docs.join("笔记.md").exists());
+}
+
+#[test]
 fn isolated_cancel_request_finishes_and_preserves_committed_counts() {
     let dir = common::temp_dir("isolated-cancel");
     let path = dir.join("a.txt");

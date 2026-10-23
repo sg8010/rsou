@@ -116,6 +116,8 @@ enum RowAction {
     AskRemoveFolder(String, u64),
     /// 重解析整个来源文件夹(递归强制重导)
     ReimportFolder(String),
+    /// 修改来源文件夹的索引格式。
+    FolderSettings(String),
     /// 定位来源文件夹
     RevealFolder(String),
     /// 在资料库内部选中并滚动到来源文件夹。
@@ -188,6 +190,8 @@ impl RsouApp {
                             "正在取消"
                         } else if self.import_progress.is_ocr {
                             "正在 OCR"
+                        } else if self.import_progress.is_folder_settings {
+                            "正在应用文件夹设置"
                         } else {
                             "正在导入"
                         },
@@ -197,6 +201,8 @@ impl RsouApp {
                             "正在停止后台任务，已入库数据将保留"
                         } else if self.import_progress.is_ocr {
                             "识别完成后自动加入全文索引"
+                        } else if self.import_progress.is_folder_settings {
+                            "移除未选格式的索引,新增格式按增量更新处理"
                         } else {
                             "正在解析文档并建立全文索引"
                         })
@@ -690,7 +696,7 @@ impl RsouApp {
             .column(Column::exact(72.0))
             .column(Column::exact(72.0))
             .column(Column::exact(72.0))
-            .column(Column::exact(284.0));
+            .column(Column::exact(324.0));
         if let Some(index) = scroll_to {
             table = table.scroll_to_row(index, Some(egui::Align::Center));
         }
@@ -745,6 +751,14 @@ impl RsouApp {
                                 action = Some(RowAction::RevealFolder(folder.root.clone()));
                             }
                             if ui
+                                .add_enabled_ui(!busy, |ui| Self::link_button(ui, "设置"))
+                                .inner
+                                .on_hover_text("选择文件格式;新增格式按增量更新处理,取消格式会移除相应索引")
+                                .clicked()
+                            {
+                                action = Some(RowAction::FolderSettings(folder.root.clone()));
+                            }
+                            if ui
                                 .add_enabled_ui(!busy, |ui| Self::link_button(ui, "增量更新"))
                                 .inner
                                 .on_hover_text("递归更新新增或修改的文件，标记原文件不存在的文档；跳过其他未变化文件")
@@ -788,6 +802,9 @@ impl RsouApp {
         let ctx = ui.ctx().clone();
         match action {
             Some(RowAction::LocateFolder(root)) => self.locate_library_folder(root),
+            Some(RowAction::FolderSettings(root)) => {
+                self.prepare_folder_settings(PathBuf::from(root));
+            }
             Some(RowAction::Open(path)) => {
                 if let Err(error) = platform::open_path(&path) {
                     self.library_notice = Some(error);

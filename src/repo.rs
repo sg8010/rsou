@@ -247,17 +247,24 @@ pub fn list_failed_documents(conn: &Connection) -> anyhow::Result<Vec<DocumentRo
     Ok(rows)
 }
 
-/// 按来源文件夹汇总数量,按路径排序;不读取文件名、标题、错误文本或正文。
+/// 按来源文件夹汇总数量,按路径排序;保留已保存格式设置但没有文档的文件夹。
+/// 不读取文件名、标题、错误文本或正文。
 pub fn list_source_root_summaries(conn: &Connection) -> anyhow::Result<Vec<SourceRootSummary>> {
     let mut statement = conn.prepare(
         "SELECT source_root, count(*), \
          count(*) FILTER (WHERE parse_status = 'parsed'), \
          count(*) FILTER (WHERE parse_status = 'failed') \
          FROM documents WHERE source_root IS NOT NULL \
-         GROUP BY source_root ORDER BY source_root ASC",
+         GROUP BY source_root \
+         UNION ALL \
+         SELECT substr(key, length(?1) + 1), 0, 0, 0 FROM settings \
+         WHERE substr(key, 1, length(?1)) = ?1 \
+         AND NOT EXISTS (SELECT 1 FROM documents \
+                         WHERE source_root = substr(settings.key, length(?1) + 1)) \
+         ORDER BY 1 ASC",
     )?;
     let summaries = statement
-        .query_map([], |row| {
+        .query_map([FOLDER_EXTENSIONS_PREFIX], |row| {
             Ok(SourceRootSummary {
                 root: row.get(0)?,
                 // COUNT 恒非负;保留 64 位计数,不受 32 位进程的 usize 宽度限制。
@@ -883,6 +890,33 @@ pub fn set_folder_import_extensions(
     )
 }
 
+/// 文件夹设置专用:在同一个立即事务里保存格式选择并移除未选格式的全部库记录。
+/// 调用方须先验证并规范化扩展名;允许空集合,不删除原文件或文件夹设置。
+pub(crate) fn sync_folder_import_extensions(
+    conn: &mut Connection,
+    source_root: &str,
+    extensions: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<usize> {
+    let selected = serde_json::to_string(extensions)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("开启保存文件夹设置事务失败")?;
+    tx.execute(
+        "DELETE FROM documents_fts WHERE rowid IN \
+         (SELECT id FROM documents WHERE source_root = ?1 \
+          AND ext COLLATE NOCASE NOT IN (SELECT value FROM json_each(?2)))",
+        params![source_root, selected],
+    )?;
+    let deleted = tx.execute(
+        "DELETE FROM documents WHERE source_root = ?1 \
+         AND ext COLLATE NOCASE NOT IN (SELECT value FROM json_each(?2))",
+        params![source_root, selected],
+    )?;
+    set_folder_import_extensions(&tx, source_root, extensions)?;
+    tx.commit().context("提交保存文件夹设置事务失败")?;
+    Ok(deleted)
+}
+
 pub fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
     let value = conn
         .query_row(
@@ -1037,6 +1071,37 @@ mod tests {
         assert!(snapshot.failed.is_empty());
         assert!(snapshot.folders.is_empty());
         assert!(conn.is_autocommit(), "快照读取结束后必须释放读事务");
+    }
+
+    #[test]
+    fn folder_settings_roll_back_pruning_and_fts_when_saving_fails() {
+        let mut conn = crate::store::open_in_memory().unwrap();
+        let id = save_doc(&mut conn, "/a/1.txt", Some("/a"));
+        let selected = ["txt".to_owned()].into();
+        set_folder_import_extensions(&conn, "/a", &selected).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_folder_settings BEFORE INSERT ON settings \
+             BEGIN SELECT RAISE(ABORT, '模拟保存失败'); END;",
+        )
+        .unwrap();
+
+        assert!(sync_folder_import_extensions(&mut conn, "/a", &Default::default()).is_err());
+        assert_eq!(
+            folder_import_extensions(&conn, "/a").unwrap(),
+            Some(selected)
+        );
+        assert!(
+            get_documents_by_ids(&conn, &[id])
+                .unwrap()
+                .contains_key(&id)
+        );
+        assert_eq!(library_snapshot(&conn).unwrap().folders[0].parsed, 1);
+        assert!(
+            crate::maintain::check_integrity(&conn)
+                .unwrap()
+                .is_consistent()
+        );
+        assert!(conn.is_autocommit());
     }
 
     #[test]

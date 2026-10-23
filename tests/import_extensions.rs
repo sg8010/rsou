@@ -20,6 +20,13 @@ fn options(extensions: &[&str]) -> ImportOptions {
     }
 }
 
+fn settings(extensions: &[&str]) -> ImportOptions {
+    ImportOptions {
+        sync_folder_extensions: true,
+        ..options(extensions)
+    }
+}
+
 fn fixture(tag: &str) -> (PathBuf, PathBuf) {
     let dir = common::temp_dir(tag);
     let docs = dir.join("资料");
@@ -191,6 +198,221 @@ fn no_matching_files_does_not_fall_back_to_all_formats() {
     assert_eq!(run(&db, &docs, ImportOptions::default()).total, 0);
     std::fs::write(docs.join("新文档.docx"), common::docx_fixture()).unwrap();
     assert_eq!(run(&db, &docs, ImportOptions::default()).ok, 1);
+}
+
+#[test]
+fn adding_settings_formats_uses_incremental_update_including_missing_files() {
+    let (db, docs) = fixture("extension-settings-add");
+    run(&db, &docs, options(&["txt", "pdf"]));
+    let conn = store::open(&db, store::OpenMode::ReadOnly).unwrap();
+    let failed_before = repo::find_document_by_path(&conn, &docs.join("坏文件.pdf"))
+        .unwrap()
+        .unwrap();
+    drop(conn);
+    std::fs::write(docs.join("保留.TXT"), "修改后的文档正文").unwrap();
+    std::fs::remove_file(docs.join("子目录/保留.txt")).unwrap();
+    std::fs::write(docs.join("新增.txt"), "新增文档").unwrap();
+
+    let counts = run(&db, &docs, settings(&["TXT", "MD", "PDF"]));
+    assert_eq!(
+        (counts.total, counts.ok, counts.failed, counts.skipped),
+        (5, 3, 1, 1)
+    );
+    let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    let failed_after = repo::find_document_by_path(&conn, &docs.join("坏文件.pdf"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed_after.updated_at, failed_before.updated_at);
+    assert_eq!(
+        failed_after.parse_error_code,
+        failed_before.parse_error_code
+    );
+    let missing = repo::find_document_by_path(&conn, &docs.join("子目录/保留.txt"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(missing.parse_error_code.as_deref(), Some("FILE_MISSING"));
+    assert!(
+        repo::list_documents(&conn)
+            .unwrap()
+            .iter()
+            .all(|doc| doc.source_root.as_deref() == docs.to_str())
+    );
+    assert_eq!(
+        repo::folder_import_extensions(&conn, &docs.to_string_lossy()).unwrap(),
+        Some(selection(&["txt", "md", "pdf"]))
+    );
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+}
+
+#[test]
+fn removing_settings_formats_cleans_only_exact_folder_records_without_rescanning() {
+    let (db, docs) = fixture("extension-settings-remove");
+    std::fs::write(docs.join("笔记.md"), "removedformatkeyword").unwrap();
+    run(&db, &docs, ImportOptions::default());
+    let conn = store::open(&db, store::OpenMode::ReadOnly).unwrap();
+    let removed_id = repo::find_document_by_path(&conn, &docs.join("笔记.md"))
+        .unwrap()
+        .unwrap()
+        .id;
+    drop(conn);
+
+    let other = docs.with_file_name("资料-其他");
+    let nested = docs.join("另一个来源");
+    for root in [&other, &nested] {
+        std::fs::create_dir(root).unwrap();
+        std::fs::write(root.join("保留.md"), "其他来源的正文").unwrap();
+        run(&db, root, options(&["md"]));
+    }
+    let standalone = docs.join("单独文件.md");
+    std::fs::write(&standalone, "单独添加的正文").unwrap();
+    run(&db, &standalone, ImportOptions::default());
+    // 仅减少格式不应顺带扫描新增文件,也不需要原文件仍可访问。
+    std::fs::write(docs.join("尚未索引.txt"), "下次更新再收录").unwrap();
+    let counts = run(&db, &docs, settings(&["txt"]));
+    assert_eq!(counts.total, 0);
+    let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    let documents = repo::list_documents(&conn).unwrap();
+    assert_eq!(documents.len(), 5);
+    assert_eq!(repo::list_failed_documents(&conn).unwrap().len(), 0);
+    let root_docs: Vec<_> = documents
+        .iter()
+        .filter(|doc| doc.source_root.as_deref() == docs.to_str())
+        .collect();
+    assert_eq!(root_docs.len(), 2);
+    assert!(root_docs.iter().all(|doc| doc.ext == "txt"));
+    assert_eq!(repo::list_standalone_documents(&conn).unwrap().len(), 1);
+    for sql in [
+        "SELECT count(*) FROM documents_fts WHERE rowid = ?1",
+        "SELECT count(*) FROM document_contents WHERE document_id = ?1",
+        "SELECT count(*) FROM chunks WHERE document_id = ?1",
+        "SELECT count(*) FROM import_items WHERE document_id = ?1",
+    ] {
+        let count: i64 = conn.query_row(sql, [removed_id], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "{sql}");
+    }
+    let matches: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM documents_fts WHERE documents_fts MATCH 'removedformatkeyword'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(matches, 0);
+    assert!(docs.join("笔记.md").exists());
+    assert!(docs.join("坏文件.pdf").exists());
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+}
+
+#[test]
+fn replacing_formats_prunes_old_records_before_reusing_duplicate_content() {
+    let (db, docs) = fixture("extension-settings-replace");
+    std::fs::write(docs.join("笔记.md"), "正文甲").unwrap();
+    run(&db, &docs, options(&["txt"]));
+    let counts = run(&db, &docs, settings(&["md"]));
+    assert_eq!((counts.total, counts.ok, counts.failed), (1, 1, 0));
+    let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    let documents = repo::list_documents(&conn).unwrap();
+    assert_eq!(documents.len(), 1);
+    assert_eq!(documents[0].ext, "md");
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+}
+
+#[test]
+fn clearing_settings_keeps_offline_folder_manageable_and_allows_reenabling_formats() {
+    let (db, docs) = fixture("extension-settings-empty");
+    run(&db, &docs, options(&["txt", "md"]));
+    let offline = docs.with_file_name("暂时离线");
+    std::fs::rename(&docs, &offline).unwrap();
+    assert_eq!(run(&db, &docs, settings(&[])).total, 0);
+    let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    assert!(repo::list_documents(&conn).unwrap().is_empty());
+    assert_eq!(
+        repo::folder_import_extensions(&conn, &docs.to_string_lossy()).unwrap(),
+        Some(BTreeSet::new())
+    );
+    let folders = repo::library_snapshot(&conn).unwrap().folders;
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].root, docs.to_string_lossy());
+    assert_eq!(
+        (folders[0].total, folders[0].parsed, folders[0].failed),
+        (0, 0, 0)
+    );
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
+    drop(conn);
+
+    std::fs::rename(&offline, &docs).unwrap();
+    for force in [false, true] {
+        assert_eq!(
+            run(
+                &db,
+                &docs,
+                ImportOptions {
+                    force,
+                    ..Default::default()
+                }
+            )
+            .total,
+            0
+        );
+    }
+    assert_eq!(run(&db, &docs, settings(&["md"])).ok, 1);
+    assert_eq!(run(&db, &docs, settings(&[])).total, 0);
+    let mut conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    assert_eq!(
+        repo::delete_source_root(&mut conn, &docs.to_string_lossy()).unwrap(),
+        0
+    );
+    assert!(repo::library_snapshot(&conn).unwrap().folders.is_empty());
+}
+
+#[test]
+fn invalid_or_precancelled_settings_do_not_change_indexes_or_preferences() {
+    let (db, docs) = fixture("extension-settings-invalid");
+    run(&db, &docs, options(&["txt"]));
+    for (options, inputs) in [
+        (settings(&["xyz"]), vec![docs.clone()]),
+        (settings(&["md"]), vec![docs.clone(), docs.clone()]),
+        (
+            ImportOptions {
+                extensions: None,
+                ..settings(&["md"])
+            },
+            vec![docs.clone()],
+        ),
+        (
+            ImportOptions {
+                ocr_base_url: Some("http://127.0.0.1:1".into()),
+                ..settings(&["md"])
+            },
+            vec![docs.clone()],
+        ),
+    ] {
+        assert!(
+            import::run_import(
+                &db,
+                inputs,
+                options,
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .is_err()
+        );
+    }
+    import::run_import(
+        &db,
+        vec![docs.clone()],
+        settings(&[]),
+        Arc::new(AtomicBool::new(true)),
+        &mut |_| {},
+    )
+    .unwrap();
+    let conn = store::open(&db, store::OpenMode::ReadWrite).unwrap();
+    assert_eq!(repo::list_documents(&conn).unwrap().len(), 2);
+    assert_eq!(
+        repo::folder_import_extensions(&conn, &docs.to_string_lossy()).unwrap(),
+        Some(selection(&["txt"]))
+    );
+    assert!(maintain::check_integrity(&conn).unwrap().is_consistent());
 }
 
 #[test]

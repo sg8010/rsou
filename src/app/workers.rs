@@ -247,6 +247,7 @@ impl RsouApp {
         self.import_active = true;
         self.import_progress = ImportProgress {
             is_ocr: options.ocr_base_url.is_some(),
+            is_folder_settings: options.sync_folder_extensions,
             ..Default::default()
         };
         self.import_gen += 1;
@@ -316,6 +317,8 @@ impl RsouApp {
             self.library_notice = Some(
                 if self.import_progress.is_ocr {
                     "正在取消 OCR 等待,服务端已接收的任务可能继续运行…"
+                } else if self.import_progress.is_folder_settings {
+                    "正在停止后台更新；已提交的文件夹设置、索引移除和导入结果将保留…"
                 } else {
                     "正在停止后台导入；已入库数据将保留…"
                 }
@@ -1051,6 +1054,8 @@ impl RsouApp {
                         finished = true;
                         let operation = if self.import_progress.is_ocr {
                             "OCR"
+                        } else if self.import_progress.is_folder_settings {
+                            "文件夹设置更新"
                         } else {
                             "导入"
                         };
@@ -1059,6 +1064,8 @@ impl RsouApp {
                                 "{operation}已取消:处理 {}/{} 个文件",
                                 counts.processed, counts.total
                             )
+                        } else if self.import_progress.is_folder_settings && counts.total == 0 {
+                            "文件夹设置已保存，未选格式的索引已移除，原文件不受影响。".to_owned()
                         } else {
                             format!(
                                 "{operation}完成:成功 {}、失败 {}、跳过 {}(共 {})",
