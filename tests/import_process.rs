@@ -17,6 +17,8 @@ fn isolated_import_reports_failures_and_preserves_options() {
     std::fs::write(docs.join("忽略.md"), "不导入").unwrap();
     let db = dir.join("index.db");
     let mut terminal = None;
+    let mut scanning = Vec::new();
+    let mut scan_complete = false;
     let counts = import_process::run_import(
         Path::new(env!("CARGO_BIN_EXE_rsou-cli")),
         &db,
@@ -26,18 +28,31 @@ fn isolated_import_reports_failures_and_preserves_options() {
             ..Default::default()
         },
         Arc::new(AtomicBool::new(false)),
-        &mut |event| {
-            if let ImportEvent::Finished {
+        &mut |event| match event {
+            ImportEvent::Scanning { found } => {
+                assert!(!scan_complete);
+                scanning.push(found);
+            }
+            ImportEvent::Scanned { total } => {
+                assert_eq!(total, 2);
+                assert_eq!(scanning.last(), Some(&total));
+                scan_complete = true;
+            }
+            ImportEvent::FileDone { .. } => assert!(scan_complete),
+            ImportEvent::Finished {
                 cancelled, run_id, ..
-            } = event
-            {
+            } => {
                 assert!(!cancelled);
                 terminal = Some(run_id);
             }
+            ImportEvent::Error { message } => panic!("{message}"),
         },
     )
     .unwrap();
     assert!(terminal.is_some());
+    assert!(scan_complete);
+    assert_eq!(scanning.first(), Some(&0));
+    assert!(scanning.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(
         (counts.total, counts.processed, counts.ok, counts.failed),
         (2, 2, 1, 1)

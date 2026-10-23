@@ -182,12 +182,15 @@ impl RsouApp {
         if self.import_active {
             let mut cancel = false;
             let cancelling = self.import_progress.cancelling;
+            let scanning = self.import_progress.scan_found.is_some();
             Self::card(ui, |ui| {
                 ui.horizontal(|ui| {
                     Self::card_title(
                         ui,
                         if cancelling {
                             "正在取消"
+                        } else if scanning {
+                            "正在扫描文件"
                         } else if self.import_progress.is_ocr {
                             "正在 OCR"
                         } else if self.import_progress.is_folder_settings {
@@ -199,6 +202,8 @@ impl RsouApp {
                     ui.label(
                         egui::RichText::new(if cancelling {
                             "正在停止后台任务，已入库数据将保留"
+                        } else if scanning {
+                            "正在递归查找符合所选格式的文件"
                         } else if self.import_progress.is_ocr {
                             "识别完成后自动加入全文索引"
                         } else if self.import_progress.is_folder_settings {
@@ -224,23 +229,34 @@ impl RsouApp {
                     });
                 });
                 ui.add_space(10.0);
-                let c = &self.import_progress.counts;
-                let fraction = if c.total == 0 {
-                    0.0
+                if let Some(found) = self.import_progress.scan_found {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(16.0).color(Self::accent()));
+                        ui.label(
+                            egui::RichText::new(format!("已发现 {found} 个待索引文件"))
+                                .size(13.0)
+                                .color(Self::text_secondary()),
+                        );
+                    });
                 } else {
-                    c.processed as f32 / c.total as f32
-                };
-                Self::progress_bar(ui, fraction, ui.available_width());
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(format!(
-                        "已处理 {}/{} · 成功 {} · 失败 {} · 跳过 {}",
-                        c.processed, c.total, c.ok, c.failed, c.skipped
-                    ))
-                    .size(13.0)
-                    .color(Self::text_secondary()),
-                );
-                if let Some(path) = &self.import_progress.current_path {
+                    let c = &self.import_progress.counts;
+                    let fraction = if c.total == 0 {
+                        0.0
+                    } else {
+                        c.processed as f32 / c.total as f32
+                    };
+                    Self::progress_bar(ui, fraction, ui.available_width());
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "已处理 {}/{} · 成功 {} · 失败 {} · 跳过 {}",
+                            c.processed, c.total, c.ok, c.failed, c.skipped
+                        ))
+                        .size(13.0)
+                        .color(Self::text_secondary()),
+                    );
+                }
+                if !scanning && let Some(path) = &self.import_progress.current_path {
                     ui.add_space(4.0);
                     ui.add(
                         egui::Label::new(
@@ -713,8 +729,33 @@ impl RsouApp {
                     });
                 }
             })
-            .body(|body| {
+            .body(|mut body| {
+                // 表格默认按上一帧的行 hovered() 绘制底色,行内按钮会抢走悬停。
+                // 固定行高列表直接用当前帧的整行几何命中,不受子控件影响。
+                let spacing = body.ui_mut().spacing().item_spacing;
+                let row_width = body.widths().iter().sum::<f32>()
+                    + spacing.x * (body.widths().len() - 1) as f32;
+                let table_ui = body.ui_mut();
+                let first_row_rect = egui::Rect::from_min_size(
+                    table_ui.available_rect_before_wrap().min,
+                    egui::vec2(row_width, Self::TABLE_ROW_HEIGHT),
+                );
+                let painter = table_ui.painter().clone();
+                let hover_enabled = table_ui.is_enabled() && table_ui.ctx().dragged_id().is_none();
                 body.rows(Self::TABLE_ROW_HEIGHT, filtered.len(), |mut row| {
+                    let row_rect = first_row_rect
+                        .translate(egui::vec2(
+                            0.0,
+                            row.index() as f32 * (Self::TABLE_ROW_HEIGHT + spacing.y),
+                        ))
+                        .expand2(0.5 * spacing);
+                    row.set_hovered(
+                        hover_enabled
+                            && painter.ctx().rect_contains_pointer(
+                                painter.layer_id(),
+                                row_rect.intersect(painter.clip_rect()),
+                            ),
+                    );
                     let folder = &folders[filtered[row.index()]];
                     row.set_selected(selected == Some(folder.root.as_str()));
                     row.col(|ui| {

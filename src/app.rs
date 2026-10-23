@@ -141,6 +141,8 @@ pub(crate) enum PendingConfirm {
 pub(crate) struct ImportProgress {
     pub is_ocr: bool,
     pub is_folder_settings: bool,
+    /// 扫描中已发现的待索引文件数;None 表示尚未扫描或已进入处理阶段。
+    pub scan_found: Option<usize>,
     pub counts: ImportCounts,
     /// 最近处理完的文件
     pub current_path: Option<PathBuf>,

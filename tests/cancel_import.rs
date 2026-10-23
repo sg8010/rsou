@@ -125,6 +125,7 @@ fn cancel_after_scan_skips_pending_items_and_finishes_as_cancelled() {
         ImportOptions::default(),
         Arc::clone(&cancel),
         &mut |event| match event {
+            ImportEvent::Scanning { .. } => {}
             ImportEvent::Scanned { total } => {
                 assert_eq!(total, 1);
                 scanned = true;

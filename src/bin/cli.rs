@@ -251,6 +251,9 @@ fn cmd_import(db_path: &Path, inputs: Vec<PathBuf>, force: bool) -> anyhow::Resu
         cancel,
         &mut |event| match event {
             ImportEvent::Error { message } => eprintln!("{message}"),
+            ImportEvent::Scanning { found } => {
+                println!("正在扫描，已发现 {found} 个待索引文件");
+            }
             ImportEvent::Scanned { total } => {
                 println!("发现 {total} 个文件");
             }

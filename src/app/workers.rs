@@ -1021,7 +1021,11 @@ impl RsouApp {
                         self.library_notice = Some(message);
                         finished = true;
                     }
+                    ImportEvent::Scanning { found } => {
+                        self.import_progress.scan_found = Some(found);
+                    }
                     ImportEvent::Scanned { total } => {
+                        self.import_progress.scan_found = None;
                         self.import_progress.counts.total = total;
                     }
                     ImportEvent::FileDone {
@@ -1077,6 +1081,7 @@ impl RsouApp {
             }
         }
         if finished {
+            self.import_progress.scan_found = None;
             self.import_progress.cancelling = false;
             self.import_rx = None;
             self.import_cancel = None;
@@ -1173,6 +1178,54 @@ mod tests {
     use rsou_lib::search::SearchResponse;
 
     #[test]
+    fn scan_progress_switches_to_file_counts_after_scanned() {
+        for total in [0, 12] {
+            let mut app = RsouApp::new_state(&egui::Context::default());
+            app.import_active = true;
+            let (tx, rx) = mpsc::channel();
+            app.import_rx = Some((app.import_gen, rx));
+            for found in [0, total] {
+                tx.send(ImportEvent::Scanning { found }).unwrap();
+                app.poll_import();
+                assert_eq!(app.import_progress.scan_found, Some(found));
+                assert_eq!(app.import_progress.counts.total, 0);
+                assert_eq!(app.import_progress.counts.processed, 0);
+                assert!(app.import_active && !app.docs_dirty);
+                assert!(app.import_progress.current_path.is_none());
+            }
+            tx.send(ImportEvent::Scanned { total }).unwrap();
+            app.poll_import();
+            assert!(app.import_progress.scan_found.is_none());
+            assert_eq!(app.import_progress.counts.total, total);
+            assert_eq!(app.import_progress.counts.processed, 0);
+        }
+    }
+
+    #[test]
+    fn cancelling_scan_keeps_count_until_finished() {
+        let mut app = RsouApp::new_state(&egui::Context::default());
+        app.import_active = true;
+        app.import_cancel = Some(Arc::new(AtomicBool::new(false)));
+        let (tx, rx) = mpsc::channel();
+        app.import_rx = Some((app.import_gen, rx));
+        tx.send(ImportEvent::Scanning { found: 7 }).unwrap();
+        app.poll_import();
+        app.cancel_import();
+        assert!(app.import_active && app.import_progress.cancelling);
+        assert_eq!(app.import_progress.scan_found, Some(7));
+        tx.send(ImportEvent::Finished {
+            run_id: 1,
+            counts: Default::default(),
+            cancelled: true,
+        })
+        .unwrap();
+        app.poll_import();
+        assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(app.import_progress.cancelled);
+        assert!(app.import_progress.scan_found.is_none());
+    }
+
+    #[test]
     fn cancelling_import_stays_active_until_finished_and_accepts_committed_events() {
         let ctx = egui::Context::default();
         let mut app = RsouApp::new_state(&ctx);
@@ -1227,6 +1280,7 @@ mod tests {
     fn import_error_clears_cancelling_without_claiming_successful_cancellation() {
         let mut app = RsouApp::new_state(&egui::Context::default());
         app.import_active = true;
+        app.import_progress.scan_found = Some(3);
         app.import_cancel = Some(Arc::new(AtomicBool::new(false)));
         let (tx, rx) = mpsc::channel();
         app.import_rx = Some((app.import_gen, rx));
@@ -1237,6 +1291,7 @@ mod tests {
         .unwrap();
         app.poll_import();
         assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(app.import_progress.scan_found.is_none());
         assert!(!app.import_progress.cancelled);
         assert_eq!(app.library_notice.as_deref(), Some("写库失败"));
     }
@@ -1245,6 +1300,7 @@ mod tests {
     fn disconnected_import_worker_clears_cancelling_instead_of_waiting_forever() {
         let mut app = RsouApp::new_state(&egui::Context::default());
         app.import_active = true;
+        app.import_progress.scan_found = Some(3);
         app.import_cancel = Some(Arc::new(AtomicBool::new(false)));
         let (tx, rx) = mpsc::channel();
         app.import_rx = Some((app.import_gen, rx));
@@ -1252,6 +1308,7 @@ mod tests {
         drop(tx);
         app.poll_import();
         assert!(!app.import_active && !app.import_progress.cancelling);
+        assert!(app.import_progress.scan_found.is_none());
         assert!(!app.import_progress.cancelled);
         assert!(app.import_rx.is_none() && app.import_cancel.is_none());
         assert!(app.library_notice.as_deref().unwrap().contains("异常结束"));

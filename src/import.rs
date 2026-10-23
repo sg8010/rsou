@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use rayon::prelude::*;
@@ -88,11 +89,13 @@ impl Default for ImportOptions {
     }
 }
 
-/// 导入进度事件(写库线程逐条发给调用方)。
+/// 导入进度事件(扫描阶段及写库提交后发给调用方)。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub enum ImportEvent {
     /// 批次无法启动或写库失败。
     Error { message: String },
+    /// 正在扫描:已发现的待索引文件数(按格式过滤、路径去重,总数尚未确定)。
+    Scanning { found: usize },
     /// 扫描完成,确定了文件总数
     Scanned { total: usize },
     /// 一个文件处理完毕
@@ -125,8 +128,11 @@ pub enum FileOutcome {
 ///   `System Volume Information`,不跟随符号链接;
 /// - 只收 `file_type_of` 支持的文件;按规范化路径去重、排序。
 pub fn scan_paths(inputs: &[PathBuf]) -> Vec<PathBuf> {
-    scan_paths_filtered(inputs, None, || Ok(())).expect("未启用取消")
+    scan_paths_filtered(inputs, None, || Ok(()), |_| {}).expect("未启用取消")
 }
+
+/// 中间扫描进度至多每 200ms 发送一次;开始和结束立即回报。
+const SCAN_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 fn extension_selected(path: &Path, extensions: Option<&BTreeSet<String>>) -> bool {
     extensions.is_none_or(|selected| {
@@ -140,11 +146,14 @@ fn scan_paths_filtered(
     inputs: &[PathBuf],
     extensions: Option<&BTreeSet<String>>,
     mut check: impl FnMut() -> Result<(), Cancelled>,
+    mut on_found: impl FnMut(usize),
 ) -> Result<Vec<PathBuf>, Cancelled> {
     const SKIP_DIRS: &[&str] = &["node_modules", "$RECYCLE.BIN", "System Volume Information"];
     let mut files = Vec::new();
     let mut seen = HashSet::new();
     let mut stack = Vec::new();
+    check()?;
+    on_found(0);
     for input in inputs {
         check()?;
         stack.push(input.clone());
@@ -188,6 +197,7 @@ fn scan_paths_filtered(
         let normalized = dunce::canonicalize(&path).unwrap_or_else(|_| absolute(&path));
         if seen.insert(normalized.clone()) {
             files.push(normalized);
+            on_found(files.len());
         }
     }
     check()?;
@@ -523,9 +533,23 @@ pub(crate) fn run_import_in_run(
                 .collect();
             files
         } else {
-            scan_paths_filtered(&inputs, options.extensions.as_ref(), || {
-                check_cancel(&cancel)
-            })?
+            let mut last_report: Option<(usize, Instant)> = None;
+            let files = scan_paths_filtered(
+                &inputs,
+                options.extensions.as_ref(),
+                || check_cancel(&cancel),
+                |found| {
+                    if last_report.is_none_or(|(_, at)| at.elapsed() >= SCAN_PROGRESS_INTERVAL) {
+                        on_event(ImportEvent::Scanning { found });
+                        last_report = Some((found, Instant::now()));
+                    }
+                },
+            )?;
+            // 小目录也要回报最终发现数,不能因节流停留在 0。
+            if last_report.is_none_or(|(found, _)| found != files.len()) {
+                on_event(ImportEvent::Scanning { found: files.len() });
+            }
+            files
         };
         check_cancel(&cancel)?;
         let missing = if !no_files && options.detect_missing && ocr.is_none() {
@@ -1613,6 +1637,135 @@ mod tests {
     }
 
     #[test]
+    fn scan_progress_counts_only_selected_unique_files() {
+        let (db, _conn, _cache) = test_cache();
+        let dir = db.parent().unwrap().join("docs");
+        for subdir in ["nested", ".hidden", "node_modules"] {
+            std::fs::create_dir_all(dir.join(subdir)).unwrap();
+        }
+        for name in [
+            "a.TXT",
+            "nested/b.txt",
+            "ignored.md",
+            "unknown.xyz",
+            ".hidden.txt",
+            ".hidden/c.txt",
+            "node_modules/d.txt",
+        ] {
+            std::fs::write(dir.join(name), "正文").unwrap();
+        }
+        let inputs = [dir.clone(), dir.join("a.TXT"), dir.join("nested")];
+        let extensions = BTreeSet::from(["TXT".to_owned()]);
+        let mut found = Vec::new();
+        let files = scan_paths_filtered(
+            &inputs,
+            Some(&extensions),
+            || Ok(()),
+            |count| found.push(count),
+        )
+        .unwrap();
+        assert_eq!(found, [0, 1, 2]);
+        assert_eq!(files.len(), 2);
+        assert!(files.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn scanning_events_precede_processing_and_include_final_count() {
+        for matching in [false, true] {
+            let (db, _conn, _cache) = test_cache();
+            let dir = db.parent().unwrap().join("docs");
+            std::fs::create_dir(&dir).unwrap();
+            for name in ["a.txt", "b.txt"] {
+                std::fs::write(dir.join(name), "正文").unwrap();
+            }
+            let expected = if matching { 2 } else { 0 };
+            let mut found = Vec::new();
+            let mut scanned = false;
+            let counts = run_import(
+                &db,
+                vec![dir],
+                ImportOptions {
+                    extensions: Some([if matching { "txt" } else { "md" }.to_owned()].into()),
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                &mut |event| match event {
+                    ImportEvent::Scanning { found: count } => {
+                        assert!(!scanned);
+                        found.push(count);
+                    }
+                    ImportEvent::Scanned { total } => {
+                        assert_eq!(total, expected);
+                        assert_eq!(found.last(), Some(&total));
+                        scanned = true;
+                    }
+                    ImportEvent::FileDone { .. } => assert!(scanned),
+                    ImportEvent::Finished { cancelled, .. } => assert!(!cancelled),
+                    ImportEvent::Error { message } => panic!("{message}"),
+                },
+            )
+            .unwrap();
+            assert!(scanned);
+            assert_eq!(found.first(), Some(&0));
+            assert!(found.windows(2).all(|pair| pair[0] <= pair[1]));
+            assert_eq!((counts.total, counts.ok), (expected, expected));
+        }
+    }
+
+    #[test]
+    fn scan_progress_callback_can_cancel_a_partial_scan() {
+        let (db, _conn, _cache) = test_cache();
+        let dir = db.parent().unwrap().join("docs");
+        std::fs::create_dir(&dir).unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.join(name), "正文").unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let mut found = Vec::new();
+        let result = scan_paths_filtered(
+            &[dir],
+            None,
+            || check_cancel(&cancel),
+            |count| {
+                found.push(count);
+                if count == 1 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        assert!(matches!(result, Err(Cancelled)));
+        assert_eq!(found, [0, 1]);
+    }
+
+    #[test]
+    fn cancellation_from_scanning_event_does_not_process_files() {
+        let (db, conn, _cache) = test_cache();
+        let file = db.parent().unwrap().join("a.txt");
+        std::fs::write(&file, "正文").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut finished = false;
+        let counts = run_import(
+            &db,
+            vec![file],
+            ImportOptions::default(),
+            Arc::clone(&cancel),
+            &mut |event| match event {
+                ImportEvent::Scanning { found } => {
+                    assert_eq!(found, 0);
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                ImportEvent::Finished { cancelled, .. } => finished = cancelled,
+                _ => panic!("扫描期间取消不应处理文件或报告错误"),
+            },
+        )
+        .unwrap();
+        assert!(finished);
+        assert_eq!((counts.total, counts.processed), (0, 0));
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM documents"), 0);
+        assert_eq!(row_count(&conn, "SELECT count(*) FROM import_items"), 0);
+    }
+
+    #[test]
     fn cancellation_during_directory_enumeration_discards_partial_scan() {
         let (db, _conn, _cache) = test_cache();
         let dir = db.parent().unwrap().join("docs");
@@ -1622,14 +1775,19 @@ mod tests {
         }
         let cancel = AtomicBool::new(false);
         let mut checks = 0;
-        let scanned = scan_paths_filtered(std::slice::from_ref(&dir), None, || {
-            checks += 1;
-            // 已进入 read_dir,但尚未遍历完目录。
-            if checks == 10 {
-                cancel.store(true, Ordering::Relaxed);
-            }
-            check_cancel(&cancel)
-        });
+        let scanned = scan_paths_filtered(
+            std::slice::from_ref(&dir),
+            None,
+            || {
+                checks += 1;
+                // 已进入 read_dir,但尚未遍历完目录。
+                if checks == 10 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                check_cancel(&cancel)
+            },
+            |_| {},
+        );
         assert!(scanned.is_err());
         assert_eq!(checks, 10);
         assert_eq!(scan_paths(&[dir]).len(), 40);
